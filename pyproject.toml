@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "chickennet-security"
+version = "1.3.0"
+description = "Lightweight L7 DDoS/WAF security gateway (stdlib only, zero runtime dependencies)."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE.txt" }
+keywords = ["waf", "ddos", "security", "gateway", "firewall", "reverse-proxy"]
+classifiers = [
+  "Development Status :: 5 - Production/Stable",
+  "Environment :: Console",
+  "Intended Audience :: System Administrators",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Security",
+  "Topic :: Internet :: Proxy Servers",
+]
+dependencies = []
+
+[project.optional-dependencies]
+geoip = ["maxminddb>=2.0"]
+
+[project.scripts]
+chickennet-security = "dataplane.service:main"
+
+[tool.setuptools]
+packages = [
+  "dataplane",
+  "dataplane.engine",
+  "dataplane.engine.core",
+  "dataplane.engine.lifeform",
+  "dataplane.engine.services",
+]

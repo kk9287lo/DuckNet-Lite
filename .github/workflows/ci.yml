@@ -1,0 +1,67 @@
+name: ci
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  test:
+    name: test (py${{ matrix.python }} / ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+        python: ["3.10", "3.11", "3.12", "3.13"]
+        include:
+          # cp932/Windows 固有の回帰(例: --help の UnicodeEncodeError)を捕捉
+          - os: windows-latest
+            python: "3.12"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Run test suite (stdlib only, no install needed)
+        env:
+          CHICKENNET_OFFLINE: "1"
+        run: python tests/run_all.py
+
+  build:
+    name: build & verify package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install build tooling
+        run: python -m pip install --upgrade build twine
+      - name: Regenerate SBOM and verify it matches the package version
+        run: |
+          python tools/gen_sbom.py
+          python - <<'PY'
+          import json, re
+          ver = re.search(r'(?m)^\s*version\s*=\s*"([^"]+)"',
+                          open("pyproject.toml", encoding="utf-8").read()).group(1)
+          sbom = json.load(open("sbom.cdx.json", encoding="utf-8"))
+          got = sbom["metadata"]["component"]["version"]
+          assert got == ver, f"SBOM version {got} != pyproject {ver}"
+          print("SBOM version OK:", ver)
+          PY
+      - name: Build sdist + wheel
+        run: python -m build
+      - name: Validate metadata (PyPI)
+        run: python -m twine check dist/*
+      - name: Smoke-install the wheel and run the console script
+        env:
+          CHICKENNET_OFFLINE: "1"
+        run: |
+          python -m venv /tmp/v
+          /tmp/v/bin/python -m pip install dist/*.whl
+          /tmp/v/bin/chickennet-security --help
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/*

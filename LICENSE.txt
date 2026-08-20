@@ -1,0 +1,6 @@
+ChickenNet L7 Security — Commercial License (template)
+Copyright (c) 2026.
+
+本ソフトウェアの評価利用は許諾されます。商用の再配布・SaaS提供には別途
+商用ライセンス契約が必要です。無保証(AS IS)。L3/L4 ボリューメトリック攻撃は
+対象外(L7アプリ層防御)であることに同意の上ご利用ください。

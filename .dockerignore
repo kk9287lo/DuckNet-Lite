@@ -1,0 +1,17 @@
+.git
+.github
+.gitignore
+.gitattributes
+dist/
+build/
+*.egg-info/
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+tests/
+tools/
+docs/
+*.md
+!README.md
+revoked.json

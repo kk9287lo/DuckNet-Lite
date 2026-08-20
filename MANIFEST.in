@@ -1,0 +1,13 @@
+# sdist に含める非パッケージファイル(ライセンス/通知/SBOM/配布補助)
+include README.md
+include LICENSE.txt
+include THIRD_PARTY_NOTICES.txt
+include sbom.cdx.json
+include Dockerfile
+include docker-compose.yml
+include run.sh
+include run.bat
+recursive-include tests *.py
+recursive-include tools *.py
+global-exclude __pycache__/*
+global-exclude *.py[cod]

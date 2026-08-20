@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+*.log
+.pytest_cache/
+.coverage
+# 運用者のローカル設定(ライセンス秘密を含みうる)。例は app.env.example を追跡。
+/app.env
+.claude/launch.json
