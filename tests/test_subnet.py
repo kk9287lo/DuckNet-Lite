@@ -3,7 +3,8 @@ test_subnet.py — サブネット集約防御(evolution #25)。
 ====================================================================================
 同一サブネット(/24・v6 /64)で *別IP* が多数BANされたら分散攻撃の温床とみなし、新規IPへ
 一度だけソフト加点(ハードBANはしない=NAT/CGNAT 巻き添え回避)。既定OFF・distinct IP 要件・
-別サブネット非波及・一度限り・時間窓・メモリ有界を回帰から守る。BANはハニーポット命中で決定論誘発。
+別サブネット非波及・一度限り・時間窓・メモリ有界を回帰から守る。BANは block_score 一発到達の
+ペナルティで決定論誘発。
 """
 import tempfile
 
@@ -21,7 +22,8 @@ def _shield(tmp, **cfg):
 
 def _ban(sh, ip):
     sh._ips.pop(ip, None)                         # 既BANなら状態を消して再BAN可能に
-    sh.inspect(ip, path="/.env")                  # ハニーポット→即時BAN→サブネット記録
+    sh.penalize(ip, weight=sh.cfg["block_score"], reason="test-ban",
+                kind="test_ban")                  # block_score一発→即時BAN→サブネット記録
 
 
 def test_subnet_key():

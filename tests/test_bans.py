@@ -2,7 +2,7 @@
 test_bans.py — 累犯BANエスカレーション(evolution #19)。
 ====================================================================================
 常習攻撃者(同一IPの再BAN)ほど BAN の TTL を指数的に延長する。初回は据置(既存挙動不変)、
-無効化トグル、倍率上限を回帰から守る。BANは決定論的にハニーポット命中(即時BAN)で誘発する。
+無効化トグル、倍率上限を回帰から守る。BANは決定論的に block_score 到達の一発ペナルティで誘発する。
 """
 import tempfile
 
@@ -10,8 +10,8 @@ from dataplane.engine.lifeform.pipeline import NetShield, _now
 
 
 def _ban_once(sh, ip):
-    """ハニーポット命中で即時BAN(do_ban 経路)。BAN中の状態を返す。"""
-    sh.inspect(ip, path="/.env")           # 既定ハニーポット → 即時BAN
+    """block_score 一発到達で即時BAN(do_ban 経路)。BAN中の状態を返す。"""
+    sh.penalize(ip, weight=sh.cfg["block_score"], reason="test-ban", kind="test_ban")
     return sh._ips[ip]
 
 

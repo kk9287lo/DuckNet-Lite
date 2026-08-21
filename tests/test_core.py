@@ -927,26 +927,6 @@ def test_http_smuggling_framing_is_rejected():
         assert _framing_ambiguous(raw) is False, label   # 正常 → 通す
 
 
-def test_attractive_honeypot_bait_is_zero_fp_oneshot_ban():
-    # 「負けない」運用: 偵察AIが欲しがる『美味しい餌』(隠し管理フォルダ/古い特権アカウント/
-    # 各種秘密)に触れたら誤検知ゼロ=100%悪意として一発BAN。正規パスは絶対に踏まない。
-    import tempfile
-    with tempfile.TemporaryDirectory() as tmp:
-        sh = ND.NetShield(state_dir=tmp)
-        sh.enable()
-        baits = ["/admin/legacy-accounts.csv", "/.ssh/id_rsa", "/admin/backup/",
-                 "/.kube/config", "/exports/ad-users-2018.csv", "/old-admin/",
-                 "/credentials.json", "/.git/config"]
-        for i, p in enumerate(baits):
-            d = sh.inspect("203.0.113.%d" % (i + 10), path=p)
-            assert d.get("action") == "block", (p, d)      # 一発BAN
-        assert len(sh.cfg["honeypots"]) >= 25              # 餌を魅力的に拡充
-        # 正規の(管理画面含む)パスは誤検知しない=信頼性が武器
-        for p in ["/index.html", "/api/users", "/static/app.js", "/admin/dashboard",
-                  "/login", "/health"]:
-            assert sh.inspect("203.0.113.99", path=p).get("action") == "allow", p
-
-
 def test_slowloris_penalty_escalates_to_ban_not_on_single():
     import tempfile
     with tempfile.TemporaryDirectory() as tmp:
@@ -988,9 +968,6 @@ def test_dashboard_controls():
             _req(url + "/api/firewall/rule", token=token,
                  body={"net": "203.0.113.0/24", "action": "deny"})
             assert any(r["net"] == "203.0.113.0/24" for r in FW._FW.rules)
-            # ハニーポット追加
-            _req(url + "/api/shield/honeypot", token=token, body={"path": "/trap.zip"})
-            assert "/trap.zip" in ND._SHIELD.cfg["honeypots"]
             # エッジ前衛設定DL(444を含む)
             code, conf = _req(url + "/api/edge", token=token)
             assert code == 200 and b"ngx.exit(444)" in conf

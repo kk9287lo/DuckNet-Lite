@@ -2,15 +2,18 @@
 
 このリポジトリ(`D:\ChickenNet-Lite`)は **ChickenNet L7 Security の free / trial エディション**の
 独立フォークです(防御エンジンは `dataplane/engine/` 配下に同梱、外部依存ゼロ)。上位(商用)
-エディションから4回の縮小パスを経て、コアの L7 WAF/DDoS リバースプロキシ・エンジン + 最小限の
+エディションから5回の縮小パスを経て、コアの L7 WAF/DDoS リバースプロキシ・エンジン + 最小限の
 Web 管理ダッシュボードだけを残した構成になっています。詳細な削除履歴は
-**[CHANGELOG.md](CHANGELOG.md)** の `[Lite]`/`[Lite-2]`/`[Lite-3]`/`[Lite-4]` を参照。
+**[CHANGELOG.md](CHANGELOG.md)** の `[Lite]`/`[Lite-2]`/`[Lite-3]`/`[Lite-4]`/`[Lite-5]` を参照。
 このメモは次セッション(あなた=Claude / 開発者)が最初に読む引き継ぎです。
 
 ## いまの状態(検証済み)
 
 - 外部依存ゼロ(stdlib のみ、`pyproject.toml` の `dependencies = []`)。
-- テスト **347/347 緑**(Lite-4 で PoW チャレンジ関連テストを1本削除・348→347):
+- テスト **344/344 緑**(Lite-5 でハニーポット関連テストを3本削除・347→344。うち複数の
+  無関係テスト(BANエスカレーション/サブネット集約/appeals/シャットダウン永続化)は、旧来
+  ハニーポット命中を「決定論的に一発BANを誘発する」ための手段として流用していたため、
+  `penalize(weight=block_score)` 直呼びへ置き換えて意図を維持):
   `python tests/run_all.py` または `pytest tests/`
   (`CHICKENNET_OFFLINE=1` / `CHICKENNET_STATE_DIR` に一時ディレクトリを指定して実行)。
 - CLI: `python -m dataplane --backend HOST:PORT --listen 8443 --admin 8081` で起動。
@@ -50,13 +53,17 @@ Web 管理ダッシュボードだけを残した構成になっています。�
   (allowlist)、ステルス運用(プロセス名偽装) — `[Lite-2]`。
 - 常駐内 watchdog による自動再起動・親プロセス監督(`--supervise`) — `[Lite-3]`。
   in-memory cfg 改竄検知(#85)・迂回検知(#78)・状態の HMAC 署名は無関係な別機構のため維持。
-- PoW(Proof-of-Work)チャレンジ段・Under Attack モード(手動/自動)— `[Lite-4]`(今回)。
+- PoW(Proof-of-Work)チャレンジ段・Under Attack モード(手動/自動)— `[Lite-4]`。
   スコアが `challenge_score` 以上の帯は `block`(単発拒否・BANなし・新設 `deny_score`)へ統合し、
   中間の『チャレンジで通す』余地は無くした(=フェイルセーフ側に倒す。詳細は CHANGELOG)。
   `under_attack`/`auto_under_attack` はこの PoW ゲートを開閉するためだけの仕組みだったため、
   ゲートごと削除(既定ONの `auto_under_attack` を「block」側へ丸ごと倒すと、通常のトラフィック
   急増だけで全公開トラフィックを自動BANしてしまう=フリー/トライアル層の自爆リスクの方が大きいと
   判断し、こちらは単純撤去を選んだ)。
+- ハニーポット(囮URLパス。`add_honeypot`/`remove_honeypot`/`honeypots` cfg キー・命中即時BAN)
+  — `[Lite-5]`(今回)。管理API `/api/shield/honeypot` とダッシュボードの追加フォームも削除
+  (該当パスへの POST は他の未定義ルートと同様 404)。侵入シグネチャ/レート制限/脅威スコア等
+  他の検知系はすべて無関係な別機構のため一切変更なし。
 
 ## 未検証 / 次にやること(正直な但し書き)
 

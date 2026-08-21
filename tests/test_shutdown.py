@@ -71,8 +71,11 @@ def test_flush_state_persists_ban_count():
     # graceful shutdown の flush_state が累犯回数まで書き出し、再起動で復元できる。
     with tempfile.TemporaryDirectory() as tmp:
         sh = _restart(tmp); ip = "203.0.113.70"
-        sh.inspect(ip, path="/.env")                 # ハニーポット命中=即BAN(count=1)
-        sh._ips[ip]["ban_until"] = 0.0; sh.inspect(ip, path="/.env")   # count=2(active)
+        sh.penalize(ip, weight=sh.cfg["block_score"], reason="test-ban",
+                    kind="test_ban")                  # block_score一発=即BAN(count=1)
+        sh._ips[ip]["ban_until"] = 0.0
+        sh.penalize(ip, weight=sh.cfg["block_score"], reason="test-ban",
+                    kind="test_ban")                  # count=2(active)
         res = sh.flush_state()
         assert res["persisted"] is True
         sh2 = _restart(tmp); st = sh2._ips.get(ip)

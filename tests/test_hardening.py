@@ -44,7 +44,8 @@ def test_appeals_collection_is_memory_bounded():
             sh.cfg["appeal_after_sec"] = 0                # 待ち時間なしで申立可能に
             for i in range(20):                          # 上限(5)を大きく超える申立
                 ip = f"203.0.113.{i + 1}"
-                sh.inspect(ip, path="/.env")             # ハニーポット→即時BAN
+                sh.penalize(ip, weight=sh.cfg["block_score"], reason="test-ban",
+                            kind="test_ban")              # block_score一発→即時BAN
                 assert sh.submit_appeal(ip, "x" * 1000)["ok"]   # reason は[:500]で切詰
             assert len(sh._appeals) <= 5                  # メモリ有界(OOMしない)
             assert all(len(v["reason"]) <= 500 for v in sh._appeals.values())
@@ -62,9 +63,12 @@ def test_appeals_evict_resolved_before_pending():
             sh.cfg["appeal_after_sec"] = 0
             for i in range(3):
                 ip = f"198.51.100.{i + 1}"
-                sh.inspect(ip, path="/.env"); sh.submit_appeal(ip, "r")
+                sh.penalize(ip, weight=sh.cfg["block_score"], reason="test-ban",
+                            kind="test_ban")
+                sh.submit_appeal(ip, "r")
             sh.resolve_appeal("198.51.100.1", approve=False)   # 1件を解決済みに
-            sh.inspect("198.51.100.9", path="/.env")
+            sh.penalize("198.51.100.9", weight=sh.cfg["block_score"], reason="test-ban",
+                        kind="test_ban")
             sh.submit_appeal("198.51.100.9", "r")              # 4件目→解決済みが退避される
             assert "198.51.100.1" not in sh._appeals           # 解決済みが消えた
             assert "198.51.100.9" in sh._appeals               # 新しい審査待ちは残る
@@ -137,7 +141,8 @@ def test_active_ban_survives_eviction_pressure():
         with tempfile.TemporaryDirectory() as tmp:
             sh = NetShield(state_dir=tmp); sh.enable()
             bad = "203.0.113.7"
-            sh.inspect(bad, path="/.env")                         # ハニーポット→即時BAN
+            sh.penalize(bad, weight=sh.cfg["block_score"], reason="test-ban",
+                        kind="test_ban")                          # block_score一発→即時BAN
             assert sh.is_banned_fast(bad)
             for i in range(80):                                   # 多数IPで _ips を満杯に(eviction誘発)
                 sh.inspect(f"10.1.{i // 256}.{i % 256}", path="/home")

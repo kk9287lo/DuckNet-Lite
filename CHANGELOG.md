@@ -2,6 +2,40 @@
 
 本プロジェクトの主要な変更点。日付は概ねの目安。詳細は各コミット(`evolution #N`)を参照。
 
+## [Lite-5] — 第5次縮小: ハニーポット(囮URLパス)を削除
+
+free / trial ティアから、偵察AI/スキャナ向けの **囮URLパス**(隠し管理フォルダ・バックアップ・
+資格情報・期限切れ特権アカウントを匂わせる名前を運用者が登録し、命中したら一発即時BANする
+仕組み)を削除。侵入シグネチャ・レート制限・脅威スコア・自動BAN・サブネット集約など他の検知系は
+無関係な別機構のため一切変更していない。
+
+- **削除(`engine/lifeform/pipeline.py`)**: 設定キー `honeypots`(既定値の囮URL一覧を含む)、
+  `add_honeypot()`/`remove_honeypot()`(evolution #84 のアトミック追加/削除)、`_is_honeypot()`、
+  `inspect()` 内のハニーポット命中チェック(`kind="honeypot_ban", do_ban=True` 分岐)。
+- **削除(`admin.py`)**: 管理API `POST /api/shield/honeypot`(add/remove)、ダッシュボードの
+  囮URL追加フォーム(`#hp` 入力・追加ボタン)、関連 JS(`honeypot()`)・i18n
+  (`ルール / ハニーポット`→`アクセスルール` へ見出しを整理・`囮URL 例:...` の対訳を削除)。
+  同じパネル内の IP allow/deny ルールとエッジ前衛設定DLは無関係機能のため維持。
+- **コメント整合**: `engine/services/proxy.py` の origin-form 強制コメントから、削除済みの
+  `honeypot` 経路への言及を除去(`path_limits`/`sensitive_path` の言及は維持=現存する別機構)。
+- **削除(テスト)**: `tests/test_buttonmash.py` の `test_concurrent_honeypot_add_no_lost_updates`/
+  `test_concurrent_add_same_path_dedups`(ハニーポット専用の並行更新テスト)、`tests/test_core.py`
+  の `test_attractive_honeypot_bait_is_zero_fp_oneshot_ban`。
+- **テスト置き換え(honeypotを「決定論的一発BANの手段」として流用していた箇所)**:
+  `tests/test_bans.py`(累犯BANエスカレーション)・`tests/test_subnet.py`(サブネット集約防御)・
+  `tests/test_hardening.py`(appeals有界性・eviction下でのBAN温存)・`tests/test_shutdown.py`
+  (BAN回数の永続化)は、`sh.inspect(ip, path="/.env")` によるハニーポット命中誘発を
+  `sh.penalize(ip, weight=sh.cfg["block_score"], ...)` の直接呼び出しへ置換。どちらも
+  `_enforce_or_audit(..., do_ban=True)` へ同じ経路で到達するため、各テストの検証意図
+  (BANカウント/TTLエスカレーション/サブネット記録/appeals/永続化)は変更していない。
+  `tests/test_buttonmash.py::test_button_mash_stress_no_corruption` からは
+  `add_honeypot` 操作枝を除去し、残る操作(inspect/ban/unban/set_config)へ比率を再配分。
+  `tests/test_core.py::test_dashboard_controls` からは `/api/shield/honeypot` 呼び出しを削除
+  (他の管理API操作の検証は維持)。
+- ドキュメント: README(「含まれない機能」にハニーポットを追加・適用機能一覧から削除)、
+  docs/defenses.md(該当行を削除)、NEXT_STEPS.md を更新。
+- テスト: **344/344 件緑**(347 件からハニーポット専用テスト3件を削除)。
+
 ## [Lite-4] — 第4次縮小: PoW チャレンジ段を削除
 
 free / trial ティアから、脅威スコアの中間防御ティアだった **チャレンジ(Proof-of-Work・自作)**

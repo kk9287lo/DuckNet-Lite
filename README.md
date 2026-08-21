@@ -14,13 +14,14 @@ Web 管理ダッシュボード(ON/OFF・指標・BAN管理・基本設定)、�
 自己完全性監視(ファイルすり替え検知+自動修復)、watchdog による自動再起動+親プロセス監督
 (`--supervise`)、GeoIP、正のセキュリティモデル(allowlist)、ステルス運用(プロセス名偽装)、
 LDAP/SMB/Kerberos の横展開デコイ、LDAP 列挙検知プロキシ、脅威インテリジェンス(IoC)照合、
-MITRE ATT&CK 対応の脅威検知コンテンツ配備、クラスタ間の分散BAN同期(gossip)、商用ライセンス管理。
+MITRE ATT&CK 対応の脅威検知コンテンツ配備、クラスタ間の分散BAN同期(gossip)、商用ライセンス管理、
+ハニーポット(囮URLパス命中の即時BAN)。
 
 ## これは何か
 [攻撃] → **ChickenNet L7 Security(前衛)** → あなたのWebサーバ(WordPress / API など)
 
 - 前衛で **レート制限・侵入シグネチャ(SQLi/XSS/RCE/traversal/XXE/SSRF/JNDI/scanner 等)・脅威スコア・
-  自動BAN・ハニーポット** を適用。
+  自動BAN** を適用。
 - **双方向に検査**: リクエストの head + **ボディ**(POST/JSON/GraphQL・gzip 解凍含む)+ **アップロード**、
   応答の **DLP・セキュリティヘッダ・Cookie/CORS/リダイレクト無害化**。
 - **認証・濫用対策**: JWT 検査(`alg:none`/alg 混同)・クレデンシャル単位レート・

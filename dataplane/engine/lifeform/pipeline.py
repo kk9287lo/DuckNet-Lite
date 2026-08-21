@@ -286,30 +286,6 @@ _DEFAULTS = {
     "cadence_min_samples": 8,    # 判定に要する最小サンプル数
     "cadence_cv_threshold": 0.15,  # 変動係数(これ未満=規則正しすぎ=機械)
     "cadence_max_mean_interval": 3.0,  # 平均間隔がこれ超なら対象外(遅い正規ポーラを誤検知しない)
-    # ハニーポット(囮URL)= 偵察AIが『価値が高い』と優先的に欲しがる餌をわざと置く。正規の
-    # ブラウザ/ツールは絶対に踏まないので、踏んだ瞬間=誤検知の可能性ゼロ=100%悪意として一発BAN。
-    # 餌は『美味しそう』に見せるのが要点: 隠し管理フォルダ・バックアップ・各種資格情報・
-    # 期限切れ特権アカウントを匂わせる名前。これで偵察AIを誘い込み、本命へ到達する前に焼く。
-    "honeypots": [
-        # 設定・秘密ファイル(古典だが効く)
-        "/.env", "/.env.bak", "/.env.production", "/secrets.env", "/config.php~",
-        "/wp-config.php.bak", "/wp-admin/setup-config.php", "/.htpasswd", "/.htpasswd.old",
-        # バックアップ(中身が丸ごと=最も美味しそうに見える)
-        "/backup.zip", "/backup.tar.gz", "/admin_backup.zip", "/db_backup.sql.gz",
-        "/database.sql", "/dump.sql", "/site-backup-2019.zip",
-        # 資格情報・鍵(クラウド/開発者の置き忘れを装う)
-        "/.aws/credentials", "/.ssh/id_rsa", "/id_rsa", "/credentials.json",
-        "/.npmrc", "/.docker/config.json", "/.kube/config", "/.vscode/sftp.json",
-        "/api/keys.json", "/service-account.json",
-        # バージョン管理・内部リポジトリ
-        "/.git/config", "/.svn/entries", "/.terraform/terraform.tfstate",
-        # 隠し管理フォルダ(『管理者しか知らない』風)
-        "/admin/backup/", "/old-admin/", "/_internal/admin/", "/private/admin/",
-        "/manager/html/",
-        # 期限切れだが特権付きの古いアカウントを匂わせる餌
-        "/admin/legacy-accounts.csv", "/users/admin.bak", "/accounts/disabled-privileged.json",
-        "/exports/ad-users-2018.csv",
-    ],
     # 高FPシグネチャの個別ON/OFF(既定OFF)。{name: True} で有効化。誤検知が許容な環境だけ点ける。
     "optional_sigs": {},
     # 検知の段階的厳格度(evolution #16): 1=保守(誤検知最小)〜4=最大(高FP許容)。set_paranoia が
@@ -1013,30 +989,6 @@ class NetShield:
     def disable(self) -> dict:
         self.cfg["enabled"] = False; self._save(); return {"ok": True, "enabled": False}
 
-    def add_honeypot(self, path: str) -> dict:
-        """ハニーポット URL を *アトミックに* 追加する(evolution #84)。管理APIは並行(ThreadingHTTP)
-        なので、admin 側の list 読取→append→set_config の read-modify-write はボタン連打で
-        更新を取りこぼす競合があった。ロック下で読み・追加・保存を一括して行い競合を消す。"""
-        p = str(path or "").strip()
-        if not p:
-            return {"ok": False, "error": "empty path"}
-        with self._lock:
-            hp = list(self.cfg.get("honeypots") or [])
-            if p not in hp:
-                hp.append(p)
-                self.cfg["honeypots"] = hp
-                self._save()
-            return {"ok": True, "honeypots": list(self.cfg.get("honeypots") or [])}
-
-    def remove_honeypot(self, path: str) -> dict:
-        """ハニーポット URL をアトミックに削除する(#84・対称操作)。"""
-        p = str(path or "").strip()
-        with self._lock:
-            hp = [h for h in (self.cfg.get("honeypots") or []) if h != p]
-            self.cfg["honeypots"] = hp
-            self._save()
-            return {"ok": True, "honeypots": list(hp)}
-
     def set_config(self, **kw) -> dict:
         changed = {}
         with self._lock:
@@ -1609,11 +1561,6 @@ class NetShield:
             if pol:
                 return self._enforce_or_audit(ip, "block", st, "ポリシー: " + pol,
                                               kind="policy_block")
-            # 1.5) ハニーポット: 囮URLを踏んだら一発即時BAN(正規ブラウザは踏まない=誤検知ほぼ0)
-            if self._is_honeypot(path):
-                st["score"] = float(self.cfg["block_score"])
-                return self._enforce_or_audit(ip, "block", st, "ハニーポット命中→即時BAN",
-                                              kind="honeypot_ban", do_ban=True)
             # 2) 侵入シグネチャ(ロック外で判定済み・組込/カスタム共通)を反映
             if sig_hit:
                 self._add_score(st, sig_weight or _SIG_WEIGHT.get(sig_hit, 30))
@@ -2054,15 +2001,7 @@ class NetShield:
         self._ewma = (1 - alpha) * self._ewma + alpha * inst
         self._ewma_last = now
 
-    # ── ハニーポット / 低速規則性 ──
-    def _is_honeypot(self, path: str) -> bool:
-        p = _path_for_match(path).rstrip("/")    # %デコード(#40)=エンコードした囮アクセスも捕捉
-        for hp in self.cfg.get("honeypots") or []:
-            h = str(hp).lower().rstrip("/")
-            if p == h or p.endswith(h):
-                return True
-        return False
-
+    # ── 低速規則性 ──
     def _cadence_botlike(self, st: dict, now: float) -> bool:
         """直近リクエスト間隔の規則性を見る。速め(平均<閾値)かつ変動係数が極小=機械。
         遅い正規ポーラ(平均間隔が大)は対象外にして誤検知を抑える。"""

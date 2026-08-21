@@ -229,7 +229,7 @@ def _framing_ambiguous(buf: bytes) -> bool:
         return True
     # origin-form のみ受理(evolution #34): リバプロは origin-form(/path)だけを受ける。絶対形
     #   (GET http://host/…)や authority 形は target に scheme/host が紛れ、WAF が path 規則
-    #   (honeypot/path_limits/sensitive_path)を本来のパスで評価できず回避され得る。OPTIONS * のみ例外。
+    #   (path_limits/sensitive_path)を本来のパスで評価できず回避され得る。OPTIONS * のみ例外。
     _rl = lines[0].split(b" ")
     _tgt = _rl[1] if len(_rl) > 1 else b""
     if not (_tgt.startswith(b"/") or (_tgt == b"*" and _rl[0].upper() == b"OPTIONS")):

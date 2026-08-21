@@ -53,7 +53,6 @@ ChickenNet L7 の防御と、それを制御する設定キー(`NetShield.cfg` /
 |---|---|---|---|
 | 信頼 proxy / 実IP | `trusted_proxies` | opt-in | 背後構成で XFF/XFP を信頼(未設定=一切信頼しない) |
 | サイト allowlist | `site_mode`, `site_whitelist` | opt-in | Host(ドメイン)許可。Host インジェクション対策 |
-| ハニーポット | `honeypots` | ON | 囮URL命中で即時BAN |
 
 ## 自己防衛 / 改竄耐性
 

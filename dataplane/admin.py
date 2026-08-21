@@ -7,7 +7,7 @@ admin.py — ChickenNet L7 Security 管理ダッシュボード(Web GUI・stdlib
   · GET  /                  … ダッシュボード(HTML・localでtoken同梱)
   · GET  /api/state         … 現在の全状態(firewall/shield/指標/capabilities)
   · POST /api/firewall/*    … ON/OFF・ゾーンポリシー・IPルール
-  · POST /api/shield/*      … ON/OFF・config・unban・honeypot
+  · POST /api/shield/*      … ON/OFF・config・unban
   · GET  /api/shield/events|top|bans
   · GET  /api/edge          … エッジ前衛(リバースプロキシ)設定(444 Drop)テキストを取得
 
@@ -335,10 +335,6 @@ def _make_handler(app: AdminDashboard):
                     r = sh.unban(b.get("ip", ""))
                 elif path == "/api/shield/ban":
                     r = sh.ban(b.get("ip", ""))
-                elif path == "/api/shield/honeypot":
-                    # #84: アトミック追加(並行ボタン連打でも更新を取りこぼさない)
-                    r = (sh.remove_honeypot(b.get("path", "")) if b.get("op") == "remove"
-                         else sh.add_honeypot(b.get("path", "")))
                 elif path == "/api/appeal/resolve":
                     r = sh.resolve_appeal(b.get("ip", ""), bool(b.get("approve")),
                                           b.get("note", ""))
@@ -623,13 +619,11 @@ canvas,svg{display:block;width:100%}
 
     <div class="sect"><span class="ic">🚦</span>アクセス制御・申立</div>
     <section class="panel">
-      <div class="phead"><h2>ルール / ハニーポット</h2></div>
+      <div class="phead"><h2>アクセスルール</h2></div>
       <div class="pbody">
         <div class="row"><input id="ruleip" placeholder="IP/CIDR 例:203.0.113.0/24">
         <button onclick="rule('allow')">許可</button>
-        <button class="red" onclick="rule('deny')">拒否</button></div>
-        <div class="row"><input id="hp" placeholder="囮URL 例:/backup.zip">
-        <button onclick="honeypot()">追加</button>
+        <button class="red" onclick="rule('deny')">拒否</button>
         <button class="ghost" onclick="edge()">エッジ前衛設定DL</button></div>
       </div>
     </section>
@@ -674,7 +668,7 @@ const JA2EN={
  "APT級の兆候":"APT-grade indicators","シグネチャ別ヒット":"Hits by signature",
  "トラフィック構成(ゾーン / アクション)":"Traffic mix (zone / action)",
  "WAF 追加シグネチャ(任意・高FP)":"WAF optional signatures (high-FP)","カスタムシグネチャ":"Custom signatures",
- "出口DLP(秘密漏洩)":"Egress DLP (secret leak)","ルール / ハニーポット":"Rules / honeypots",
+ "出口DLP(秘密漏洩)":"Egress DLP (secret leak)","アクセスルール":"Access rules",
  "詳細防御(評価)":"Advanced defenses (eval)",
  "応答セキュリティヘッダ":"Response security headers",
  "検知の厳格度(paranoia)":"Detection strictness (paranoia)","ヘッダ":"headers",
@@ -689,7 +683,7 @@ const JA2EN={
  "許可":"Allow","拒否":"Deny","追加":"Add","エッジ前衛設定DL":"Download edge proxy config",
  "秘密漏洩検知":"Secret leak detection","監査(記録のみ)":"Audit (log only)","遮断(漏洩を送出しない)":"Block (withhold leak)",
  "手動BANするIP":"IP to ban manually","IP/CIDR 例:203.0.113.0/24":"IP/CIDR e.g. 203.0.113.0/24",
- "囮URL 例:/backup.zip":"Decoy URL e.g. /backup.zip","名前 例:my-rule":"Name e.g. my-rule",
+ "名前 例:my-rule":"Name e.g. my-rule",
  "正規表現 例:evil-?bot":"Regex e.g. evil-?bot",
  "パス別レート制限":"Per-path rate limits","パス前方一致 例:/login":"Path prefix e.g. /login",
  "毎秒 例:0.5":"Per sec e.g. 0.5","バースト 例:5":"Burst e.g. 5","ルール":"rules","ルールなし":"No rules",
@@ -962,7 +956,6 @@ function resolveAppeal(ip,ok){post("/api/appeal/resolve",{ip,approve:ok}).then((
 function unban(ip){post("/api/shield/unban",{ip}).then(refresh)}
 function ban(){post("/api/shield/ban",{ip:$("banip").value}).then(refresh)}
 function rule(a){post("/api/firewall/rule",{net:$("ruleip").value,action:a}).then(refresh)}
-function honeypot(){post("/api/shield/honeypot",{path:$("hp").value}).then(refresh)}
 async function edge(){const t=await (await fetch("/api/edge",{headers:H})).text();
  const u=URL.createObjectURL(new Blob([t]));const a=document.createElement("a");a.href=u;a.download="chickennet_edge.conf";a.click()}
 addEventListener("resize",()=>{try{refreshPro()}catch(e){}});
