@@ -13,7 +13,6 @@ from dataplane.engine.lifeform.pipeline import NetShield, _PATH_LIMIT_MAX
 
 def _shield(tmp):
     sh = NetShield(state_dir=tmp); sh.enable()
-    sh.cfg["auto_under_attack"] = False     # 異常検知由来の challenge を排除(レート制限を分離検証)
     return sh
 
 

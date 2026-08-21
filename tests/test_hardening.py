@@ -78,7 +78,7 @@ def test_host_and_accept_headers_are_scanned():
     # Host: ${jndi:...} や Accept-Language: ${jndi:...} が素通りしていた(バックエンドが記録→Log4Shell)。
     from dataplane.engine.services.proxy import _scan_header_values
     with tempfile.TemporaryDirectory() as tmp:
-        sh = NetShield(state_dir=tmp); sh.enable(); sh.cfg["auto_under_attack"] = False
+        sh = NetShield(state_dir=tmp); sh.enable()
         # Host 経由の攻撃を検知(inspect の host フィールドを走査)
         assert sh.inspect("198.51.100.31", path="/", host="${jndi:ldap://e/x}")["action"] != "allow"
         assert sh.inspect("198.51.100.32", path="/", host="x' or 1=1--")["action"] != "allow"
@@ -98,7 +98,7 @@ def test_percent_encoding_access_control_evasion_blocked():
     # 脆弱性修正(#40): blocked_urls/blocked_extensions/path_limits は path を小文字化のみで
     # %デコードせず=/%61dmin・/secret%2eenv・/%6cogin で回避できた(バックエンドは復号して提供)。
     with tempfile.TemporaryDirectory() as tmp:
-        sh = NetShield(state_dir=tmp); sh.enable(); sh.cfg["auto_under_attack"] = False
+        sh = NetShield(state_dir=tmp); sh.enable()
         sh.cfg["blocked_urls"] = ["/admin"]; sh.cfg["blocked_extensions"] = [".env"]
         a = lambda ip, p: sh.inspect(ip, path=p)["action"]
         assert a("198.51.100.21", "/admin") == "block"
@@ -117,7 +117,7 @@ def test_scan_area_padding_evasion_is_blocked():
     # パディングでヘッダ内の payload(Log4Shell/SQLi)を走査外へ押し出して全署名を回避できた。
     # 各フィールド(path?query+UA / 各ヘッダ値)を独立走査することで封じる。
     with tempfile.TemporaryDirectory() as tmp:
-        sh = NetShield(state_dir=tmp); sh.enable(); sh.cfg["auto_under_attack"] = False
+        sh = NetShield(state_dir=tmp); sh.enable()
         JND = "${jndi:ldap://evil/a}"
         a = lambda ip, **kw: sh.inspect(ip, **kw)["action"]
         assert a("203.0.113.71", path="/", query="x=1", headers=JND) != "allow"          # 基本検知
@@ -135,7 +135,7 @@ def test_active_ban_survives_eviction_pressure():
     old = P._MAX_IPS; P._MAX_IPS = 12
     try:
         with tempfile.TemporaryDirectory() as tmp:
-            sh = NetShield(state_dir=tmp); sh.enable(); sh.cfg["auto_under_attack"] = False
+            sh = NetShield(state_dir=tmp); sh.enable()
             bad = "203.0.113.7"
             sh.inspect(bad, path="/.env")                         # ハニーポット→即時BAN
             assert sh.is_banned_fast(bad)
@@ -215,5 +215,5 @@ def test_hot_path_is_reasonably_fast():
         t0 = time.perf_counter()
         for i in range(3000):
             r = sh.inspect("203.0.113.%d" % (i % 254 + 1), path="/", query=corpus[i % len(corpus)])
-            assert r.get("action") in ("allow", "throttle", "challenge", "block")
+            assert r.get("action") in ("allow", "throttle", "block")
         assert time.perf_counter() - t0 < 10.0      # 3000 件 < 10s(実測は ~0.1s)

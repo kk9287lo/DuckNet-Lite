@@ -37,7 +37,6 @@ def _drive(req: bytes) -> _W:
 def _throttling_shield(tmp, **cfg):
     """/x を burst=1 で絞るシールド。1発目=allow(バケツ消費)、2発目=throttle。"""
     sh = ND.NetShield(state_dir=tmp); sh.enable()
-    sh.cfg["auto_under_attack"] = False          # 異常検知由来の challenge を排除
     sh.set_path_limits([{"path": "/x", "rate": 0.001, "burst": 1}])
     sh.cfg.update(cfg)
     return sh

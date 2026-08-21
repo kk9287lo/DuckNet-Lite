@@ -13,7 +13,6 @@ from dataplane.engine.lifeform.pipeline import (NetShield, _now, _subnet_key,
 
 def _shield(tmp, **cfg):
     sh = NetShield(state_dir=tmp); sh.enable()
-    sh.cfg["auto_under_attack"] = False          # 異常検知由来の challenge を排除
     sh.cfg["subnet_defense"] = True
     sh.cfg["subnet_threshold"] = 3
     sh.cfg.update(cfg)
@@ -33,7 +32,7 @@ def test_subnet_key():
 
 def test_off_by_default_no_bump():
     with tempfile.TemporaryDirectory() as tmp:
-        sh = NetShield(state_dir=tmp); sh.enable(); sh.cfg["auto_under_attack"] = False
+        sh = NetShield(state_dir=tmp); sh.enable()
         for i in range(1, 6):                     # subnet_defense は既定 False
             _ban(sh, f"198.51.100.{i}")
         r = sh.inspect("198.51.100.200", path="/home")

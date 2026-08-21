@@ -19,7 +19,7 @@ def test_clean_cfg_not_flagged():
 def test_legit_change_updates_mac():
     with tempfile.TemporaryDirectory() as d:
         sh = NetShield(state_dir=d)
-        sh.set_config(challenge_score=55)              # 正規変更=_save が MAC 更新
+        sh.set_config(flood_threshold=200)              # 正規変更=_save が MAC 更新
         assert sh.verify_cfg_integrity()["tampered"] is False   # 正規変更は誤検知しない
 
 
@@ -43,17 +43,17 @@ def test_out_of_band_memory_edit_detected_and_restored():
 def test_type_change_tamper_restored():
     with tempfile.TemporaryDirectory() as d:
         sh = NetShield(state_dir=d)
-        sh.set_config(challenge_score=40)
-        sh.cfg["challenge_score"] = "x"                # 型まで改変
+        sh.set_config(flood_threshold=200)
+        sh.cfg["flood_threshold"] = "x"                # 型まで改変
         r = sh.verify_cfg_integrity()
-        assert r["tampered"] and sh.cfg["challenge_score"] == 40   # defaults 経由で確実に復元
+        assert r["tampered"] and sh.cfg["flood_threshold"] == 200   # 保存済み正規値へ確実に復元
 
 
 def test_tamper_reported():
     with tempfile.TemporaryDirectory() as d:
         sh = NetShield(state_dir=d)
-        sh.set_config(challenge_score=40)
-        sh.cfg["challenge_score"] = 999999             # out-of-band 改変(既定と異なる値)
+        sh.set_config(flood_threshold=200)
+        sh.cfg["flood_threshold"] = 999999             # out-of-band 改変(既定と異なる値)
         sh.verify_cfg_integrity()
         assert sh.metrics()["tamper"]["count"] >= 1
         assert sh.metrics()["tamper"]["last"]["kind"] == "memory_tamper"

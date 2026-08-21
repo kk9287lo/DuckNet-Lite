@@ -41,16 +41,16 @@ def test_raw_token_not_stored():
 
 
 def test_same_key_across_ips_escalates():
-    # 同一キーを *異なる IP* から大量送信→キー単位の窓が上限超過→各 IP に加点(チャレンジ/遮断へ)。
+    # 同一キーを *異なる IP* から大量送信→キー単位の窓が上限超過→各 IP に加点(単発拒否/遮断へ)。
     with tempfile.TemporaryDirectory() as d:
         sh = _shield(d, cred_rate_limit=20, cred_rate_score=40,
-                     challenge_score=40, block_score=100)
+                     deny_score=40, block_score=100)
         token = "Bearer stolen-key-123"  # inspect は cred をそのまま使う
         acts = set()
         for i in range(40):
             r = sh.inspect(f"10.0.0.{i % 250}", path="/api", cred="stolen-key-123")
             acts.add(r["action"])
-        assert acts & {"challenge", "block", "throttle"}    # キー濫用が IP 横断で escalation
+        assert acts & {"block", "throttle"}    # キー濫用が IP 横断で escalation
         assert sh.metrics().get("cred_rate_hit", 0) >= 1
 
 

@@ -2,7 +2,7 @@
 test_botconsistency.py — ヘッダ整合性ボット検知(evolution #63)。
 ====================================================================================
 UA はブラウザを名乗るのに実ブラウザが常時送るヘッダ(Accept-Language/Encoding)を欠く=ツールの
-UA 偽装、を低FPで加点する。単独では落とさず(challenge_score 未満)、flood/scan 等と合算で escalation。
+UA 偽装、を低FPで加点する。単独では落とさず(deny_score 未満)、flood/scan 等と合算で escalation。
 """
 import tempfile
 
@@ -42,7 +42,7 @@ def _shield(d, **cfg):
 
 def test_inspect_scores_spoofed_browser():
     with tempfile.TemporaryDirectory() as d:
-        sh = _shield(d, bot_inconsistency_score=20, challenge_score=40)
+        sh = _shield(d, bot_inconsistency_score=20, deny_score=40)
         # ブラウザ UA を名乗るが Accept-Language/Encoding 欠落=偽装の疑い→加点(単独では allow)
         r = sh.inspect("9.9.9.9", path="/", user_agent=_CHROME,
                        header_names=["host", "user-agent"])
@@ -70,15 +70,15 @@ def test_inspect_no_header_names_skips():
 
 
 def test_inconsistency_escalates_with_repetition():
-    # 単発は allow だが、偽装ブラウザが連射すれば加点が積もり challenge/block へ。
+    # 単発は allow だが、偽装ブラウザが連射すれば加点が積もり block(単発拒否/BAN)へ。
     with tempfile.TemporaryDirectory() as d:
-        sh = _shield(d, bot_inconsistency_score=20, challenge_score=40, block_score=100)
+        sh = _shield(d, bot_inconsistency_score=20, deny_score=40, block_score=100)
         acts = set()
         for _ in range(8):
             r = sh.inspect("6.6.6.6", path="/", user_agent=_CHROME,
                            header_names=["host", "user-agent"])
             acts.add(r["action"])
-        assert acts & {"challenge", "block", "throttle"}         # 反復で escalation
+        assert acts & {"block", "throttle"}         # 反復で escalation
 
 
 def test_disabled_no_scoring():

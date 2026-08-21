@@ -2,7 +2,7 @@
 test_respscore.py — 応答アウェア脅威スコア(エラーレート検知・evolution #60)。
 ====================================================================================
 バックエンド応答の 4xx 連射を *列挙(404)/ブルートフォース(401/403)* の足跡として検知し、
-保守的に加点→チャレンジ、反復で BAN へ。5xx は加点しない(バックエンド起因の誤遮断回避)。
+保守的に加点(1バーストでは即BANしない)、反復で BAN へ。5xx は加点しない(バックエンド起因の誤遮断回避)。
 リクエスト署名では捕まらない攻撃を応答の足跡で捉えることを回帰から守る。
 """
 import tempfile
@@ -25,16 +25,15 @@ def test_below_threshold_only_tracks():
         assert sh._decayed_score(sh._state("1.2.3.4")) == 0.0    # 未加点
 
 
-def test_threshold_breach_adds_score_and_challenges():
+def test_threshold_breach_adds_score():
     with tempfile.TemporaryDirectory() as d:
-        sh = _shield(d, resp_error_threshold=10, resp_error_score=50,
-                     challenge_score=40, block_score=100)
+        sh = _shield(d, resp_error_threshold=10, resp_error_score=50, block_score=100)
         r = None
         for _ in range(10):
             r = sh.note_response("9.9.9.9", 401)        # ブルートフォースの足跡
         assert r["action"] == "score" and not r["banned"]
         score = sh._decayed_score(sh._state("9.9.9.9"))
-        assert score >= 40                               # challenge_score 以上=次要求でチャレンジ
+        assert score >= 50                               # resp_error_score 分が確実に加点される
         # window はリセットされる(二重加点しない)
         assert not sh._state("9.9.9.9")["resp_err"]
 

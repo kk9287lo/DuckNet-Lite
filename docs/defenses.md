@@ -27,7 +27,7 @@ ChickenNet L7 の防御と、それを制御する設定キー(`NetShield.cfg` /
 
 | 防御 | 主な設定キー | 既定 | 概要 |
 |---|---|---|---|
-| IP レート/フラッド | `flood_threshold`, `window_sec`, `challenge_score`, `block_score` | ON | スコア+PoW チャレンジ+自動BAN(累犯エスカレーション) |
+| IP レート/フラッド | `flood_threshold`, `window_sec`, `deny_score`, `block_score` | ON | スコア: `deny_score` 以上で単発拒否・`block_score` 以上で自動BAN(累犯エスカレーション) |
 | パス別レート | `path_limits`（`set_path_limits`） | opt-in | 認証/高コスト経路を厳格化 |
 | per-IP 同時接続 | `max_conn_per_ip` | opt-in | 接続枯渇/slowloris 増幅対策 |
 | クレデンシャル単位レート | `cred_rate_enabled`, `cred_rate_limit`, `cred_rate_window_sec` | **opt-in** | トークン/API キー単位(IP ローテーション濫用対策) |

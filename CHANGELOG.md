@@ -2,6 +2,55 @@
 
 本プロジェクトの主要な変更点。日付は概ねの目安。詳細は各コミット(`evolution #N`)を参照。
 
+## [Lite-4] — 第4次縮小: PoW チャレンジ段を削除
+
+free / trial ティアから、脅威スコアの中間防御ティアだった **チャレンジ(Proof-of-Work・自作)**
+を削除。パズルを解けば通過できる段そのものを無くし、`allow`/`throttle`/`block` の3段構成へ
+単純化(上位/商用エディションのみ PoW チャレンジを提供)。
+
+- **スコア判定の統合(`engine/lifeform/pipeline.py` `inspect()`)**: 旧 `challenge_score` 以上
+  (score ≧ 40 帯・従来はチャレンジ発行)を `block` へ統合した。新設の `deny_score`(既定 `40`
+  =旧 `challenge_score` と同値)が単発拒否(**BAN はしない**)の閾値、`block_score`(既定 `100`・
+  変更なし)が自動BANの閾値。中間の『パズルを解けば通す』余地を無くし、フェイルセーフ側(=より
+  厳格)に倒した。`block_score` 自体(および `inspect_body`/`scan_upload`/`inspect_graphql`/
+  `note_response`/JWT/ハニーポットの各 do_ban=True 判定)は一切変更していない——単発の疑わしい
+  signal(本文シグネチャ・UA/ヘッダ不整合・クレデンシャルレート超過 等)が誤って即時BANされる
+  ことを防ぐ既存の低FP設計(`body_sig_weight_factor` 等)をそのまま維持するため。
+- **Under Attack モードを丸ごと削除**: `under_attack`(手動)・`auto_under_attack`(EWMA
+  ベースの自動検知・既定 `True`)・`_anomaly()` は、このチャレンジ段を開閉するためだけの仕組み
+  だったため撤去した(フォールドではなく単純削除)。理由: `auto_under_attack` は既定ONで、
+  これを「未検証の public/unknown トラフィックは block」へフォールドすると、通常のアクセス
+  急増(セール/バズり等)だけで新規訪問者が軒並み自動BANされる自爆的な既定挙動になり、
+  free/trialティアの安全な既定として不適切と判断した。全体レートのEWMA自体
+  (`_tick_ewma`/`global_rate_ewma`)はダッシュボードのテレメトリとして維持。
+- **削除(`engine/lifeform/pipeline.py`)**: `_issue_challenge()`/`solve_challenge()`/
+  `_dynamic_difficulty()`、`set_under_attack()`、`_anomaly()`。設定キー `challenge_score`/
+  `challenge_difficulty`/`max_difficulty`/`verify_ttl_sec`/`under_attack`/`auto_under_attack`。
+  状態 `_nonces`/`verified_until`(付与箇所が無くなったため)。`_out()`/`metrics()`/
+  `sample_series()`/`analysis()` から `challenge`/`anomaly` 系フィールドを除去。
+  `absorb_suspend()`(OSスリープ吸収)は BAN タイマーの補正だけを残し、nonce/検証セッションの
+  補正ロジックを削除。
+- **削除(`engine/services/proxy.py`)**: `_CHALLENGE_PATH`
+  (`/__chickennet_challenge__`)定数、`_handle_challenge()`、`if act == "challenge":` の
+  503+PoW 応答分岐、`AsyncEdgeGuard.metrics` の `challenged` カウンタ。
+- **削除(`admin.py`)**: ダッシュボードの `🚨 Under Attack` トグルと
+  `/api/shield/under_attack` エンドポイント、`challenge_total` メトリクス露出、
+  KPIカード/棒グラフ/折れ線グラフ/凡例/i18n の `チャレンジ`/`challenge` 系表示一式。
+- **その他**: `bloom.py`/`edge_config.py`/`service.py` のコメント中の PoW 言及を、実態
+  (後段の inspect() が拾う・PoW 前提でないアクセス制御である旨)に合わせて訂正。
+- **削除(テスト)**: `tests/test_core.py` の `test_pow_challenge_solution_grants_verification`
+  (PoW 発行/検証そのものを検証するテスト)を削除。`test_botconsistency.py`/`test_credrate.py`
+  (キー/IPローテーション濫用の escalation テスト)・`test_respscore.py`・`test_memtamper.py`・
+  `test_signed_state.py`・`test_buttonmash.py` は `challenge_score` 参照を `deny_score` へ
+  差し替え、または改竄検知テスト用の別の既存 cfg キー(`flood_threshold`)へ差し替えて意図を
+  維持。`test_hardening.py`/`test_method.py`/`test_pathrate.py`/`test_subnet.py`/
+  `test_throttle.py` の `auto_under_attack = False`(異常検知由来のチャレンジ除外用の
+  お膳立て)は不要になったため削除。
+- ドキュメント: README(「含まれない機能」に PoW チャレンジを追加)・docs/defenses.md・
+  docs/options.md・NEXT_STEPS.md から `challenge_score`/`under_attack`/PoW の記述を
+  `deny_score`/2段のスコア閾値の説明へ更新。
+- テスト: **347/347 件緑**(348 件から PoW 検証テスト1件を削除)。
+
 ## [Lite-3] — 第3次縮小: 自己防衛の watchdog/親プロセス監督を削除
 
 free / trial ティアから、常駐サービス層の *自動復旧*(auto-recovery/self-healing)機構を削除。

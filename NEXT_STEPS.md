@@ -2,15 +2,16 @@
 
 このリポジトリ(`D:\ChickenNet-Lite`)は **ChickenNet L7 Security の free / trial エディション**の
 独立フォークです(防御エンジンは `dataplane/engine/` 配下に同梱、外部依存ゼロ)。上位(商用)
-エディションから3回の縮小パスを経て、コアの L7 WAF/DDoS リバースプロキシ・エンジン + 最小限の
+エディションから4回の縮小パスを経て、コアの L7 WAF/DDoS リバースプロキシ・エンジン + 最小限の
 Web 管理ダッシュボードだけを残した構成になっています。詳細な削除履歴は
-**[CHANGELOG.md](CHANGELOG.md)** の `[Lite]`/`[Lite-2]`/`[Lite-3]` を参照。
+**[CHANGELOG.md](CHANGELOG.md)** の `[Lite]`/`[Lite-2]`/`[Lite-3]`/`[Lite-4]` を参照。
 このメモは次セッション(あなた=Claude / 開発者)が最初に読む引き継ぎです。
 
 ## いまの状態(検証済み)
 
 - 外部依存ゼロ(stdlib のみ、`pyproject.toml` の `dependencies = []`)。
-- テスト **348/348 緑**: `python tests/run_all.py` または `pytest tests/`
+- テスト **347/347 緑**(Lite-4 で PoW チャレンジ関連テストを1本削除・348→347):
+  `python tests/run_all.py` または `pytest tests/`
   (`CHICKENNET_OFFLINE=1` / `CHICKENNET_STATE_DIR` に一時ディレクトリを指定して実行)。
 - CLI: `python -m dataplane --backend HOST:PORT --listen 8443 --admin 8081` で起動。
   `--cluster`(全コア待受)・`--install-autostart`/`--uninstall-autostart`(OS 公認の場所への
@@ -23,9 +24,10 @@ Web 管理ダッシュボードだけを残した構成になっています。�
 
 ## 含まれる機能(現状のスコープ)
 
-- L7 リバースプロキシ・ゲートウェイ: スコアリング/自動BAN/PoWチャレンジ/侵入シグネチャ照合
+- L7 リバースプロキシ・ゲートウェイ: スコアリング/自動BAN/侵入シグネチャ照合
   (SQLi/XSS/RCE/traversal/XXE/SSRF/JNDI 等)、要求ボディ/アップロード検査、応答側の
   Cookie/CORS/DLP/オープンリダイレクト無害化、JWT・クレデンシャルレート・スマグリング対策等。
+  スコア閾値は2段階(`deny_score`=単発拒否・BANなし / `block_score`=自動BAN)のみ。
 - Web 管理ダッシュボード: ON/OFF・指標・BAN管理・基本設定(トークン認証)。
 - 状態永続化: BAN/設定の HMAC 署名(改竄耐性)、宣言的設定ブートストラップ(JSON/ConfigMap)。
 - 自動起動登録(`--install-autostart`): Windows タスクスケジューラ/Run キー、systemd、launchd
@@ -39,15 +41,22 @@ Web 管理ダッシュボードだけを残した構成になっています。�
 
 ## 含まれない機能(上位/商用エディションのみ・意図的に除外)
 
-3回の縮小パスで以下を削除済み(詳細は CHANGELOG の該当エントリ):
+4回の縮小パスで以下を削除済み(詳細は CHANGELOG の該当エントリ):
 - デスクトップ GUI、カナリアトークン、LDAP/SMB/Kerberos デコイ、LDAP 列挙検知プロキシ、
   脅威インテリジェンス(IoC)照合、MITRE ATT&CK 検知コンテンツ配備、クラスタ間分散BAN同期
   (gossip)、商用ライセンス管理 — `[Lite]`。
 - DNS フィルタ(L7検知)、囮ファイル・ビーコン追跡、SIEM/Webhook 転送、構造化トランザクション
   ログ、自己完全性監視(ファイルすり替え検知+自動修復)、GeoIP 国別判定、正のセキュリティモデル
   (allowlist)、ステルス運用(プロセス名偽装) — `[Lite-2]`。
-- 常駐内 watchdog による自動再起動・親プロセス監督(`--supervise`) — `[Lite-3]`(今回)。
+- 常駐内 watchdog による自動再起動・親プロセス監督(`--supervise`) — `[Lite-3]`。
   in-memory cfg 改竄検知(#85)・迂回検知(#78)・状態の HMAC 署名は無関係な別機構のため維持。
+- PoW(Proof-of-Work)チャレンジ段・Under Attack モード(手動/自動)— `[Lite-4]`(今回)。
+  スコアが `challenge_score` 以上の帯は `block`(単発拒否・BANなし・新設 `deny_score`)へ統合し、
+  中間の『チャレンジで通す』余地は無くした(=フェイルセーフ側に倒す。詳細は CHANGELOG)。
+  `under_attack`/`auto_under_attack` はこの PoW ゲートを開閉するためだけの仕組みだったため、
+  ゲートごと削除(既定ONの `auto_under_attack` を「block」側へ丸ごと倒すと、通常のトラフィック
+  急増だけで全公開トラフィックを自動BANしてしまう=フリー/トライアル層の自爆リスクの方が大きいと
+  判断し、こちらは単純撤去を選んだ)。
 
 ## 未検証 / 次にやること(正直な但し書き)
 

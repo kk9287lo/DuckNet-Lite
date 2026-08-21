@@ -444,7 +444,7 @@ def test_zone_telemetry_breakdown_and_public_trend():
         m = sh.metrics()
         assert m["zone_hits"] == {"public": 2, "private": 1, "loopback": 1}
         # アクション別は既存メトリクスにある(ダッシュボードはこれを横棒で描く)
-        assert all(k in m for k in ("allow", "throttle", "challenge", "block"))
+        assert all(k in m for k in ("allow", "throttle", "block"))
         sh._series_last = 0.0
         s = sh.series(2)
         assert s[-1].get("pub") == 2          # 外部トラフィックの累積→クライアントが差分で推移描画
@@ -925,34 +925,6 @@ def test_http_smuggling_framing_is_rejected():
     }
     for label, raw in good.items():
         assert _framing_ambiguous(raw) is False, label   # 正常 → 通す
-
-
-def test_pow_challenge_solution_grants_verification():
-    # チェックメイト(PoW未処理→セルフDoS)の核: 解の検証が verified を付与すること。
-    import hashlib
-    import tempfile
-    with tempfile.TemporaryDirectory() as tmp:
-        sh = ND.NetShield(state_dir=tmp)
-        ip = "198.51.100.20"
-        ch = sh._issue_challenge(ip, difficulty=2)    # 低難易度=テスト高速
-        nonce, diff = ch["nonce"], ch["difficulty"]
-        sol = 0
-        while not hashlib.sha256(f"{nonce}{sol}".encode()).hexdigest().startswith("0" * diff):
-            sol += 1
-        # 不正解は *確実に* PoW を満たさない文字列にする(偶然満たすと誤って ok=True になりフレーク)
-        bad_sol = str(sol + 1)
-        while hashlib.sha256(f"{nonce}{bad_sol}".encode()).hexdigest().startswith("0" * diff):
-            bad_sol += "x"
-        bad = sh.solve_challenge(nonce, bad_sol)             # 不正解は拒否
-        assert bad["ok"] is False
-        r = sh.solve_challenge(nonce, str(sol))       # 正解 → verify 付与
-        assert r["ok"] is True
-        assert sh._state(ip)["verified_until"] > _now_dummy()
-
-
-def _now_dummy():
-    import time
-    return time.time() - 1
 
 
 def test_attractive_honeypot_bait_is_zero_fp_oneshot_ban():

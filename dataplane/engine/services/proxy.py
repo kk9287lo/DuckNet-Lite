@@ -7,7 +7,7 @@ proxy.py — stdlib asyncio による Fail-Fast 前衛ガード(依存ゼロの�
   · 接続が来たら request-line / Host / User-Agent だけを(タイムアウト付きで)読む。
   · app_firewall + net_shield(v2)に照会。block/deny は **その場で writer.close()**=
     レスポンスも返さず即TCP切断(444 相当=接続を黙って閉じる)。スレッドを1つも消費しない。
-  · challenge は 503+PoW を即返して切断。allow だけバックエンド(本体 Web サービス)へ
+  · throttle は 429+Retry-After を返して切断。allow だけバックエンド(本体 Web サービス)へ
     非同期パイプ(双方向 splice)。
 
 これが C10K/C100K への現実解の一枚: イベントループなら数万の I/O 待ちをシングルスレッドで
@@ -194,9 +194,6 @@ def _forwarded_proto_tls(peer_ip: str, buf: bytes, trusted) -> bool:
 
 # 解除リクエスト(異議申立)の受付パス。遮断中ユーザーでも到達できる(BAN判定の手前)。
 _APPEAL_PATH = "/__chickennet_appeal__"
-# PoW チャレンジの解(nonce+solution)の提出先。これが無いと『解いても通れない』
-# セルフDoSになる(Under Attack 時に人間もBotも永久に入れなくなる)。
-_CHALLENGE_PATH = "/__chickennet_challenge__"
 
 
 _CL_DIGITS = re.compile(rb"\A[0-9]+\Z")         # Content-Length は 1*DIGIT のみ(RFC 7230 §3.3.2)
@@ -573,7 +570,7 @@ class AsyncEdgeGuard:
         self._conn_per_ip: dict = {}  # ip -> 同時接続数(limit_conn 用・ループスレッドのみ=ロック不要)
         self._conn_rate: dict = {}    # ip -> [窓開始, 件数](接続レート=RST/churn フラッド対策・#10)
         self._pool = _BufferPool()
-        self.metrics = {"accepted": 0, "dropped": 0, "challenged": 0, "proxied": 0}
+        self.metrics = {"accepted": 0, "dropped": 0, "proxied": 0}
 
     @staticmethod
     def platform_capabilities() -> dict:
@@ -772,7 +769,7 @@ class AsyncEdgeGuard:
                 zone = _zone_of(ip)
             except Exception:
                 zone = ""
-        # 2) L7 DDoS/侵入防御(v2): block/throttle は即解放、challenge は 503+PoW
+        # 2) L7 DDoS/侵入防御(v2): block/throttle は即解放
         try:
             from ..lifeform.pipeline import net_shield
             sh = net_shield()
@@ -784,9 +781,6 @@ class AsyncEdgeGuard:
             # 解除リクエスト(異議申立)経路はBAN判定の手前=遮断中のユーザーでも到達できる。
             if _p == _APPEAL_PATH:
                 return await self._handle_appeal(ip, path, sh, writer)
-            # PoW チャレンジの解の提出経路(判定の手前=チャレンジ中でも到達できる)。
-            if _p == _CHALLENGE_PATH:
-                return await self._handle_challenge(ip, path, sh, writer)
             # 0) 既知BANの瞬殺プリスキャン(ブルーム・ロックなしほぼO(1))。重い inspect
             #    (ロック/正規表現/state)へ行く手前で、執拗な再攻撃Botをビット演算で即落とす。
             #    失敗時はフェイルオープン=下の inspect() がロック下で BAN 状態を再判定する。
@@ -843,17 +837,6 @@ class AsyncEdgeGuard:
                     except Exception:
                         pass
                 return self._close(writer)        # Fail Fast=スレッド非消費
-            if act == "challenge":
-                self.metrics["challenged"] += 1
-                writer.write(_http_response("503 Service Unavailable", _jsonify(
-                    {"ok": False, "defense": "challenge",
-                     "challenge": d.get("challenge")}),
-                    extra=deception.headers_for(ip)))
-                try:
-                    await writer.drain()
-                except Exception:
-                    pass
-                return self._close(writer)
         # 3) allow → バックエンドへ非同期パイプ(綺麗なアクセスだけ本体に通す)
         try:
             bre, bwr = await self._open_backend()
@@ -1104,24 +1087,6 @@ class AsyncEdgeGuard:
         try:
             self._write_html(writer, "403 Forbidden", _block_page(sh.ban_info(ip)),
                              extra=deception.headers_for(ip))
-            await writer.drain()
-        except Exception:
-            pass
-        return self._close(writer)
-
-    async def _handle_challenge(self, ip, path, sh, writer):
-        """PoW チャレンジの解(nonce+solution)を受けて検証する。成功で当該IPに verify を
-        付与し、以後 verify_ttl 秒は素通しになる。この経路が無いと『解いても通れない』
-        セルフDoS(Under Attack 時に人間もBotも永久に入れない)になるため必須。
-        nonce 検証は dict ルックアップ+sha256 1回=安価(申立のような重い生成は無い)。"""
-        from urllib.parse import parse_qs
-        q = parse_qs(path.split("?", 1)[1]) if "?" in path else {}
-        nonce = (q.get("nonce") or [""])[0]
-        solution = (q.get("solution") or [""])[0]
-        r = sh.solve_challenge(nonce, solution)
-        writer.write(_http_response("200 OK" if r.get("ok") else "403 Forbidden",
-                                    _jsonify(r)))
-        try:
             await writer.drain()
         except Exception:
             pass

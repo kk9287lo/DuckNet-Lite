@@ -183,16 +183,16 @@ def test_netshield_rejects_tampered_config():
     with tempfile.TemporaryDirectory() as d:
         sh = _fresh_shield(d)
         sh._save()
-        base_score = sh.cfg["challenge_score"]
-        # 攻撃者が state.json を改竄: challenge_score を巨大化して PoW を実質無効化
+        base_score = sh.cfg["flood_threshold"]
+        # 攻撃者が state.json を改竄: flood_threshold を巨大化して flood 検知を実質無効化
         with open(sh.path, encoding="utf-8") as f:
             env = json.load(f)
-        env["_payload"]["cfg"]["challenge_score"] = 10 ** 9
+        env["_payload"]["cfg"]["flood_threshold"] = 10 ** 9
         with open(sh.path, "w", encoding="utf-8") as f:
             json.dump(env, f)
         sh2 = _fresh_shield(d)
         sh2._load()
-        assert sh2.cfg["challenge_score"] == base_score   # 改竄設定を採らず既定を維持
+        assert sh2.cfg["flood_threshold"] == base_score   # 改竄設定を採らず既定を維持
 
 
 # ── ロールバック攻撃対策(#102): 古い正署名ファイルへの巻き戻しを拒否 ──

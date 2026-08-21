@@ -7,7 +7,7 @@ admin.py — ChickenNet L7 Security 管理ダッシュボード(Web GUI・stdlib
   · GET  /                  … ダッシュボード(HTML・localでtoken同梱)
   · GET  /api/state         … 現在の全状態(firewall/shield/指標/capabilities)
   · POST /api/firewall/*    … ON/OFF・ゾーンポリシー・IPルール
-  · POST /api/shield/*      … ON/OFF・Under Attack・config・unban・honeypot
+  · POST /api/shield/*      … ON/OFF・config・unban・honeypot
   · GET  /api/shield/events|top|bans
   · GET  /api/edge          … エッジ前衛(リバースプロキシ)設定(444 Drop)テキストを取得
 
@@ -56,7 +56,6 @@ def _metrics_exposition(sh) -> str:
     for key, name, h in (("requests", "requests_total", "Requests inspected"),
                          ("allow", "allow_total", "Allowed requests"),
                          ("block", "block_total", "Blocked requests"),
-                         ("challenge", "challenge_total", "Challenged requests"),
                          ("throttle", "throttle_total", "Throttled requests"),
                          ("dlp_leak", "dlp_leak_total", "Egress secret leaks"),
                          ("subnet_flag", "subnet_flag_total", "Subnet-aggregation soft flags")):
@@ -317,8 +316,6 @@ def _make_handler(app: AdminDashboard):
                          else fw.remove_rule(b.get("net", "")))
                 elif path == "/api/shield/toggle":
                     r = sh.enable() if b.get("on") else sh.disable()
-                elif path == "/api/shield/under_attack":
-                    r = sh.set_under_attack(bool(b.get("on")))
                 elif path == "/api/shield/config":
                     r = sh.set_config(**{k: v for k, v in b.items()})
                 elif path == "/api/shield/optional_sig":
@@ -500,7 +497,6 @@ canvas,svg{display:block;width:100%}
   <div class="controls">
     <label class="sw"><input type="checkbox" id="fw" class="toggle"> ファイアウォール</label>
     <label class="sw"><input type="checkbox" id="sh" class="toggle"> DDoS / 侵入防御</label>
-    <label class="sw"><input type="checkbox" id="ua" class="toggle red"> 🚨 Under Attack</label>
     <div class="spacer"></div>
     <button class="red" onclick="globalBlock(true)">🌍 グローバル遮断</button>
     <button class="ghost" onclick="globalBlock(false)">解除</button>
@@ -509,7 +505,7 @@ canvas,svg{display:block;width:100%}
   <div class="grid">
     <div class="sect"><span class="ic">📈</span>概況</div>
     <section class="panel wide">
-      <div class="phead"><h2>リアルタイム通信</h2><span class="meta" id="chartleg">req/s · block/s · challenge/s</span></div>
+      <div class="phead"><h2>リアルタイム通信</h2><span class="meta" id="chartleg">req/s · block/s</span></div>
       <div class="pbody"><canvas id="chart" height="180" style="height:180px"></canvas></div>
     </section>
     <section class="panel wide">
@@ -665,7 +661,7 @@ const tm=ts=>new Date((ts||0)*1000).toLocaleTimeString();
 const nf=n=>(n||0).toLocaleString();
 function sev(s){s=(s||"").toLowerCase();
  if(["malicious","block","blocked","deny"].includes(s))return"danger";
- if(["suspicious","alert","throttle","challenge"].includes(s))return"warn";
+ if(["suspicious","alert","throttle"].includes(s))return"warn";
  if(["recon","info"].includes(s))return"info";return"muted";}
 /* 言語(i18n): 既定は日本語=サーバHTMLそのまま。EN はクライアントで適用。 */
 const JA2EN={
@@ -709,7 +705,7 @@ const JA2EN={
  "申立なし":"No appeals","承認":"Approve","却下":"Reject","名前とパターンを入力":"Enter name and pattern",
  "SSTI(テンプレート注入 {{…}})":"SSTI (template injection {{…}})","内部SSRF(localhost/内部IP)":"Internal SSRF (localhost/internal IP)",
  "オープンリダイレクト(=//)":"Open redirect (=//)",
- "要求":"Requests","スロットル":"Throttle","チャレンジ":"Challenge","ブロック":"Block","BAN中":"Banned","漏洩":"Leaks",
+ "要求":"Requests","スロットル":"Throttle","ブロック":"Block","BAN中":"Banned","漏洩":"Leaks",
  "有効":"on","無効":"off","計":"total","種別":"types","系統":"families","前":"ago",
  "インターネット(public)を一括遮断します。よろしいですか?":"Block all public (internet) traffic. Are you sure?",
  "(CHICKENNET_DECEPTION 未設定 = 偽装なし)":"(CHICKENNET_DECEPTION unset = no deception)",
@@ -751,10 +747,10 @@ async function refresh(){
  let s;try{s=await (await fetch("/api/state",{headers:H})).json()}catch(e){
   $("conn").className="pill bad";$("connt").textContent=tr("接続不可");return}
  $("conn").className="pill ok";$("connt").textContent=tr("接続中");
- $("fw").checked=s.firewall.enabled;$("sh").checked=s.shield.cfg.enabled;$("ua").checked=s.shield.cfg.under_attack;
+ $("fw").checked=s.firewall.enabled;$("sh").checked=s.shield.cfg.enabled;
  const m=s.shield_metrics;
  $("cards").innerHTML=[["要求",m.requests,"i-blue"],["許可",m.allow,"i-green"],["スロットル",m.throttle,"i-amber"],
-   ["チャレンジ",m.challenge,"i-amber"],["ブロック",m.block,"i-red"],["BAN中",m.active_bans,"i-red"],
+   ["ブロック",m.block,"i-red"],["BAN中",m.active_bans,"i-red"],
    ["漏洩",m.dlp_leak,"i-red"]]
    .map(([l,n,a])=>`<div class="kpi ${a}"><div class="kn">${nf(n)}</div><div class="kl">${esc(tr(l))}</div></div>`).join("");
  // 出口DLP: 設定の反映 + 漏洩イベントの抽出表示
@@ -796,7 +792,7 @@ async function refresh(){
  $("sigbars").innerHTML=barHTML(si,10);
  $("zonebars").innerHTML=barHTML(Object.entries(m.zone_hits||{}),6);
  $("actbars").innerHTML=barHTML([["allow",m.allow],["throttle",m.throttle],
-   ["challenge",m.challenge],["block",m.block]],5);
+   ["block",m.block]],5);
  $("methbars").innerHTML=barHTML(Object.entries(m.method_hits||{}),8);
  // 漏洩した秘密種別の内訳(累積・テレメトリ)
  const lkm=m.dlp_kinds||{},lki=Object.entries(lkm).sort((a,b)=>b[1]-a[1]).slice(0,6);
@@ -819,7 +815,6 @@ async function refresh(){
 }
 $("fw").onchange=e=>post("/api/firewall/toggle",{on:e.target.checked}).then(refresh);
 $("sh").onchange=e=>post("/api/shield/toggle",{on:e.target.checked}).then(refresh);
-$("ua").onchange=e=>post("/api/shield/under_attack",{on:e.target.checked}).then(refresh);
 $("dlp").onchange=e=>post("/api/shield/config",{dlp_enabled:e.target.checked}).then(refresh);
 $("dlpact").onchange=e=>post("/api/shield/config",{dlp_action:e.target.value}).then(refresh);
 $("sech").onchange=e=>post("/api/shield/config",{sec_headers_enabled:e.target.checked}).then(refresh);
@@ -842,7 +837,7 @@ async function refreshPro(){
   ).join("")||'<tr><td colspan="4" class="empty">'+tr("申立なし")+'</td></tr>';}catch(e){}
  try{const an=await (await fetch("/api/analysis",{headers:H})).json();
   $("analysis").textContent=JSON.stringify({actions:an.actions,by_zone:an.by_zone,
-   top_signatures:an.top_signatures,event_kinds:an.event_kinds,active_bans:an.active_bans,anomaly:an.anomaly},null,2);}catch(e){}
+   top_signatures:an.top_signatures,event_kinds:an.event_kinds,active_bans:an.active_bans},null,2);}catch(e){}
  try{const ap=await (await fetch("/api/apt",{headers:H})).json();
   $("apt").textContent=(ap.suspects||[]).map(s=>
    `${(s.ip+"").padStart(15)}  apt ${String(s.apt_score).padStart(3)}  ${s.regular_beacon?"beacon ":""}${s.low_and_slow?"low&slow ":""}${s.banned?"BAN":""}`
@@ -947,12 +942,12 @@ function drawChart(s){
  if(c.width!==Math.round(cw*dpr)){c.width=Math.round(cw*dpr);c.height=Math.round(ch*dpr);}
  x.setTransform(dpr,0,0,dpr,0,0);const W=cw,Hh=ch;
  x.clearRect(0,0,W,Hh);
- const line=cssv("--line2"),faint=cssv("--faint"),blue=cssv("--blue"),red=cssv("--brand"),amber=cssv("--amber");
+ const line=cssv("--line2"),faint=cssv("--faint"),blue=cssv("--blue"),red=cssv("--brand");
  for(let i=0;i<=4;i++){const y=5+(Hh-15)*i/4;x.strokeStyle=line;x.lineWidth=1;x.beginPath();x.moveTo(0,y);x.lineTo(W,y);x.stroke();}
  if(s.length<2){return;}
  const d=[];for(let i=1;i<s.length;i++){const dt=Math.max(0.001,s[i].t-s[i-1].t);
-  d.push({r:(s[i].requests-s[i-1].requests)/dt,b:(s[i].block-s[i-1].block)/dt,c:(s[i].challenge-s[i-1].challenge)/dt});}
- const mx=Math.max(1,...d.map(p=>Math.max(p.r,p.b,p.c)));
+  d.push({r:(s[i].requests-s[i-1].requests)/dt,b:(s[i].block-s[i-1].block)/dt});}
+ const mx=Math.max(1,...d.map(p=>Math.max(p.r,p.b)));
  const px=i=>i/(d.length-1)*W,py=v=>Hh-(v/mx)*(Hh-15)-5;
  // req は塗り
  x.beginPath();x.moveTo(0,Hh);d.forEach((p,i)=>x.lineTo(px(i),py(p.r)));x.lineTo(W,Hh);x.closePath();
@@ -960,8 +955,8 @@ function drawChart(s){
  x.fillStyle=grad;x.fill();
  const ln=(k,col)=>{x.strokeStyle=col;x.lineWidth=2;x.lineJoin="round";x.beginPath();
   d.forEach((p,i)=>{i?x.lineTo(px(i),py(p[k])):x.moveTo(px(i),py(p[k]));});x.stroke();};
- ln("r",blue);ln("b",red);ln("c",amber);
- $("chartleg").innerHTML=`<span style="color:${blue}">●</span> req/s &nbsp;<span style="color:${red}">●</span> block/s &nbsp;<span style="color:${amber}">●</span> challenge/s &nbsp;· peak ${mx.toFixed(1)}/s`;
+ ln("r",blue);ln("b",red);
+ $("chartleg").innerHTML=`<span style="color:${blue}">●</span> req/s &nbsp;<span style="color:${red}">●</span> block/s &nbsp;· peak ${mx.toFixed(1)}/s`;
 }
 function resolveAppeal(ip,ok){post("/api/appeal/resolve",{ip,approve:ok}).then(()=>{refresh();refreshPro();})}
 function unban(ip){post("/api/shield/unban",{ip}).then(refresh)}

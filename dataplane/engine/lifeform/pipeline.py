@@ -3,7 +3,7 @@ pipeline.py — 高度なL7 DDoS / ネット侵入防御(アプリ層・OS非侵
 ====================================================================================
 クラウド級WAF/DDoS防御の中核概念を **クリーンルームで自作** したもの(特定製品の模倣でも
 コードの流用でもない・固有名なし)。先の app_firewall(送信元ゾーン制御)の上に、L7の
-レート制限・侵入シグネチャ・脅威スコア・チャレンジ(PoW)・自動BAN・異常検知を積む。
+レート制限・侵入シグネチャ・脅威スコア・自動BAN・異常検知を積む。
 
 正直な線引き(誇張しない):
   · これは **L7(アプリ層)** 防御=本アプリのサーバが受理したHTTP要求を検査して弾く。
@@ -24,10 +24,9 @@ pipeline.py — 高度なL7 DDoS / ネット侵入防御(アプリ層・OS非侵
   · トークンバケット レート制限(IP毎・rate/burst)。
   · スライディングウィンドウ flood 検知(window秒で閾値超過)。
   · 侵入シグネチャ(SQLi/XSS/traversal/RCE/スキャナUA/機微パス)= L7 WAF。
-  · 脅威スコア(各寄与を加算・時間で半減減衰)→ allow/challenge/throttle/block。
-  · チャレンジ(Proof-of-Work・自作): nonce+難易度を出し、sha256先頭ゼロを要求して人間/正規
-    クライアントを通す(Under Attack時に未検証は要チャレンジ)。
-  · 自動BAN(TTL付き)・解除。異常検知(全体EWMAベースラインからのスパイク)で自動防御強化(任意)。
+  · 脅威スコア(各寄与を加算・時間で半減減衰)→ allow/throttle/block(deny_score 以上は単発拒否、
+    block_score 以上は自動BAN。中間の『チャレンジ(PoW)』段は本エディションには無い=上位版のみ)。
+  · 自動BAN(TTL付き)・解除。全体レートのEWMAはテレメトリとしてダッシュボードに出す。
 """
 from __future__ import annotations
 
@@ -101,8 +100,6 @@ _SIG_WEIGHT = {"sqli": 55, "xss": 45, "traversal": 50, "rce": 60,
 
 _DEFAULTS = {
     "enabled": False,            # 既定OFF(完全パススルー)
-    "under_attack": False,       # 手動 Under Attack(未検証は要チャレンジ)
-    "auto_under_attack": True,   # 異常スパイクで自動的に防御強化
     "rate_per_sec": 20.0,        # IP毎の定常許容レート
     "burst": 40,                 # バースト許容
     # 同時接続数の上限(evolution #30): 1 IP が同時に保持できる接続数の上限(nginx limit_conn 相当)。
@@ -131,7 +128,7 @@ _DEFAULTS = {
     "subnet_defense": False,     # 既定OFF(共有NATを巻き込み得るため明示オプトイン)
     "subnet_threshold": 8,       # この数の *別IP* が窓内BANでサブネットを hot 扱い
     "subnet_window_sec": 3600,   # BAN を集計する時間窓(秒)
-    "subnet_score": 30,          # hot サブネットの新規IPへ一度だけ加える score(challenge_score未満=ソフト)
+    "subnet_score": 30,          # hot サブネットの新規IPへ一度だけ加える score(deny_score未満=ソフト)
     # HTTPメソッドポリシー(evolution #26): XST(TRACE/TRACK)・プロキシ濫用(CONNECT)等、アプリ
     #   前段にまず正規には来ない異常メソッドを遮断。低FP=既定で3種を拒否(空配列で無効化可)。
     "blocked_methods": ["TRACE", "TRACK", "CONNECT"],
@@ -173,7 +170,10 @@ _DEFAULTS = {
     "conn_rate_per_ip": 0,
     "window_sec": 10,            # flood検知ウィンドウ
     "flood_threshold": 150,      # window内の要求数閾値
-    "challenge_score": 40,       # これ以上でチャレンジ
+    # スコア閾値は2段階(evolution #110 で PoW チャレンジ段を廃止・単発拒否へ統合):
+    #   deny_score  以上 … その場のリクエストのみ拒否(BANはしない・単発の疑わしい signal 用)。
+    #   block_score 以上 … 自動BAN(TTL付き・累犯エスカレーション)。
+    "deny_score": 40,            # これ以上で単発拒否(BANなし)
     "block_score": 100,          # これ以上でBAN
     "slowloris_score": 50,       # ヘッダ未完(slowloris)1回あたりの加点(反復でBAN)
     # 応答アウェア脅威スコア(evolution #60): バックエンド応答のクライアントエラー(4xx)の
@@ -182,23 +182,23 @@ _DEFAULTS = {
     # クライアントの非ではない事が多いので加点しない(テレメトリのみ)=誤遮断回避。
     "resp_score_enabled": True,  # 応答エラーレートで脅威加点(列挙/ブルートフォース検知)
     "resp_error_window_sec": 60, # 4xx 集計窓
-    "resp_error_threshold": 50,  # 窓内 4xx 数の閾(超で加点・1回=チャレンジ相当の保守値)
-    "resp_error_score": 50,      # 閾超過1回あたりの加点。challenge_score(40)より上=減衰しても
-                                 # 1バーストで確実にチャレンジに乗る。2バーストで block_score(100)→BAN。
+    "resp_error_threshold": 50,  # 窓内 4xx 数の閾(超で加点・1回=保守的な値)
+    "resp_error_score": 50,      # 閾超過1回あたりの加点(note_response は block_score のみ判定=
+                                 # 1バーストはスコア記録に留め即BANしない)。2バーストで block_score(100)→BAN。
     # 要求ボディ検査(evolution #61): head-only の死角=POST/JSON/GraphQL 本文の SQLi/XSS/RCE/SSTI を、
     # 本文先頭を *有界* に能動読取して head と同じ署名エンジンで走査する。block_score 超で BAN。
     "body_scan_enabled": True,   # 要求ボディのシグネチャ走査(head-only の死角を塞ぐ)
     "body_scan_max_bytes": 65536,  # 本文先頭この量だけ走査(全バッファしない=fail-fast/有界)
     # 誤BAN低減(#FP): 要求ボディ(=問い合わせフォーム等の本文)由来のシグネチャは確度が低い
     #   (一般ユーザーが "SELECT 文について" 等と書く)。本文ヒットのスコア寄与をこの係数で下げ、
-    #   『単発の疑わしい本文』では即BANせずチャレンジ止まりにする。1.0=従来どおり。
+    #   『単発の疑わしい本文』では即BANせずスコア記録止まりにする(block_score 未満なら allow)。1.0=従来どおり。
     "body_sig_weight_factor": 0.7,
     "body_decode_enabled": True,   # gzip/deflate 圧縮ボディを有界解凍して走査(#74・圧縮回避封じ)
     # ヘッダ整合性ボット検知(evolution #63): UA はブラウザを名乗るのに実ブラウザが常時送る
     # ヘッダ(Accept-Language/Accept-Encoding)を欠く=ツールの UA 偽装。低FPで *加点のみ*
     # (単独では落とさず、flood/scan 等と合算でエスカレーション)。
     "bot_consistency_enabled": True,   # UA とヘッダの整合性チェック(ブラウザ偽装ツール検知)
-    "bot_inconsistency_score": 20,     # 不整合1回あたりの加点(challenge_score 未満=単独では非遮断)
+    "bot_inconsistency_score": 20,     # 不整合1回あたりの加点(deny_score 未満=単独では非遮断)
     # JWT 検査(evolution #68): Authorization: Bearer の JWT を *鍵無しで* 構造点検する。
     # alg:none(無署名トークン=認証バイパス)を遮断。jwt_allowed_algs を設定すると許可外
     # アルゴリズム(RS256→HS256 等の alg 混同)も遮断。署名検証はアプリの責務(鍵が無い)。
@@ -206,11 +206,11 @@ _DEFAULTS = {
     "jwt_allowed_algs": [],        # 許可する alg のホワイトリスト(空=none のみ遮断)。例 ["RS256","ES256"]
     # クレデンシャル単位レート制限(evolution #70): IP ではなく Bearer トークン/API キーの *識別子*
     # 単位でレートを集計する。攻撃者が IP をローテーションしつつ同一の盗用キーを使う濫用を、IP に
-    # 依らず絞る。トークンは生で保持せずハッシュ短縮。超過で加点(既定=challenge_score→チャレンジ)。
+    # 依らず絞る。トークンは生で保持せずハッシュ短縮。超過で加点(既定=deny_score→単発拒否)。
     "cred_rate_enabled": False,    # API キー/トークン単位のレート制限(IP ローテーション濫用対策)
     "cred_rate_window_sec": 60,    # 集計窓
     "cred_rate_limit": 600,        # 窓内のリクエスト上限(超で加点)
-    "cred_rate_score": 40,         # 超過時の加点(既定=challenge_score 相当→次要求でチャレンジ)
+    "cred_rate_score": 40,         # 超過時の加点(既定=deny_score 相当→次要求で単発拒否)
     # スロー POST(R-U-Dead-Yet)対策(evolution #64): 要求ボディの *総受信時間* に上限を設ける。
     # head slowloris(head_timeout)は対処済みだが、ボディを小出しして接続を保持する攻撃に上限が
     # 無かった。client→backend 方向のみに効く(応答=backend→client の長時間ストリームは縛らない)。
@@ -281,9 +281,6 @@ _DEFAULTS = {
     "ip_blacklist": [],
     "usage_record": True,        # ネットワーク使用量リスト(誰が/どのサイトと/どれだけ)を記録
     "score_halflife_sec": 30.0,  # スコア半減期
-    "challenge_difficulty": 4,   # PoW 先頭ゼロhex桁(基準)
-    "max_difficulty": 6,         # 動的PoWの上限(EWMA/スコアで base→最大ここまで)
-    "verify_ttl_sec": 600,       # チャレンジ通過の有効期間
     # 低速・規則性検知(ステルスBot/スクレイパ。Floodに掛からない等間隔アクセスを炙る)
     "cadence_score": 35,         # 機械的規則性を検知した時の加点
     "cadence_min_samples": 8,    # 判定に要する最小サンプル数
@@ -715,12 +712,10 @@ class NetShield:
         self.path = os.path.join(base, "state.json")
         self._lock = threading.RLock()
         self._ips: dict = {}            # ip -> state
-        self._nonces: dict = {}         # nonce -> (ip, expiry)
         self._events = deque(maxlen=_EVENTS_MAX)
         self._subnets: dict = {}           # subnet -> {ip: last_ban_ts}(分散攻撃の集約検知・有界)
-        self._metrics = {"requests": 0, "allow": 0, "throttle": 0,
-                         "challenge": 0, "block": 0}
-        self._ewma = 0.0                # 全体レートのEWMA(異常検知)
+        self._metrics = {"requests": 0, "allow": 0, "throttle": 0, "block": 0}
+        self._ewma = 0.0                # 全体レートのEWMA(ダッシュボード用テレメトリ)
         self._ewma_last = _now()
         self._started = _now()          # プロセス稼働開始時刻(uptime 算出・ダッシュボード)
         # 既知BAN IP の確率的プリスキャン(真O(k)・bytearray)。BAN時に add、判定は lock-free。
@@ -1018,10 +1013,6 @@ class NetShield:
     def disable(self) -> dict:
         self.cfg["enabled"] = False; self._save(); return {"ok": True, "enabled": False}
 
-    def set_under_attack(self, on: bool) -> dict:
-        self.cfg["under_attack"] = bool(on); self._save()
-        return {"ok": True, "under_attack": bool(on)}
-
     def add_honeypot(self, path: str) -> dict:
         """ハニーポット URL を *アトミックに* 追加する(evolution #84)。管理APIは並行(ThreadingHTTP)
         なので、admin 側の list 読取→append→set_config の read-modify-write はボタン連打で
@@ -1104,7 +1095,7 @@ class NetShield:
                 self._evict()
             st = {"tokens": float(self.cfg["burst"]), "refill": _now(),
                   "window": deque(), "score": 0.0, "score_ts": _now(),
-                  "ban_until": 0.0, "verified_until": 0.0, "seen": _now(),
+                  "ban_until": 0.0, "seen": _now(),
                   "hits": 0, "first": _now(), "last_req": 0.0,
                   "intervals": deque(maxlen=24), "ban_started": 0.0, "ban_count": 0}
             self._ips[ip] = st
@@ -1656,17 +1647,13 @@ class NetShield:
                 return self._enforce_or_audit(ip, "block", st,
                     "スコア超過→BAN: " + (",".join(reasons) or "高スコア"),
                     kind="ban", do_ban=True)
-            need_challenge = (
-                score >= float(self.cfg["challenge_score"]) or
-                ((self.cfg["under_attack"] or self._anomaly())
-                 and zone in ("public", "unknown", "")
-                 and st["verified_until"] <= now))
-            if need_challenge:
-                ch = self._issue_challenge(ip, self._dynamic_difficulty(st))
-                return self._enforce_or_audit(ip, "challenge", st,
-                    "要チャレンジ: " + (",".join(reasons) or
-                    ("under_attack" if self.cfg["under_attack"] else "anomaly")),
-                    challenge=ch)
+            # evolution #110: PoW チャレンジ段を廃止。deny_score 以上は BAN までは至らない
+            # (=まだ確度が低い)単発の疑わしい signal として、この1件だけを拒否する(BANはしない=
+            # 累犯にならなければ次のリクエストから通常どおり再評価される)。
+            if score >= float(self.cfg["deny_score"]):
+                return self._enforce_or_audit(ip, "block", st,
+                    "スコア超過→単発拒否(BANなし): " + (",".join(reasons) or "要注意スコア"),
+                    kind="score_deny")
             if throttled:
                 return self._enforce_or_audit(ip, "throttle", st, throttle_reason)
             return self._out(ip, "allow", st, ",".join(reasons) or "正常")
@@ -1697,8 +1684,8 @@ class NetShield:
         """バックエンド応答1件のステータスを脅威スコアへ還元する(evolution #60)。
         per-IP の 4xx を窓内で数え、閾を超えたら *エラーの足跡* を攻撃兆候として加点する:
           · 404 連射=パス列挙/スキャン、401/403 連射=ブルートフォース/クレデンシャルスタッフィング。
-        加点は保守的(既定=challenge_score 相当)で、1バーストは即BANでなく *チャレンジ* に倒す
-        (誤遮断回避=正規ユーザは PoW を解いて通れる)。反復バーストで block_score 超→BAN。
+        加点は保守的で、1バーストでは即BANしない(誤遮断回避=単発のエラーバーストだけで
+        IPを落とさない)。反復バーストで block_score 超→BAN。
         5xx はバックエンド起因が多く加点しない(テレメトリのみ)。応答パイプから呼ぶ(ロック外)。"""
         try:
             code = int(status)
@@ -2042,9 +2029,9 @@ class NetShield:
                     "note": "分散攻撃の集約検知(/24・v6 /64)。新規IPへソフト加点のみ"
                             "(ハードBANせず=共有NAT巻き添え回避)。既定OFF。"}
 
-    def _out(self, ip, action, st, reason, challenge=None, remain=None):
+    def _out(self, ip, action, st, reason, remain=None):
         self._metrics[action] = self._metrics.get(action, 0) + 1
-        if action in ("block", "challenge"):
+        if action == "block":
             st["hits"] += 1
         sig = (reason.split("signature:", 1)[1].split(",")[0].strip()
                if "signature:" in reason else "")
@@ -2052,13 +2039,11 @@ class NetShield:
                              "action": action, "sig": sig})
         res = {"action": action, "reason": reason,
                "score": round(self._decayed_score(st), 1), "ip": ip}
-        if challenge:
-            res["challenge"] = challenge
         if remain is not None:
             res["ban_remain_sec"] = round(remain, 1)
         return res
 
-    # ── 異常検知(全体レートEWMA) ──
+    # ── 全体レートEWMA(ダッシュボード用テレメトリ) ──
     def _tick_ewma(self):
         now = _now()
         dt = now - self._ewma_last
@@ -2069,11 +2054,7 @@ class NetShield:
         self._ewma = (1 - alpha) * self._ewma + alpha * inst
         self._ewma_last = now
 
-    def _anomaly(self) -> bool:
-        # 自動Under Attack: 全体レートが基準を大きく超えたら防御強化
-        return bool(self.cfg["auto_under_attack"] and self._ewma > 50.0)
-
-    # ── ハニーポット / 低速規則性 / 動的PoW難易度 ──
+    # ── ハニーポット / 低速規則性 ──
     def _is_honeypot(self, path: str) -> bool:
         p = _path_for_match(path).rstrip("/")    # %デコード(#40)=エンコードした囮アクセスも捕捉
         for hp in self.cfg.get("honeypots") or []:
@@ -2101,81 +2082,26 @@ class NetShield:
         cv = (var ** 0.5) / mean
         return cv < float(self.cfg["cadence_cv_threshold"])
 
-    def _dynamic_difficulty(self, st: dict) -> int:
-        """EWMA(全体急増)と個別スコアに比例して PoW 難易度を base→max まで動的に上げる。
-        ハッシュは1桁で約16倍重くなる=GPU Bot ほどコストが跳ね上がる(人間は据え置きで軽い)。"""
-        base = int(self.cfg["challenge_difficulty"])
-        boost = 0
-        if self._ewma > 150.0:
-            boost = 2
-        elif self._ewma > 50.0:
-            boost = 1
-        if self._decayed_score(st) >= float(self.cfg["block_score"]) * 0.8:
-            boost += 1
-        return max(1, min(int(self.cfg["max_difficulty"]), base + boost))
-
-    # ── チャレンジ(Proof-of-Work・自作・動的難易度) ──
-    def _issue_challenge(self, ip: str, difficulty: int = None) -> dict:
-        diff = int(difficulty if difficulty is not None
-                   else self.cfg["challenge_difficulty"])
-        nonce = secrets.token_hex(8)
-        # 難易度を nonce に束縛して保存(検証は発行時の難易度で行う=後から下げられない)
-        self._nonces[nonce] = (ip, _now() + 120, diff)
-        if len(self._nonces) > 5000:
-            self._nonces = {n: v for n, v in self._nonces.items()
-                            if v[1] > _now()}
-        return {"type": "pow", "nonce": nonce, "difficulty": diff,
-                "howto": "sha256(nonce+solution) の先頭が difficulty 桁の'0'(hex)になる "
-                         "solution を見つけ、GET /__chickennet_challenge__?nonce=..&solution=.. へ提出。"}
-
-    def solve_challenge(self, nonce: str, solution: str) -> dict:
-        """クライアントの解を検証。成功でそのIPを verify_ttl 秒だけ通す。
-        検証は **発行時に束縛した難易度** で行う(動的難易度を後から回避させない)。"""
-        with self._lock:
-            ent = self._nonces.get(nonce)
-            if not ent or ent[1] < _now():
-                return {"ok": False, "error": "nonce無効/期限切れ"}
-            ip, _exp, diff = ent
-            digest = hashlib.sha256((nonce + str(solution)).encode()).hexdigest()
-            if not digest.startswith("0" * int(diff)):
-                return {"ok": False, "error": "PoW不正(難易度未達)"}
-            self._nonces.pop(nonce, None)
-            st = self._state(ip)
-            st["verified_until"] = _now() + float(self.cfg["verify_ttl_sec"])
-            st["score"] = 0.0; st["score_ts"] = _now()      # 通過で減点リセット
-            self._event(ip, "verified", {})
-            return {"ok": True, "ip": ip,
-                    "verified_sec": int(self.cfg["verify_ttl_sec"])}
-
     def absorb_suspend(self, gap: float) -> dict:
         """プロセス一時停止(OSスリープ/SIGSTOP/VM一時停止/デバッガ凍結)からの復帰時に呼ぶ(#49)。
-        停止中は wall-clock だけが進むため、進行中の PoW チャレンジ nonce と検証済みセッションが
-        一斉失効して正規ユーザを締め出し(under-attack 時は self-DoS)、時限BANが切れて攻撃者を
-        取り逃がす。停止秒数 gap を『停止開始時点で有効だった』タイマーにのみ足し戻し、停止を
-        無かったかのように補正する(プロセスごと凍結=停止中に攻撃は来ない→足し戻しは安全側)。
+        停止中は wall-clock だけが進むため、時限BANが停止時間の分だけ早く切れて攻撃者を
+        取り逃がす。停止秒数 gap を『停止開始時点で有効だった』BANタイマーにのみ足し戻し、
+        停止を無かったかのように補正する(プロセスごと凍結=停止中に攻撃は来ない→足し戻しは安全側)。
         一時停止(OSスリープ等)を検出する仕組み(旧 watchdog)がある場合にそこから配線する用途。
         返り値=補正件数。"""
         gap = float(gap)
         if gap <= 0:
-            return {"ok": True, "absorbed": 0.0, "nonces": 0, "sessions": 0, "bans": 0}
+            return {"ok": True, "absorbed": 0.0, "bans": 0}
         with self._lock:
             thr = _now() - gap                      # ≈ 停止開始時刻(これより後に切れる=停止時点で有効)
-            n_nonce = n_verify = n_ban = 0
-            for k, ent in list(self._nonces.items()):
-                if isinstance(ent, tuple) and len(ent) == 3 and ent[1] > thr:
-                    self._nonces[k] = (ent[0], ent[1] + gap, ent[2]); n_nonce += 1
+            n_ban = 0
             for st in self._ips.values():
-                vu = st.get("verified_until", 0.0)
-                if vu and vu > thr:                 # 停止時点で有効だった検証済みセッション
-                    st["verified_until"] = vu + gap; n_verify += 1
                 bu = st.get("ban_until", 0.0)
                 if bu and bu != float("inf") and bu > thr:   # 停止時点で有効だった時限BAN
                     st["ban_until"] = bu + gap; n_ban += 1
             self._event("system", "suspend_absorbed",
-                        {"gap_sec": round(gap, 1), "nonces": n_nonce,
-                         "sessions": n_verify, "bans": n_ban})
-        return {"ok": True, "absorbed": round(gap, 1),
-                "nonces": n_nonce, "sessions": n_verify, "bans": n_ban}
+                        {"gap_sec": round(gap, 1), "bans": n_ban})
+        return {"ok": True, "absorbed": round(gap, 1), "bans": n_ban}
 
     # ── BAN管理 ──
     def bans(self) -> list:
@@ -2340,7 +2266,7 @@ class NetShield:
         m = self._metrics
         self._series.append({"t": round(now, 1), "requests": m["requests"],
                              "allow": m["allow"], "block": m["block"],
-                             "challenge": m["challenge"], "throttle": m["throttle"],
+                             "throttle": m["throttle"],
                              "dlp_leak": m.get("dlp_leak", 0),
                              "sig_total": sum(self._sig_hits.values()),
                              "pub": self._zone_hits.get("public", 0),
@@ -2373,7 +2299,6 @@ class NetShield:
                 "appeals_pending": len(self.list_appeals("pending")),
                 "ban_bloom": self._ban_bloom.info(),
                 "global_rate_ewma": round(self._ewma, 2),
-                "anomaly": self._anomaly(),
                 "ts": now}
 
     # ── ネットワーク図(IP:zone:MAC・直感ブロック用) / APT検知の形式化 ──
@@ -2570,7 +2495,6 @@ class NetShield:
                     "active_bans": sum(1 for s in self._ips.values()
                                        if s["ban_until"] > _now()),
                     "global_rate_ewma": round(self._ewma, 2),
-                    "anomaly": self._anomaly(),
                     "dlp_kinds": dict(self._dlp_kinds),
                     "sig_hits": dict(self._sig_hits),
                     "zone_hits": dict(self._zone_hits),

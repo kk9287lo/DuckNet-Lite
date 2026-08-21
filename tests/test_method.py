@@ -11,7 +11,6 @@ from dataplane.engine.lifeform.pipeline import NetShield
 
 def _shield(tmp, **cfg):
     sh = NetShield(state_dir=tmp); sh.enable()
-    sh.cfg["auto_under_attack"] = False
     sh.cfg.update(cfg)
     return sh
 

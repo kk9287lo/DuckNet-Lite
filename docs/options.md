@@ -20,9 +20,8 @@ ChickenNet の挙動は **CLI 引数**・**環境変数**・**設定キー(cfg)*
 | キー | 既定 | 説明 |
 | --- | --- | --- |
 | `enabled` | `False` | 防御全体の ON/OFF(既定 OFF=完全パススルー)。 |
-| `under_attack` | `False` | Under Attack モード(全員に追加チャレンジ・最大強度)。 |
 | `paranoia` | `1` | 検知の厳格度 1–3。 |
-| `challenge_score` / `block_score` | `40` / `100` | チャレンジ発行 / 遮断+自動BAN の脅威スコア閾値。 |
+| `deny_score` / `block_score` | `40` / `100` | 単発拒否(BANなし) / 遮断+自動BAN の脅威スコア閾値。 |
 | `ban_ttl_sec` | `300` | 自動BAN の継続秒(累犯は `ban_escalation`/`ban_escalation_cap` で延長)。 |
 | `body_scan_enabled` / `body_scan_max_bytes` | `True` / `65536` | 要求ボディのシグネチャ走査と上限バイト。 |
 | `body_sig_weight_factor` | `0.7` | **本文由来シグネチャのスコア係数**(誤BAN低減。1.0=従来)。 |

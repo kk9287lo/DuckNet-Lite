@@ -44,7 +44,7 @@ def test_sqli_body_blocks_over_threshold():
 
 
 def test_body_single_hit_does_not_ban_at_default_threshold():
-    # 誤BAN耐性(#FP): 既定閾値(100)では本文の単発ヒットは BAN せずスコア/チャレンジ止まり。
+    # 誤BAN耐性(#FP): 既定閾値(100)では本文の単発ヒットは BAN せずスコア記録止まり。
     # 一般ユーザーが問い合わせフォームに SQL 風の文章を書いただけで永久BAN…を避ける。
     with tempfile.TemporaryDirectory() as d:
         sh = _shield(d)                               # block_score 既定=100

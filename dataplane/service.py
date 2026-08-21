@@ -4,7 +4,7 @@ service.py — ChickenNet L7 Security スタンドアロン・サービス本体
 『あなたのWebサーバの手前にポン置きするだけで DDoS / WAF 防御が完了する』軽量プロキシ。
 外部依存ゼロ(標準ライブラリのみ)・OS非侵襲・防御専用。
 
-  [攻撃] → 前衛ガード(asyncio Fail-Fast: block/denyは即TCP切断, challengeはPoW)
+  [攻撃] → 前衛ガード(asyncio Fail-Fast: block/denyは即TCP切断, throttleは429応答)
          → あなたのバックエンド(WordPress等)
   管理ダッシュボード(Web GUI)で ON/OFF・指標・BAN・設定をクリック操作。
 

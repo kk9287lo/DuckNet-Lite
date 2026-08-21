@@ -59,7 +59,7 @@ def test_button_mash_stress_no_corruption():
                     elif op < 0.85:
                         sh.add_honeypot(f"/h{rnd.randint(0, 20)}")
                     else:
-                        sh.set_config(challenge_score=rnd.choice([30, 40, 50]))
+                        sh.set_config(flood_threshold=rnd.choice([100, 150, 200]))
             except Exception as e:        # noqa: BLE001
                 errors.append(repr(e))
 
