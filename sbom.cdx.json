@@ -1,25 +1,25 @@
 {
   "bomFormat": "CycloneDX",
   "specVersion": "1.5",
-  "serialNumber": "urn:uuid:c85b4b5d-435f-56fd-9974-718078e5e9e6",
+  "serialNumber": "urn:uuid:f1cc5022-bb32-5ad6-a739-f1bcbfb4d139",
   "version": 1,
   "metadata": {
-    "timestamp": "2026-06-26T02:46:47Z",
+    "timestamp": "2026-08-21T05:04:18Z",
     "tools": {
       "components": [
         {
           "type": "application",
           "name": "chickennet gen_sbom",
-          "version": "1.0.0"
+          "version": "1.3.0"
         }
       ]
     },
     "component": {
       "type": "application",
-      "bom-ref": "chickennet-security@1.0.0",
+      "bom-ref": "chickennet-security@1.3.0",
       "name": "chickennet-security",
-      "version": "1.0.0",
-      "purl": "pkg:pypi/chickennet-security@1.0.0",
+      "version": "1.3.0",
+      "purl": "pkg:pypi/chickennet-security@1.3.0",
       "description": "Lightweight L7 DDoS/WAF security gateway (stdlib only, zero runtime dependencies).",
       "licenses": [
         {
@@ -50,42 +50,17 @@
           "value": ">=3.10"
         }
       ]
-    },
-    {
-      "type": "library",
-      "bom-ref": "maxminddb",
-      "name": "maxminddb",
-      "scope": "optional",
-      "purl": "pkg:pypi/maxminddb",
-      "description": "Optional GeoIP lookups; only present if the user installs the 'geoip' extra.",
-      "licenses": [
-        {
-          "license": {
-            "id": "Apache-2.0"
-          }
-        }
-      ],
-      "properties": [
-        {
-          "name": "extra",
-          "value": "geoip"
-        }
-      ]
     }
   ],
   "dependencies": [
     {
-      "ref": "chickennet-security@1.0.0",
+      "ref": "chickennet-security@1.3.0",
       "dependsOn": [
         "cpython"
       ]
     },
     {
       "ref": "cpython",
-      "dependsOn": []
-    },
-    {
-      "ref": "maxminddb",
       "dependsOn": []
     }
   ]

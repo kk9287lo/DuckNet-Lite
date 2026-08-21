@@ -163,35 +163,20 @@ def test_netshield_traffic_signed_and_tamper_rejected():
 
 
 def test_tamper_is_visualized_and_forwarded():
-    # #55: 改竄検知が metrics.tamper / tamper_report に出て、SIEM へ malicious 転送される。
-    from dataplane.engine.lifeform import pipeline as P
-    sent = []
-
-    class _FO:
-        active = True
-        def emit(self, ev, src, verdict):
-            sent.append((ev.get("kind"), verdict))
-
+    # #55: 改竄検知が metrics.tamper / tamper_report に出る(ダッシュボードでの可視化)。
     with tempfile.TemporaryDirectory() as d:
         sh = _fresh_shield(d)
-        orig = P.default_fanout
-        P.default_fanout = lambda: _FO()
-        try:
-            sh.report_tamper("state_tamper", "bans", "fail-safe(default)",
-                             {"file": "blocklist.json"})
-            sh.report_tamper("integrity_tamper", "pipeline.py", "repaired")
-        finally:
-            P.default_fanout = orig
+        sh.report_tamper("state_tamper", "bans", "fail-safe(default)",
+                         {"file": "blocklist.json"})
+        sh.report_tamper("memory_tamper", "cfg", "restored-from-disk")
         m = sh.metrics()["tamper"]
         assert m["count"] == 2
-        assert m["by_kind"]["state_tamper"] == 1 and m["by_kind"]["integrity_tamper"] == 1
-        assert m["last"]["kind"] == "integrity_tamper"
+        assert m["by_kind"]["state_tamper"] == 1 and m["by_kind"]["memory_tamper"] == 1
+        assert m["last"]["kind"] == "memory_tamper"
         rep = sh.tamper_report()
         assert rep["summary"]["count"] == 2
         kinds = {e["kind"] for e in rep["events"]}
-        assert {"state_tamper", "integrity_tamper"} <= kinds
-        assert ("state_tamper", "malicious") in sent          # SIEM へ malicious 転送
-        assert ("integrity_tamper", "malicious") in sent
+        assert {"state_tamper", "memory_tamper"} <= kinds
 
 
 def test_netshield_rejects_tampered_config():

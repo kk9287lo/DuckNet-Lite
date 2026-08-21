@@ -46,7 +46,6 @@ from collections import deque
 from ..core.atomic_io import default_state_dir, atomic_write_json, safe_read_json
 from ..core.signed_state import persistent_key, write_signed_json, read_signed_json
 from .bloom import BloomFilter
-from .forwarders import default_fanout
 from ..core import saferegex
 
 # ── 侵入シグネチャ(L7 WAF・カテゴリ別・原創パターン) ──
@@ -163,7 +162,7 @@ _DEFAULTS = {
     "origin_window_sec": 30,           # トークンの時間バケット幅(リプレイ窓・時計ずれ吸収)
     # 迂回検知 / dead-man's switch(evolution #78): ChickenNet 経由のトラフィックが *直近は活発だったのに
     # 突然ゼロ* になったら、再ルーティング等で迂回された疑い。busy→ゼロ の遷移のみ警報=自然な低トラフ
-    # では誤検知しない。watchdog の周期から呼ぶ。
+    # では誤検知しない。AsyncEdgeGuard の独立した定期チェックループから呼ぶ。
     "stall_detect_enabled": True,    # トラフィック急停止(迂回の疑い)を検知して警報
     "stall_min_rate": 1.0,           # 「直近 busy」とみなす最小レート(req/s)。これ未満は静観
     # 資源枯渇ハードニング(evolution #79): 接続フラッドで FD/ソケット/メモリを枯渇させ OS ごと
@@ -195,10 +194,6 @@ _DEFAULTS = {
     #   『単発の疑わしい本文』では即BANせずチャレンジ止まりにする。1.0=従来どおり。
     "body_sig_weight_factor": 0.7,
     "body_decode_enabled": True,   # gzip/deflate 圧縮ボディを有界解凍して走査(#74・圧縮回避封じ)
-    # 正のセキュリティモデル(evolution #62): 許可した (パス,メソッド) だけ通す allowlist。
-    # 既定OFF(運用者が許可リストを定義して有効化)。enforce=逸脱を遮断、audit=記録のみ。
-    "posmodel_enabled": False,   # スキーマ allowlist(許可外エンドポイントを弾く正のモデル)
-    "posmodel_mode": "enforce",  # enforce=遮断 / audit=記録のみ(段階導入用)
     # ヘッダ整合性ボット検知(evolution #63): UA はブラウザを名乗るのに実ブラウザが常時送る
     # ヘッダ(Accept-Language/Accept-Encoding)を欠く=ツールの UA 偽装。低FPで *加点のみ*
     # (単独では落とさず、flood/scan 等と合算でエスカレーション)。
@@ -269,9 +264,8 @@ _DEFAULTS = {
     "blocked_extensions": [],    # 遮断する拡張子(例 .env .sql .bak .git .ini)
     "blocked_urls": [],          # 遮断するURL部分文字列(例 /admin /wp-admin)
     "require_tls": False,        # 正規TLS以外(平文)を遮断(X-Forwarded-Proto=https 必須)
-    "geo_mode": "off",           # off / allow / block(CIDR) / country_allow / country_block(GeoIP DB)
+    "geo_mode": "off",           # off / allow / block(CIDR)
     "geo_cidrs": [],             # 国/地域のCIDR(海外通信ブロック等・DB不要)
-    "geo_countries": [],         # 国コード(例 ["JP"])。geo_mode=country_* + GeoIP DB で精密判定
     # データ漏洩防止: 1IPが窓(N日)内に送出できる量/接続時間の上限(明らかな大量流出を遮断)
     "quota_enabled": False,
     "quota_window_days": 1,      # 集計窓(1〜N日)
@@ -332,9 +326,6 @@ _DEFAULTS = {
     "sec_headers_enabled": False,  # 既定OFF(オプトイン)。ON で保守的な既定ヘッダ群を付与
     "sec_headers_extra": {},     # 運用者の追加/上書き(例 {"Content-Security-Policy": "default-src 'self'"})
     "sec_headers_strip": [],     # 除去するヘッダ名(例 ["Server","X-Powered-By"]=指紋/情報漏洩を消す)
-    # トランザクションログ(evolution #14): 全リクエストを安定スキーマで構造化記録。
-    "txnlog_enabled": False,     # 既定OFF(全リクエスト=高ボリューム)。<state>/txn_log.jsonl へ追記
-    "txnlog_forward": False,     # 各トランザクションも SIEM へ転送(高ボリューム=syslog UDP 推奨)
 }
 # 既定OFFの高FPシグネチャ(テンプレ/内部IPはアプリ次第で正規にも現れる=オプトイン運用)。
 _OPTIONAL_SIGS = frozenset({"ssti", "ssrf_internal", "redirect"})
@@ -362,10 +353,6 @@ def _subnet_key(ip: str):
         return str(ipaddress.ip_network(f"{ip}/{24 if ver == 4 else 64}", strict=False))
     except Exception:
         return None
-# SIEM/Webhook 転送のスロットル: 同一 (ip,kind) はこの窓内 1 回だけ転送する(flood 下で
-# SIEM を溺れさせない。ローカル _events への記録は常に維持)。マップは件数上限で有界化。
-_FWD_WINDOW = 60.0
-_FWD_GATE_CAP = 4096
 _CRED_RATE_CAP = 50000   # クレデンシャル単位レート集計マップの上限(#70・メモリ有界)
 # 重複(挙動同値)検知用の小コーパス(攻撃片+良性)。新旧パターンの一致集合を比較する。
 _DEDUP_CORPUS = [
@@ -730,7 +717,6 @@ class NetShield:
         self._ips: dict = {}            # ip -> state
         self._nonces: dict = {}         # nonce -> (ip, expiry)
         self._events = deque(maxlen=_EVENTS_MAX)
-        self._fwd_seen: dict = {}          # (ip,kind) -> last_forward_ts(SIEM転送スロットル)
         self._subnets: dict = {}           # subnet -> {ip: last_ban_ts}(分散攻撃の集約検知・有界)
         self._metrics = {"requests": 0, "allow": 0, "throttle": 0,
                          "challenge": 0, "block": 0}
@@ -779,10 +765,6 @@ class NetShield:
         self._stall_ts = -1.0              # -1=未初期化(warmup 番兵。now=0 と衝突しない)
         self._stall_prev_rate = 0.0        # 前区間のレート(busy→ゼロ 遷移の判定用)
         self._cfg_mac = ""                 # in-memory cfg の整合 MAC(#85・メモリすり替え検知)
-        self._posmodel_path = os.path.join(base, "posmodel.json")  # 正のモデル(許可リスト・#62)
-        from .posmodel import PositiveModel
-        self._posmodel = PositiveModel()   # 既定空=制約なし。reload_posmodel で読み込む
-        self._country_hits: dict = {}      # 国別の累積内訳(GeoIP DB ロード時のみ)
         self._declog = deque(maxlen=500)   # 直近の判定ログ(プロ分析のゾーン/シグネチャ内訳用)
         self._last_zone = ""
         self.cfg = dict(_DEFAULTS)
@@ -790,7 +772,6 @@ class NetShield:
         self._load_sigs()
         self._compile_geo()
         self._load_bans()
-        self.reload_posmodel()
         if self.cfg.get("persist_bans"):
             _tv, _tm = self._read_state(self._traffic_path, {}, "traffic")
             self._traffic = (_tv or {}).get("traffic", {})
@@ -868,7 +849,8 @@ class NetShield:
         """in-memory cfg が *API を通さない out-of-band 改変*(デバッガ/プロセス注入によるメモリ
         すり替え)で書き換えられていないか検査する(#85)。正規変更は _save 時に MAC を更新するので、
         MAC 不一致=正規経路を通らない改変。検出したら署名検証済みディスク state から cfg を復元し
-        (=最後の正規状態へ戻す)、memory_tamper を警報する。watchdog の周期から呼ぶ。"""
+        (=最後の正規状態へ戻す)、memory_tamper を警報する。AsyncEdgeGuard の独立した
+        定期チェックループから呼ぶ。"""
         with self._lock:
             if hmac.compare_digest(self._compute_cfg_mac().encode("ascii", "ignore"),
                                    str(self._cfg_mac).encode("ascii", "ignore")):
@@ -1196,15 +1178,6 @@ class NetShield:
                 return "地域許可リスト外(海外通信ブロック)"
             if gm == "block" and inside:
                 return "地域遮断リストに該当"
-        if gm in ("country_allow", "country_block"):
-            from .geoip import geoip
-            cc = geoip().country(ip)
-            if cc:                              # DB未ロード(cc="")はフォールバック=判定しない
-                ccs = {str(c).upper() for c in self.cfg.get("geo_countries") or []}
-                if gm == "country_allow" and cc not in ccs:
-                    return f"国許可外(海外通信ブロック: {cc})"
-                if gm == "country_block" and cc in ccs:
-                    return f"遮断対象国: {cc}"
         return ""
 
     @staticmethod
@@ -1551,33 +1524,15 @@ class NetShield:
             _targets.append(host)            # Host も走査面に(Host経由のLog4Shell/SQLi死角を塞ぐ・#41)
         _targets.extend(h for h in (headers or "").split("\n") if h)
         blob = _normalize_for_scan(_targets[0])    # 主走査面(reason/後続参照の後方互換用)
-        try:
-            from .canary import canary_minter
-            _cm = canary_minter()
-            _cm = None if _cm.empty else _cm
-        except Exception:
-            _cm = None
         sig_hit, sig_weight = self._scan_signatures(blob)
-        canary_hit = _cm.match(blob) if _cm is not None else None
         for _t in _targets[1:_MAX_SCAN_FIELDS]:    # ヘッダ各値を独立面として(必要分だけ)走査
-            if sig_hit is not None and (canary_hit is not None or _cm is None):
+            if sig_hit is not None:
                 break
             _nb = _normalize_for_scan(_t)
-            if sig_hit is None:
-                sig_hit, sig_weight = self._scan_signatures(_nb)
-            if canary_hit is None and _cm is not None:
-                canary_hit = _cm.match(_nb)
+            sig_hit, sig_weight = self._scan_signatures(_nb)
         # テレメトリ(ロック外で算出=ロック保持時間を伸ばさない)。method は攻撃者入力ゆえ
-        # 既知メソッド名のみ採用し OTHER に畳む(辞書の無制限肥大を防ぐ)。国は GeoIP DB ロード時のみ。
+        # 既知メソッド名のみ採用し OTHER に畳む(辞書の無制限肥大を防ぐ)。
         mkey = method.upper() if (method and method.isalpha() and len(method) <= 10) else "OTHER"
-        cc = ""
-        try:
-            from .geoip import geoip
-            _g = geoip()
-            if _g.loaded:
-                cc = _g.country(ip) or "??"
-        except Exception:
-            cc = ""
         with self._lock:
             self._metrics["requests"] += 1
             if sig_hit:                       # シグネチャ別ヒットの累積内訳(テレメトリ・推移用)
@@ -1585,8 +1540,6 @@ class NetShield:
             _zk = zone or "?"                 # ゾーン別リクエストの累積内訳(トラフィック構成)
             self._zone_hits[_zk] = self._zone_hits.get(_zk, 0) + 1
             self._method_hits[mkey] = self._method_hits.get(mkey, 0) + 1  # メソッド別
-            if cc:                            # 国別(GeoIP DB ロード時のみ。??=DB有だが不一致)
-                self._country_hits[cc] = self._country_hits.get(cc, 0) + 1
             self._tick_ewma()
             self._last_zone = zone           # _out で判定ログに残す(プロ分析の内訳用)
             st = self._state(ip)
@@ -1659,20 +1612,6 @@ class NetShield:
                     st["score"] = float(self.cfg["block_score"])
                     return self._enforce_or_audit(ip, "block", st, "JWT: " + jv,
                                                   kind="jwt_block", do_ban=True)
-            # 1.27) 正のセキュリティモデル(evolution #62): 許可した (パス,メソッド) 以外を弾く
-            #       allowlist。未知の攻撃/ゼロデイにも構造的に強い(許可外=通さない)。enforce=遮断、
-            #       audit=記録のみ(段階導入)。ルール空/無効時はスキップ。
-            if self.cfg.get("posmodel_enabled") and not self._posmodel.empty:
-                pm = self._posmodel.check(method, path)
-                if not pm.get("allowed"):
-                    if self.cfg.get("posmodel_mode", "enforce") == "audit":
-                        self._event(ip, "posmodel_violation",
-                                    {"reason": pm["reason"], "path": (path or "")[:80],
-                                     "method": (method or "")[:10], "mode": "audit"})
-                    else:
-                        return self._enforce_or_audit(
-                            ip, "block", st, "正モデル逸脱: " + pm["reason"],
-                            kind="posmodel_block")
             # 1.3) ポリシー(拡張子/URL/正規TLS以外/海外CIDR/サイト許可遮断)。監査なら通過+アラート。
             pol = (self._policy_block(ip, path, tls) or self._site_block(host)
                    or self._ip_list_block(ip))
@@ -1684,19 +1623,6 @@ class NetShield:
                 st["score"] = float(self.cfg["block_score"])
                 return self._enforce_or_audit(ip, "block", st, "ハニーポット命中→即時BAN",
                                               kind="honeypot_ban", do_ban=True)
-            # 1.6) カナリアトークン作動(evolution #13): 植えた罠の文字列が要求に現れた=確定侵害。
-            #      即時BAN + 台帳に作動記録(memo/チャネル付き→#10で SIEM へ自動転送)。
-            if canary_hit:
-                st["score"] = float(self.cfg["block_score"])
-                try:
-                    from .canary import canary_minter
-                    canary_minter().trigger(canary_hit["token"], ip, "edge", ua=user_agent)
-                except Exception:
-                    pass
-                return self._enforce_or_audit(
-                    ip, "block", st,
-                    "カナリア作動: " + (canary_hit.get("memo") or canary_hit.get("kind", "")),
-                    kind="canary_ban", do_ban=True)
             # 2) 侵入シグネチャ(ロック外で判定済み・組込/カスタム共通)を反映
             if sig_hit:
                 self._add_score(st, sig_weight or _SIG_WEIGHT.get(sig_hit, 30))
@@ -1811,11 +1737,6 @@ class NetShield:
             else:
                 self._event(ip, "resp_anomaly", {"reason": reason, "score": round(score, 1)})
                 banned = False
-        try:
-            self._forward(ip, "resp_anomaly", "malicious" if banned else "suspicious",
-                          signals=[reason])
-        except Exception:
-            pass
         return {"action": "block" if banned else "score", "banned": banned,
                 "score": round(score, 1)}
 
@@ -1862,11 +1783,6 @@ class NetShield:
             else:
                 self._event(ip, "body_sig", {"signature": sig_hit, "score": round(score, 1)})
                 act, banned = "score", False
-        try:
-            self._forward(ip, "body_sig", "malicious" if banned else "suspicious",
-                          signals=[sig_hit])
-        except Exception:
-            pass
         return {"action": act if act in ("block", "throttle") else "score",
                 "banned": banned, "signature": sig_hit, "score": round(score, 1)}
 
@@ -1890,11 +1806,6 @@ class NetShield:
                                        do_ban=True)
             act = r.get("action", "block")
             banned = st.get("ban_until", 0) > _now()
-        try:
-            self._forward(ip, "upload_block", "malicious" if banned else "suspicious",
-                          signals=[f".{ext}", fn])
-        except Exception:
-            pass
         return {"action": act if act in ("block", "throttle") else "score",
                 "banned": banned, "ext": ext, "filename": fn, "score": round(score, 1)}
 
@@ -1927,48 +1838,8 @@ class NetShield:
                                        do_ban=True)
             act = r.get("action", "block")
             banned = st.get("ban_until", 0) > _now()
-        try:
-            self._forward(ip, "graphql_block", "malicious" if banned else "suspicious",
-                          signals=[res["reason"]])
-        except Exception:
-            pass
         return {"action": act if act in ("block", "throttle") else "score",
                 "banned": banned, "reason": res["reason"], "score": round(score, 1)}
-
-    # ── 正のセキュリティモデル(スキーマ allowlist・evolution #62) ──
-    def reload_posmodel(self) -> dict:
-        """許可リストを <state>/posmodel.json から読み直す(署名検証つき=#52 と一貫)。
-        形式 {"rules":[{"path","match","methods"}, ...]}。改竄=空(制約なし=fail-open)+警報。
-        regex ルールは ReDoS 検証を通った安全なものだけ載せる。"""
-        from .posmodel import build_model
-        d, migrate = self._read_state(self._posmodel_path, {}, "posmodel")
-        rules = (d or {}).get("rules", []) if isinstance(d, dict) else []
-        model = build_model(rules, validate=self.validate_pattern)
-        with self._lock:
-            self._posmodel = model
-        if migrate and rules:
-            self._save_posmodel(rules)                # 旧来無署名→署名済みへ移行
-        return {"ok": True, "rules": model.size}
-
-    def _save_posmodel(self, rules) -> bool:
-        return write_signed_json(self._posmodel_path, {"rules": list(rules)},
-                                 self._state_key)
-
-    def set_posmodel(self, rules) -> dict:
-        """許可リストを丸ごと設定して永続化(署名つき)。即時に有効化される。"""
-        if not isinstance(rules, list):
-            return {"ok": False, "error": "rules must be a list"}
-        from .posmodel import build_model
-        with self._lock:
-            self._posmodel = build_model(rules, validate=self.validate_pattern)
-            self._save_posmodel(rules)
-            n = self._posmodel.size
-        return {"ok": True, "rules": n, "loaded": n}
-
-    def posmodel_status(self) -> dict:
-        return {"enabled": bool(self.cfg.get("posmodel_enabled")),
-                "mode": self.cfg.get("posmodel_mode", "enforce"),
-                "rules": self._posmodel.size}
 
     # ── 応答セキュリティヘッダ(evolution #12) ──
     def set_sec_headers_enabled(self, on: bool) -> dict:
@@ -2025,13 +1896,6 @@ class NetShield:
             self._save()
         return {"ok": True, "blocked_methods": list(norm)}
 
-    # ── トランザクションログ(evolution #14) ──
-    def set_txnlog_enabled(self, on: bool) -> dict:
-        """トランザクションログの ON/OFF(永続化)。記録は proxy が cfg を読んで実施。"""
-        with self._lock:
-            self.cfg["txnlog_enabled"] = bool(on)
-            self._save()
-        return {"ok": True, "txnlog_enabled": self.cfg["txnlog_enabled"]}
 
     # ── 出口DLP(evolution #6) ──
     def dlp_active(self) -> bool:
@@ -2050,7 +1914,6 @@ class NetShield:
             for k in kinds:                         # 漏洩した秘密種別の累積内訳(テレメトリ)
                 self._dlp_kinds[k] = self._dlp_kinds.get(k, 0) + 1
             self._event(ip, "dlp_leak", {"kinds": kinds})
-        self._forward(ip, "dlp_leak", "malicious", kinds)   # 秘密の出口漏洩=SOC 最優先
         return {"action": self.cfg.get("dlp_action", "audit"), "kinds": kinds}
 
     def _enforce_or_audit(self, ip, action, st, reason, *, kind="",
@@ -2058,8 +1921,6 @@ class NetShield:
         """決定点の一元化。監査モードは遮断せず通過+アラート。enforce は必要ならBAN設定。"""
         if self.cfg.get("mode") == "audit":
             self._event(ip, "audit", {"would": action, "reason": reason[:120], "rule": kind})
-            self._forward(ip, kind or "audit", "suspicious",   # 監査=遮断せず可視化(would-block)
-                          [f"would {action}: {reason}"[:160]])
             return self._out(ip, "allow", st, f"AUDIT(would {action}): {reason}")
         if do_ban:
             st["ban_count"] = st.get("ban_count", 0) + 1       # 累犯回数(エスカレーション用)
@@ -2079,8 +1940,6 @@ class NetShield:
                 self._record_subnet_ban(ip)
             if kind:
                 self._event(ip, kind, {"reason": reason[:120], "count": st["ban_count"]})
-        if do_ban or action == "block":         # 実遮断/BAN は脅威=malicious(challenge/throttle は送らない)
-            self._forward(ip, kind or action, "malicious", [reason[:160]])
         return self._out(ip, action, st, reason, **kw)
 
     def _take_token(self, st: dict) -> bool:
@@ -2294,7 +2153,8 @@ class NetShield:
         一斉失効して正規ユーザを締め出し(under-attack 時は self-DoS)、時限BANが切れて攻撃者を
         取り逃がす。停止秒数 gap を『停止開始時点で有効だった』タイマーにのみ足し戻し、停止を
         無かったかのように補正する(プロセスごと凍結=停止中に攻撃は来ない→足し戻しは安全側)。
-        watchdog(resilience)の suspend 検出から配線する。返り値=補正件数。"""
+        一時停止(OSスリープ等)を検出する仕組み(旧 watchdog)がある場合にそこから配線する用途。
+        返り値=補正件数。"""
         gap = float(gap)
         if gap <= 0:
             return {"ok": True, "absorbed": 0.0, "nonces": 0, "sessions": 0, "bans": 0}
@@ -2343,8 +2203,6 @@ class NetShield:
             self._ban_bloom.add(ip)
             self._save_bans()
         self._event(ip, "manual_ban", {"permanent": permanent})
-        self._forward(ip, "manual_ban", "info",      # 運用者の操作=監査証跡として転送
-                      ["operator ban" + (" (permanent)" if permanent else "")])
         return {"ok": True, "banned": ip, "permanent": permanent}
 
     # ── 一時制限(状況報告書→管理者アラート→双方合意で解除) ──
@@ -2651,7 +2509,8 @@ class NetShield:
         self._events.append({"ts": _now(), "ip": ip, "kind": kind, **extra})
 
     def traffic_stall_check(self, now: float = None) -> dict:
-        """迂回検知 / dead-man's switch(#78)。周期(watchdog)から呼ぶ。直近の区間が busy
+        """迂回検知 / dead-man's switch(#78)。AsyncEdgeGuard の独立した定期チェックループから
+        周期的に呼ぶ。直近の区間が busy
         (>= stall_min_rate)だったのに *今区間で1件も通っていない* なら、再ルーティング等で
         ChickenNet を迂回された疑いとして警報する。busy→ゼロ の遷移のみ=自然な低トラフィックや
         graceful な停止では鳴らない。返り値 {"stall": bool, ...}。"""
@@ -2674,20 +2533,13 @@ class NetShield:
                             {"prev_rate": round(prev_rate, 2), "gap_sec": round(dt, 1),
                              "note": "edge traffic stopped while recently busy=possible bypass"})
             ev = stalled
-        if ev:
-            try:
-                self._forward("system", "traffic_stall", "suspicious",
-                              signals=[f"prev_rate={round(prev_rate, 2)}/s", "possible-bypass"])
-            except Exception:
-                pass
         return {"stall": bool(ev), "prev_rate": round(prev_rate, 2)}
 
     def report_tamper(self, kind: str, what: str, action: str, extra=None) -> dict:
         """改竄検知を *一級アラート* として可視化する単一経路(#55)。
           · ローカル events に記録(ダッシュボードの /api/shield/events に出る)。
           · 件数/直近/種別内訳を計上 → status/metrics の `tamper` ブロックで前面に出す。
-          · SIEM/Webhook へ malicious 重大度で転送(opt-in・設定時)=SOC が即気づける。
-        kind: "state_tamper"(状態ファイル改竄)/ "integrity_tamper"(コード/不変ファイル改竄)。"""
+        kind: "state_tamper"(状態ファイル改竄)/ "memory_tamper"(in-memory cfg 改竄)。"""
         d = {"what": what, "action": action}
         if extra:
             d.update(extra)
@@ -2696,34 +2548,7 @@ class NetShield:
             self._tamper["last"] = {"ts": round(_now(), 1), "kind": kind, **d}
             self._tamper["by_kind"][kind] = self._tamper["by_kind"].get(kind, 0) + 1
         self._event("system", kind, d)
-        try:
-            self._forward("system", kind, "malicious",
-                          signals=[s for s in (what, action, d.get("file", "")) if s])
-        except Exception:
-            pass
         return {"ok": True, "tamper_count": self._tamper["count"]}
-
-    def _forward(self, ip, kind, verdict, signals=()):
-        """重要検知のみ SIEM/Webhook へ転送する(本体WAFの配線)。ホットパス安全:
-          · opt-in: env(CHICKENNET_SYSLOG/WEBHOOK)未設定なら active=False で即 return=ゼロコスト。
-          · スロットル: 同一 (ip,kind) は窓内1回だけ(flood で SIEM を溺れさせない。ローカル
-            _events 記録は別途常に維持)。マップは _FWD_GATE_CAP で有界(最古を間引く)。
-          · 非ブロッキング: emit は 2worker プールへ submit するだけ(SIEM I/O は別スレッド)。
-        manual_ban 経路はロック外から呼ばれ得るので RLock を取り直す(再入で安全)。"""
-        fo = default_fanout()
-        if not fo.active:
-            return                              # 既定OFF=完全 no-op
-        now = _now()
-        with self._lock:
-            last = self._fwd_seen.get((ip, kind))
-            if last is not None and now - last < _FWD_WINDOW:
-                return                          # 窓内重複=転送抑止
-            if len(self._fwd_seen) >= _FWD_GATE_CAP:
-                for k in list(self._fwd_seen)[:_FWD_GATE_CAP // 10]:
-                    self._fwd_seen.pop(k, None)
-            self._fwd_seen[(ip, kind)] = now
-        fo.emit({"client": ip, "kind": kind, "verdict": verdict,
-                 "signals": [str(s) for s in signals][:3]}, "waf", verdict)
 
     def events(self, limit: int = 100) -> list:
         with self._lock:
@@ -2751,7 +2576,6 @@ class NetShield:
                     "zone_hits": dict(self._zone_hits),
                     "method_hits": dict(self._method_hits),
                     "resp_code_hits": dict(self._resp_code_hits),   # 応答ステータス帯(#60)
-                    "country_hits": dict(self._country_hits),
                     "tamper": dict(self._tamper),          # 改竄検知の可視化(#55)
                     "ban_bloom": self._ban_bloom.info()}
 
@@ -2761,7 +2585,7 @@ class NetShield:
             summary = {k: (dict(v) if isinstance(v, dict) else v)
                        for k, v in self._tamper.items()}
         evs = [e for e in self.events(200)
-               if e.get("kind") in ("state_tamper", "integrity_tamper")]
+               if e.get("kind") in ("state_tamper", "memory_tamper")]
         return {"summary": summary, "events": evs[:50]}
 
     def status(self) -> dict:

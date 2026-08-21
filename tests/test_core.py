@@ -100,34 +100,6 @@ def test_dashboard_state_and_token():
             FW._FW, ND._SHIELD = ofw, osh
 
 
-def test_dashboard_canary_visualization():
-    # evolution #9 配線: 本命囮の持ち出し(exfil)/外部開封(trigger)をダッシュボードで可視化。
-    import tempfile
-    from dataplane.engine.lifeform import datasets as H
-    with tempfile.TemporaryDirectory() as tmp:
-        ofw, osh = FW._FW, ND._SHIELD
-        adm, url, token = _admin_with_temp(tmp)
-        oldbook = H._LEDGER
-        H._LEDGER = H.TokenLedger(state_dir=tmp)          # 隔離した台帳
-        try:
-            assert b'id="ledger"' in _req(url + "/")[1] and "参照トークン台帳".encode() in _req(url + "/")[1]
-            d0 = json.loads(_req(url + "/api/ledger", token=token)[1])
-            assert d0["present"] is True and d0["tokens"] == 0
-            # 囮を配布→持ち出し→外部で開封 が状態に出る
-            m = H.build_manifest(40000, seed=11)
-            H._LEDGER.register(m)
-            H._LEDGER.record_pull("45.146.0.3", m[0])
-            H._LEDGER.record_hit(m[0]["token"], "203.0.113.50", ua="curl/8")
-            d = json.loads(_req(url + "/api/ledger", token=token)[1])
-            assert d["tokens"] == len(m)
-            assert d["metrics"].get("pull") == 1 and d["metrics"].get("hit") == 1
-            assert any(e.get("token") == m[0]["token"] for e in d["recent"])
-        finally:
-            H._LEDGER = oldbook
-            adm.stop()
-            FW._FW, ND._SHIELD = ofw, osh
-
-
 def test_dashboard_deception_status_visualization():
     # #4 配線: デセプション(MTD)の状態とローテーション プレビューを可視化(env 駆動・状態レス)。
     import os
@@ -255,7 +227,7 @@ def test_dashboard_dlp_wiring():
 
 
 def test_dashboard_advanced_defenses_wiring():
-    # #11〜#16 配線: ダッシュボードから 応答ヘッダ / txnログ のトグルと paranoia 段階を
+    # #11〜#16 配線: ダッシュボードから 応答ヘッダ のトグルと paranoia 段階を
     # 操作でき、状態に反映される(バックエンドは既存 /api/shield/config + /api/shield/paranoia)。
     import tempfile
     with tempfile.TemporaryDirectory() as tmp:
@@ -264,21 +236,20 @@ def test_dashboard_advanced_defenses_wiring():
         try:
             ND._SHIELD.enable()
             _, html = _req(url + "/")
-            for cid in (b'id="sech"', b'id="txnlog"', b'id="paranoia"',
+            for cid in (b'id="sech"', b'id="paranoia"',
                         b'id="advstat"'):
                 assert cid in html
             assert "詳細防御".encode() in html
             # 既定: すべてOFF / paranoia=1
             st = json.loads(_req(url + "/api/state", token=token)[1])["shield"]["cfg"]
             assert st["sec_headers_enabled"] is False
-            assert st["txnlog_enabled"] is False and st["paranoia"] == 1
-            # 2トグルを一括ON(既存 config エンドポイント)
+            assert st["paranoia"] == 1
+            # トグルをON(既存 config エンドポイント)
             code, body = _req(url + "/api/shield/config", token=token,
-                              body={"sec_headers_enabled": True,
-                                    "txnlog_enabled": True})
+                              body={"sec_headers_enabled": True})
             assert code == 200 and json.loads(body)["ok"] is True
             st = json.loads(_req(url + "/api/state", token=token)[1])["shield"]["cfg"]
-            assert st["sec_headers_enabled"] and st["txnlog_enabled"]
+            assert st["sec_headers_enabled"]
             # paranoia を段階設定 → optional_sigs も一括反映
             code, body = _req(url + "/api/shield/paranoia", token=token, body={"level": 3})
             assert code == 200 and json.loads(body)["paranoia"] == 3
@@ -445,31 +416,18 @@ def test_semantic_tautology_catches_value_swapped_sqli():
         assert "sqli-stacked" in d2.get("reason", "")
 
 
-def test_method_and_country_telemetry_breakdown():
-    # evolution #7 拡張: メソッド別(攻撃者入力ゆえ既知名のみ+OTHER畳み)と国別(GeoIP DB
-    # ロード時のみ)の累積内訳。
+def test_method_telemetry_breakdown():
+    # evolution #7 拡張: メソッド別(攻撃者入力ゆえ既知名のみ+OTHER畳み)の累積内訳。
     import tempfile
-    import dataplane.engine.lifeform.geoip as GEO
     with tempfile.TemporaryDirectory() as tmp:
-        old_geo = GEO._GEO
-        GEO._GEO = None                       # GeoIP シングルトンを隔離(他テストへ汚染しない)
-        try:
-            sh = ND.NetShield(state_dir=tmp)
-            sh.enable()
-            sh.inspect("1.0.0.1", path="/", method="GET")
-            sh.inspect("1.0.0.2", path="/", method="POST")
-            sh.inspect("1.0.0.3", path="/", method="post")     # 小文字→正規化
-            sh.inspect("1.0.0.4", path="/", method="ZZ;evil")  # 不正→OTHER(辞書肥大防止)
-            m = sh.metrics()
-            assert m["method_hits"] == {"GET": 1, "POST": 2, "OTHER": 1}
-            assert m["country_hits"] == {}      # GeoIP DB 未ロード=国別なし
-            # GeoIP DB をロードすると国別が出る
-            GEO.geoip().load_pairs([("1.0.0.0/24", "AU"), ("8.8.8.0/24", "US")])
-            sh.inspect("1.0.0.9", path="/", method="GET")
-            sh.inspect("8.8.8.8", path="/", method="GET")
-            assert sh.metrics()["country_hits"] == {"AU": 1, "US": 1}
-        finally:
-            GEO._GEO = old_geo                # シングルトンを元に戻す
+        sh = ND.NetShield(state_dir=tmp)
+        sh.enable()
+        sh.inspect("1.0.0.1", path="/", method="GET")
+        sh.inspect("1.0.0.2", path="/", method="POST")
+        sh.inspect("1.0.0.3", path="/", method="post")     # 小文字→正規化
+        sh.inspect("1.0.0.4", path="/", method="ZZ;evil")  # 不正→OTHER(辞書肥大防止)
+        m = sh.metrics()
+        assert m["method_hits"] == {"GET": 1, "POST": 2, "OTHER": 1}
 
 
 def test_zone_telemetry_breakdown_and_public_trend():
@@ -1095,37 +1053,6 @@ def test_dashboard_oversized_body_is_capped():
         finally:
             adm.stop()
             FW._FW, ND._SHIELD = ofw, osh
-
-
-def test_dashboard_detections_reads_logs():
-    import os
-    import tempfile
-    from dataplane.engine.core.atomic_io import append_jsonl
-    with tempfile.TemporaryDirectory() as tmp:
-        # 別プロセスが書く想定の検知ログを用意。
-        append_jsonl(os.path.join(tmp, "dns_log.jsonl"),
-                     {"ts": 2.0, "domain": "x.evil.example", "qtype": "TXT",
-                      "action": "alert", "threat": "malicious"})
-        # アローリストで除外(ignored)された接触=脅威ではない→パネルから外れるはず
-        append_jsonl(os.path.join(tmp, "dns_log.jsonl"),
-                     {"ts": 1.5, "domain": "ok.example", "qtype": "A",
-                      "action": "ignored", "threat": "suspicious"})
-        adm = AdminDashboard(host="127.0.0.1", port=0, state_dir=tmp)
-        info = adm.start()
-        url, token = info["url"], adm.token
-        try:
-            code, _ = _req(url + "/api/detections")          # token 必須
-            assert code == 401
-            code, body = _req(url + "/api/detections", token=token)
-            assert code == 200
-            d = json.loads(body)
-            # ignored(信頼ソース)は脅威ビューから除外 → dns は alert の1件のみ
-            assert d["counts"]["dns"] == 1
-            assert d["sources"]["dns"][0]["domain"] == "x.evil.example"
-            assert all(r.get("action") != "ignored"
-                       for r in d["sources"]["dns"])            # 除外を確認
-        finally:
-            adm.stop()
 
 
 if __name__ == "__main__":

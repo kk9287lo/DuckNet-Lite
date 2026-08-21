@@ -4,7 +4,6 @@
 .DESCRIPTION
   Python を堅牢に検出し、バージョンを確認し、UTF-8 を整えて製品本体へ委譲する。
     .\run.ps1                      # ゲートウェイ(前衛 + 管理ダッシュボード)
-    .\run.ps1 dns        --help    # DNS の L7 検知
     .\run.ps1 --help               # 製品の全オプション
   環境変数:
     CHICKENNET_PYTHON    使う Python を明示(未設定なら .venv -> python -> py)

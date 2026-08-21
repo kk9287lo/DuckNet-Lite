@@ -94,7 +94,7 @@ class _FakeServer:
 
 
 def test_stop_on_dead_loop_is_clean():
-    # #57 review fix: ループが既に停止している(watchdog 復旧後など)時の stop() は
+    # #57 review fix: ループが既に停止している(restart() 直後など)時の stop() は
     #   _drain を投入せず=コルーチン未await 警告も無駄な待機も無く、例外なく返る。
     g = AsyncEdgeGuard()
     loop = asyncio.new_event_loop()        # 走っていないループ(is_running()=False)

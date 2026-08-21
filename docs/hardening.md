@@ -6,9 +6,8 @@
 > **実装しません**。本物の EDR と同じく、保護は **透明**(管理者は常に正規の手段で停止・確認できる)で、
 > 阻むのは **攻撃者だけ**です。本書はその透明な保護を OS ごとに設定する手順です。
 
-アプリ内蔵の自己防衛(watchdog/強制再起動/一時停止安定化=#47/#49、ファイルすり替え検知+強制修復=#48、
-可変状態の HMAC 署名=#52–#54、改竄の可視化+SIEM 転送=#55、親監督=#51)に、本書の **OS 層**を重ねて
-多層防御にします。
+アプリ内蔵の自己防衛(可変状態の HMAC 署名=#52–#54、改竄の可視化(ダッシュボード)=#55)に、
+本書の **OS 層**(クラッシュからの自動再起動を含む)を重ねて多層防御にします。
 
 ---
 
@@ -16,11 +15,11 @@
 
 | 目的 | アプリ内蔵 | OS 公認(本書) |
 |---|---|---|
-| クラッシュからの再起動 | `--supervise`(#51)/ watchdog(#47) | systemd `Restart=` / Windows サービス回復 / launchd `KeepAlive` |
+| クラッシュからの再起動 | (なし=OS層に委任) | systemd `Restart=` / Windows サービス回復 / launchd `KeepAlive` |
 | 終了されにくさ | （しない=透明） | サービス ACL・専用ユーザ・権限分離 |
-| 本体コードの改竄防止 | 検知+強制修復(#48) | `chattr +i` / 読取専用マウント / ファイル ACL |
+| 本体コードの改竄防止 | （なし=OS層に委任） | `chattr +i` / 読取専用マウント / ファイル ACL |
 | 状態ファイルの改竄耐性 | HMAC 署名(#52–#54) | **外部署名鍵**(下記)+ state dir 権限 |
-| 改竄の気づき | events+metrics(#55) | SIEM 転送(`CHICKENNET_SYSLOG`/`CHICKENNET_WEBHOOK`) |
+| 改竄の気づき | events+metrics(#55・ダッシュボード) | — |
 
 **やらないこと**(意図的): プロセス/ファイルの隠蔽、taskkill/Task Manager からの終了妨害、別名での
 隠れ起動、「終了したと見せかけて稼働」。これらは透明な実装が存在せず rootkit になる。
@@ -37,17 +36,12 @@
 ```bash
 # 例: 別管理の鍵をサービスにだけ環境変数で渡す（state dir には書かない）
 export CHICKENNET_STATE_KEY="$(cat /etc/chickennet/keys/state.key)"     # 状態(#52–#54)
-export CHICKENNET_INTEGRITY_KEY="$(cat /etc/chickennet/keys/integrity.key)"  # 不変ファイル(#48)
 ```
 鍵ファイルは `root:chickennet` 所有・`0640`、または Vault/KMS 等から起動時に注入する。
 
-### 1.2 改竄を SIEM へ飛ばす（#55）
-```bash
-export CHICKENNET_SYSLOG="udp://siem.internal:514"     # state_tamper/integrity_tamper を malicious で転送
-# もしくは
-export CHICKENNET_WEBHOOK="https://hooks.example/incoming"
-```
-ダッシュボードは `GET /api/shield/tamper` で改竄要約+直近イベントを返す。
+### 1.2 改竄の気づき（#55）
+ダッシュボードは `GET /api/shield/tamper` で状態ファイル改竄(`state_tamper`)/ in-memory cfg
+改竄(`memory_tamper`)の要約+直近イベントを返す(ローカル可視化・外部転送はしない)。
 
 ### 1.3 最小権限で動かす
 専用の非特権ユーザ（例 `chickennet`）で実行し、書込みは state dir だけに限定する。バインドに特権
@@ -75,7 +69,7 @@ ExecStart=/usr/bin/python3 -m dataplane --backend 127.0.0.1:8080 --listen 8443
 Restart=on-failure
 RestartSec=2
 StartLimitIntervalSec=60
-StartLimitBurst=5            # クラッシュループ遮断（アプリ側 #51 と二重）
+StartLimitBurst=5            # クラッシュループ遮断
 
 # --- サンドボックス（攻撃者が本体を触れる面を削る）---
 NoNewPrivileges=yes
@@ -106,8 +100,9 @@ sudo systemctl daemon-reload && sudo systemctl enable --now chickennet
 sudo systemctl stop chickennet      # 管理者は正規に停止できる（透明）
 ```
 
-> `--supervise`(#51) は systemd 配下では不要（`Restart=` が親監督を担う）。systemd の無い環境
-> (素のコンテナ・Windows のタスク以外)では `--supervise` を使う。
+> クラッシュからの自動再起動はアプリ自身では行わない(watchdog/親プロセス監督は持たない)。
+> systemd 配下では `Restart=` が、それ以外の環境ではタスクスケジューラ/nssm/launchd の
+> 回復設定(下記 §3・§4)がこの役目を担う。
 
 ### 2.2 本体コードを不変属性に（ファイルすり替え防止の OS 層）
 ```bash
@@ -116,8 +111,7 @@ sudo chattr +R +i /opt/chickennet/dataplane
 sudo chattr +i /etc/chickennet/config.json
 # 更新手順: sudo chattr -R -i <path> → 更新 → 再度 +i
 ```
-これで #48 の検知に加え、そもそも **書き換え自体を OS が拒否**する。読取専用マウント
-（`mount -o remount,ro`）でも同等。
+**書き換え自体を OS が拒否**する。読取専用マウント（`mount -o remount,ro`)でも同等。
 
 ### 2.3 state dir の権限
 ```bash
@@ -205,7 +199,7 @@ kill -9 $(pgrep -f 'm dataplane') ; sleep 3 ; systemctl is-active chickennet    
 # 2) コード不変: 書き換えが OS に拒否されるか
 echo x >> /opt/chickennet/dataplane/engine/lifeform/pipeline.py                  # → Operation not permitted
 
-# 3) 状態改竄検知: blocklist を平文すり替え → 起動で弾かれ SIEM に出るか
+# 3) 状態改竄検知: blocklist を平文すり替え → 起動で弾かれダッシュボードに出るか
 #    （署名運用後は無署名/改竄ファイルは fail-safe で破棄され state_tamper が飛ぶ）
 curl -s -H "X-Token: $TOKEN" http://127.0.0.1:8081/api/shield/tamper           # → count>=1, events[]
 ```
@@ -213,7 +207,6 @@ curl -s -H "X-Token: $TOKEN" http://127.0.0.1:8081/api/shield/tamper           #
 ---
 
 ## 6. 参照
-- アプリ内蔵の自己防衛: watchdog/強制再起動/一時停止安定化（#47/#49）、不変ファイルすり替え検知+強制修復（#48）、
-  周期乱択+バックアップ復元（#50）、親監督（#51）、可変状態 HMAC 署名（#52–#54）、改竄可視化+SIEM（#55）。
-- 関連環境変数: `CHICKENNET_STATE_KEY` / `CHICKENNET_INTEGRITY_KEY`（外部署名鍵）、`CHICKENNET_STATE_DIR`（状態の所在）、
-  `CHICKENNET_SYSLOG` / `CHICKENNET_WEBHOOK`（改竄含む重要検知の SIEM 転送）。
+- アプリ内蔵の自己防衛: 可変状態 HMAC 署名(#52–#54)、改竄可視化(#55・ダッシュボード)。
+  クラッシュからの自動再起動はアプリでは行わず OS 層(本書)に委ねる。
+- 関連環境変数: `CHICKENNET_STATE_KEY`(外部署名鍵)、`CHICKENNET_STATE_DIR`(状態の所在)。

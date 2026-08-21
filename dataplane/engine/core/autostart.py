@@ -28,14 +28,12 @@ def python_exe() -> str:
     return sys.executable or "python"
 
 
-def build_command(args, *, supervise: bool = True) -> list:
+def build_command(args) -> list:
     """登録する起動コマンド(argv リスト)。`python -m dataplane <args>`。
-    supervise=True で親監督下(クラッシュ自動再起動)に。OS 側にも回復設定がある場合は二重で安全。"""
+    クラッシュからの自動再起動は OS 側の回復設定(systemd Restart= / Windows サービス回復 /
+    launchd KeepAlive)に委ねる(アプリ自身は親監督フラグを持たない)。"""
     cmd = [python_exe(), "-m", "dataplane"]
-    args = list(args)
-    if supervise and "--supervise" not in args:
-        cmd.append("--supervise")
-    cmd += args
+    cmd += list(args)
     return cmd
 
 
@@ -139,10 +137,10 @@ def launchd_plist_text(label, command) -> str:
 
 
 def install(args, *, method: str = "auto", name: str = "ChickenNet",
-            trigger: str = "onlogon", supervise: bool = True) -> dict:
+            trigger: str = "onlogon") -> dict:
     """プラットフォームに応じて自動起動を登録/案内する。Windows は実登録(schtasks/runkey)、
     Linux/macOS は unit/plist テキストと配置先を返す(#56 docs/hardening.md に沿って有効化)。"""
-    command = build_command(args, supervise=supervise)
+    command = build_command(args)
     plat = sys.platform
     if plat.startswith("win"):
         m = "runkey" if method == "runkey" else "schtasks"

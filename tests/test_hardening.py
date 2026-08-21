@@ -12,7 +12,6 @@ import random
 import dataplane.engine.lifeform.pipeline as P
 from dataplane.engine.lifeform.pipeline import NetShield, _normalize_for_scan, _SIG_RE
 from dataplane.engine.services.proxy import _framing_ambiguous
-from dataplane.engine.lifeform import datasets as D
 
 _BS = chr(92)
 _PATHOLOGICAL = [
@@ -178,23 +177,6 @@ def test_traffic_map_is_memory_bounded():
         P._MAX_IPS = old
 
 
-def test_alertsink_sources_set_is_bounded():
-    # 脆弱性修正(#38): AlertSink._sources(distinct送信元IPのset)は唯一無界だった。
-    # 多数の別IPからの記録(無認証ビーコン等)でも上限で飽和=メモリ有界。
-    import dataplane.engine.lifeform.alerts as A
-    old = A._SOURCES_MAX
-    A._SOURCES_MAX = 10
-    try:
-        with tempfile.TemporaryDirectory() as tmp:
-            sink = A.AlertSink("t", state_dir=tmp, dedup_window=0.0)
-            for i in range(60):
-                sink.record((f"k{i}", "hit"), {"client": f"10.0.{i // 256}.{i % 256}"},
-                            verdict="malicious", action="alert")
-            assert len(sink._sources) <= 10
-    finally:
-        A._SOURCES_MAX = old
-
-
 def test_only_origin_form_target_accepted():
     # evolution #34: リバプロは origin-form(/path)のみ受理。絶対形/authority形は拒否=パス規則の回避防止。
     def fa(line):
@@ -222,15 +204,6 @@ def test_fuzz_entrypoints_no_crash():
                 rx.search(b)
             sh.inspect("9.9.9.9", path="/", query=s[:300], user_agent=s[:100])
         assert time.perf_counter() - t0 < 20.0
-
-
-def test_stream_and_manifest_bounds_exact():
-    # ハニーデータ生成が合計サイズ・ストリーム長を厳密に守る(資源の溢れ/枯渇なし)。
-    for sz in (1, 1000, 65537, 500000):
-        m = D.build_manifest(sz, seed=1)
-        assert sum(f["size"] for f in m) == sz
-        streamed = sum(len(c) for f in m for c in D.iter_content(f, chunk=4096))
-        assert streamed == sz, (sz, streamed)
 
 
 def test_hot_path_is_reasonably_fast():

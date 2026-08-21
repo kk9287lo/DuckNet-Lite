@@ -84,11 +84,10 @@ def test_graphql_extract_survives_json_bomb():
 
 
 def test_all_compiled_patterns_are_redos_safe():
-    # 自分のコンパイル済み正規表現すべて(signatures/tautology/stacked/filename/secret/dns/monitor)が
+    # 自分のコンパイル済み正規表現すべて(signatures/tautology/stacked/filename/secret/monitor)が
     # ネスト量化子(ReDoS)を含まない=WAF が自分自身を DoS しない。将来の混入も検出する。
     import re as _re
     import dataplane.engine.lifeform.pipeline as P
-    import dataplane.engine.lifeform.dns as D
     import dataplane.engine.lifeform.monitor as M
     risky = []
 
@@ -99,7 +98,7 @@ def test_all_compiled_patterns_are_redos_safe():
         if r and "ネスト" in r:          # 長さ超過等ではなく ReDoS 構造のみを問題視
             risky.append((name, s[:60]))
 
-    for mod in (P, D, M):
+    for mod in (P, M):
         for nm in dir(mod):
             v = getattr(mod, nm)
             if isinstance(v, _re.Pattern):

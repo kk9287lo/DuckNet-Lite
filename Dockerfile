@@ -27,7 +27,5 @@ HEALTHCHECK --interval=30s --timeout=4s --start-period=5s --retries=3 \
 
 ENTRYPOINT ["python", "-m", "dataplane"]
 # 既定: 前衛8443→バックエンド(ホストの8080)、管理画面8081(コンテナ内0.0.0.0=ポート公開)。
-# DNS の L7 検知はサブコマンドで起動可(CMD を上書き): 例 `docker run <img> dns --upstream 1.1.1.1:53`。
-# compose は profile で opt-in。
 CMD ["--backend", "host.docker.internal:8080", "--listen", "8443", \
      "--admin", "8081", "--admin-host", "0.0.0.0"]

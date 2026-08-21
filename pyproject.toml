@@ -25,9 +25,6 @@ classifiers = [
 ]
 dependencies = []
 
-[project.optional-dependencies]
-geoip = ["maxminddb>=2.0"]
-
 [project.scripts]
 chickennet-security = "dataplane.service:main"
 

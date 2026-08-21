@@ -4,7 +4,7 @@ ChickenNet L7 の防御と、それを制御する設定キー(`NetShield.cfg` /
 宣言的設定 JSON で変更可)。**既定ON** は配備直後から効く低誤検知のもの。**opt-in** は配備依存・
 誤検知リスクがあるため有効化が必要なもの。
 
-> 設定例(管理API): `POST /api/shield/config {"posmodel_enabled": true}`
+> 設定例(管理API): `POST /api/shield/config {"sec_headers_enabled": true}`
 > または宣言的設定ファイル(`--config config.json` / `CHICKENNET_CONFIG`)。
 
 ## リクエスト検査
@@ -19,7 +19,6 @@ ChickenNet L7 の防御と、それを制御する設定キー(`NetShield.cfg` /
 | パスオーバーライド | `path_override_block` | ON | `X-Original-URL`/`X-Rewrite-URL` 等の ACL 回避を遮断 |
 | Range DoS | `range_check_enabled`, `range_max_ranges` | ON | 多数レンジ(Apache Killer)を遮断 |
 | スマグリング/フレーミング | （常時） | ON | CL.TE/TE.CL/裸改行/origin-form 強制/パイプライン遮断 |
-| 正のセキュリティモデル | `posmodel_enabled`, `posmodel_mode` | **opt-in** | 許可した (パス,メソッド) だけ通す allowlist。`/api/shield/posmodel` で設定 |
 | GraphQL 防御 | `graphql_enabled`, `graphql_paths`, `graphql_max_depth` ほか | **opt-in** | 深さ/複雑度/イントロスペクション/バッチの上限 |
 | JWT 検査 | `jwt_inspect_enabled`, `jwt_allowed_algs` | ON | `alg:none` 遮断。`jwt_allowed_algs` 指定で alg 混同も遮断 |
 | ボット整合性 | `bot_consistency_enabled`, `bot_inconsistency_score` | ON | ブラウザ UA 偽装ツールを低FP加点 |
@@ -58,11 +57,10 @@ ChickenNet L7 の防御と、それを制御する設定キー(`NetShield.cfg` /
 
 ## 自己防衛 / 改竄耐性
 
-[docs/hardening.md](hardening.md) を参照(watchdog・強制再起動・一時停止安定化・ファイルすり替え検知+修復・
-状態 HMAC 署名・親プロセス監督・自動起動登録・OS 公認ハードニング)。関連環境変数:
-`CHICKENNET_STATE_KEY`/`CHICKENNET_INTEGRITY_KEY`(外部署名鍵)、`CHICKENNET_SYSLOG`/`CHICKENNET_WEBHOOK`(SIEM 転送)。
+[docs/hardening.md](hardening.md) を参照(状態 HMAC 署名・自動起動登録・OS 公認の
+クラッシュ自動再起動・ハードニング)。関連環境変数: `CHICKENNET_STATE_KEY`(外部署名鍵)。
 
 ## 段階導入の勧め
-1. 既定ON のまま **監査**(`txnlog_enabled`)で運用し誤検知を観察。
-2. 配備に合う opt-in を **audit モード**から(`posmodel_mode=audit` / `open_redirect_mode=audit`)。
+1. 既定ON のまま **監査**(`mode=audit`)で運用し誤検知を観察。
+2. 配備に合う opt-in を **audit モード**から(`open_redirect_mode=audit`)。
 3. 問題なければ enforce へ。`paranoia` で全体の厳格度も調整可。

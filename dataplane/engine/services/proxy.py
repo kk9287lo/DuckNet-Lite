@@ -574,10 +574,6 @@ class AsyncEdgeGuard:
         self._conn_rate: dict = {}    # ip -> [窓開始, 件数](接続レート=RST/churn フラッド対策・#10)
         self._pool = _BufferPool()
         self.metrics = {"accepted": 0, "dropped": 0, "challenged": 0, "proxied": 0}
-        # 生存ハートビート(#47): serving ループが周期的に monotonic を刻む。watchdog はこの
-        # 前進を見てハング/死亡を検出する。トラフィック非依存(無通信でも刻む)=idle を死と誤認しない。
-        self._heartbeat_mono = time.monotonic()
-        self._watchdog = None         # serve_forever 時に常駐監視を張る(任意)
 
     @staticmethod
     def platform_capabilities() -> dict:
@@ -670,7 +666,6 @@ class AsyncEdgeGuard:
 
     async def _handle_conn(self, reader, writer):
         self.metrics["accepted"] += 1
-        t0 = time.time()                          # トランザクション開始(txnlog の duration 用)
         ip = "127.0.0.1"
         try:
             peer = writer.get_extra_info("peername")
@@ -717,29 +712,6 @@ class AsyncEdgeGuard:
         if self.health_path and path.split("?", 1)[0] == self.health_path:
             self.metrics["health"] = self.metrics.get("health", 0) + 1
             writer.write(_http_response("200 OK", '{"status":"ok"}'))
-            try:
-                await writer.drain()
-            except Exception:
-                pass
-            return self._close(writer)
-
-        # 0-) カナリア・ビーコン: 持ち出された囮ファイルが外部で開かれ /c/<token>.png を叩いた。
-        #     公開・無認証(攻撃者の *別環境* から届く)。誰が・どこから・何で叩いたかを高度に記録し
-        #     1x1 PNG を返す(自然に見せる)。WAF より前=遮断中でも取りこぼさない。
-        _p0 = path.split("?", 1)[0]
-        if _p0.startswith("/c/"):
-            token = _p0[3:].split("/")[0].rsplit(".", 1)[0][:64]
-            try:
-                from ..lifeform.datasets import token_ledger
-                token_ledger().record_hit(token, ip, ua=ua,
-                                          extra={"host": host, "path": _p0})
-            except Exception:
-                pass
-            _PNG = (b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
-                    b"\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\nIDATx\x9cc\x00"
-                    b"\x01\x00\x00\x05\x00\x01\r\n-\xb4\x00\x00\x00\x00IEND\xaeB`\x82")
-            writer.write(_http_response("200 OK", _PNG, "image/png",
-                                        extra=deception.headers_for(ip)))
             try:
                 await writer.drain()
             except Exception:
@@ -824,9 +796,6 @@ class AsyncEdgeGuard:
                 _banned_fast = False
             if _banned_fast:
                 self.metrics["dropped"] += 1
-                self._txn(ip=ip, method=method, host=host, path=path, ua=ua,
-                          zone=zone, action="block", reason="banned",
-                          dur=time.time() - t0)
                 if sh.cfg.get("block_page"):
                     return await self._serve_block_page(ip, sh, writer)
                 return self._close(writer)        # 444相当・inspectを呼ぶことすら贅沢
@@ -852,18 +821,8 @@ class AsyncEdgeGuard:
                                range_header=_header_value(buf, b"range"))   # #76
             except Exception:
                 self.metrics["dropped"] += 1
-                try:
-                    self._txn(ip=ip, method=method, host=host, path=path, ua=ua,
-                              zone=zone, action="block", reason="inspect_exception",
-                              dur=time.time() - t0)
-                except Exception:
-                    pass
                 return self._close(writer)
             act = d.get("action")
-            if act != "allow":                # WAF が遮断/絞り/チャレンジした要求を構造化記録
-                self._txn(ip=ip, method=method, host=host, path=path, ua=ua, zone=zone,
-                          action=act, reason=d.get("reason", ""), score=d.get("score", 0),
-                          dur=time.time() - t0)
             if act == "block":
                 self.metrics["dropped"] += 1
                 if sh.cfg.get("block_page"):
@@ -983,10 +942,6 @@ class AsyncEdgeGuard:
                                             in_bytes=inbound, conn_sec=time.time() - start)
             except Exception:
                 pass
-            # 許可(プロキシ完了)トランザクションを構造化記録(バイト/時間つき)。
-            self._txn(ip=ip, method=method, host=host, path=path, ua=ua, zone=zone,
-                      action="allow", b_in=inbound, b_out=outbound,
-                      dur=time.time() - start)
 
     def _apply_redirect_policy(self, head: bytes, req_host: str, ip: str = "") -> bytes:
         """応答 head に対しオープンリダイレクト無害化を適用する(#71)。外部の許可外ホストへの
@@ -1137,34 +1092,6 @@ class AsyncEdgeGuard:
             # 本文スキャン(SQLi/アップロード/GraphQL検査)が丸ごとバイパスされる。
             blocked = True
         return bytes(extra), blocked
-
-    def _txn(self, *, ip, method, host, path, ua="", zone="", action="allow",
-             reason="", score=0, b_in=0, b_out=0, dur=0.0):
-        """1トランザクションを構造化ログへ記録(cfg txnlog_enabled 時のみ=既定ゼロコスト)。
-        既存 usage_log と同じ同期追記。verdict と sig タグは action/reason から導出。例外は握り潰す。"""
-        try:
-            from ..lifeform.pipeline import net_shield
-            sh = net_shield()
-            if not sh.cfg.get("txnlog_enabled"):
-                return                            # 既定OFF=即 return(ゼロコスト)
-            from .txnlog import txn_log
-            verdict = {"allow": "clean", "throttle": "suspicious",
-                       "challenge": "suspicious", "block": "malicious"}.get(action, "clean")
-            r = reason or ""
-            sig = ""
-            for pre in ("signature:", "intel:", "カナリア作動", "ハニーポット", "flood:", "quota"):
-                if pre in r:
-                    sig = r.split(pre, 1)[1].split(",")[0].strip() if pre.endswith(":") else pre
-                    break
-            txn_log().record({
-                "src": ip, "method": method, "host": host, "uri": path,
-                "ua": (ua or "")[:200], "zone": zone, "action": action, "verdict": verdict,
-                "reason": r[:160], "sig": sig, "score": round(float(score or 0), 1),
-                "bytes_in": int(b_in), "bytes_out": int(b_out),
-                "duration": round(float(dur), 4),
-            }, forward=bool(sh.cfg.get("txnlog_forward")))
-        except Exception:
-            pass
 
     def _write_html(self, writer, code: str, body, server: str = "", extra=None):
         # body は str/bytes どちらでも可。Content-Length は _http_response が
@@ -1418,93 +1345,48 @@ class AsyncEdgeGuard:
         # 委ねる=停止時に listener だけ閉じて(受理停止)、進行中の _handle タスクは生かしたまま
         # drain を待てる(per-connection タスクは serve_forever とは独立に走り続ける)。
         serve_task = asyncio.ensure_future(self._server.serve_forever())
-        beat_task = asyncio.ensure_future(self._heartbeat_loop())   # #47: 生存ハートビート
+        check_task = asyncio.ensure_future(self._periodic_checks_loop())
         try:
             await self._stop_event.wait()
         finally:
-            for _t in (serve_task, beat_task):
+            for _t in (serve_task, check_task):
                 _t.cancel()
                 try:
                     await _t
                 except (asyncio.CancelledError, Exception):
                     pass
 
-    async def _heartbeat_loop(self):
-        """serving ループの生存を monotonic で周期的に刻む(#47)。トラフィックの有無に依らず
-        進むので、watchdog は『拍動が止まった=ハング/死亡』と『無通信の idle』を取り違えない。
-        ループが詰まれば await が戻らず拍動も止まる=ハングが観測可能になる。"""
+    async def _periodic_checks_loop(self, interval: float = 30.0):
+        """トラフィック非依存の定期セキュリティチェックを回す独立ループ(自己再起動/生存監視とは
+        無関係): 迂回検知(#78 traffic_stall_check)と in-memory cfg 改竄検知(#85
+        verify_cfg_integrity)。以前は watchdog の周期タスクに便乗していたが、どちらも
+        自動復旧(watchdog)とは別物のセキュリティ機能なのでここへ独立させてある。"""
         try:
             while True:
-                self._heartbeat_mono = time.monotonic()
-                await asyncio.sleep(1.0)
+                await asyncio.sleep(interval)
+                try:
+                    from ..lifeform.pipeline import net_shield
+                    net_shield().traffic_stall_check()   # #78: 迂回検知(busy→突然ゼロ=バイパスの疑い)
+                    net_shield().verify_cfg_integrity()  # #85: in-memory cfg すり替え検知+復元
+                except Exception:
+                    pass
         except asyncio.CancelledError:
             pass
 
-    # ── 自己防衛(#47): watchdog 向けの生存/再起動アクセサ ──
+    # ── 生存/再起動アクセサ(基本のスレッド状態操作。自動復旧の配線はしない) ──
     def is_alive(self) -> bool:
         return bool(self._thread and self._thread.is_alive())
 
-    def heartbeat(self) -> float:
-        """serving ループが最後に拍動した monotonic 時刻(watchdog のハング検出用)。"""
-        return self._heartbeat_mono
-
-    def _absorb_suspend(self, gap: float):
-        """watchdog が一時停止を検出した時の通知(#49): NetShield のセッション/BAN タイマーへ
-        停止秒数を足し戻し、復帰直後の self-DoS(正規ユーザ締め出し)と BAN 取り逃がしを防ぐ。"""
-        try:
-            from ..lifeform.pipeline import net_shield
-            net_shield().absorb_suspend(gap)
-        except Exception:
-            pass
-
-    def _make_integrity_tick(self, si):
-        """SelfIntegrity を周期実行し、すり替え検知時に metrics 計上+イベント記録する閉包を返す。"""
-        def _tick():
-            try:                              # #78: 迂回検知(busy→突然ゼロ=バイパスの疑い)
-                from ..lifeform.pipeline import net_shield
-                net_shield().traffic_stall_check()
-                net_shield().verify_cfg_integrity()   # #85: in-memory cfg すり替え検知+復元
-            except Exception:
-                pass
-            rep = si.tick()
-            if rep.get("event") == "baseline":
-                # 実行時 TOFU ベースライン(deploy 時に --integrity-baseline していない=弱い姿勢)。
-                # 既に改竄済みの状態を『正』としかねないので、運用者が気づけるよう記録する。
-                try:
-                    from ..lifeform.pipeline import net_shield
-                    net_shield()._event("system", "integrity_baseline_tofu", {
-                        "count": rep.get("count"),
-                        "note": "runtime TOFU baseline; prefer 'python -m dataplane "
-                                "--integrity-baseline' at deploy time"})
-                except Exception:
-                    pass
-            elif rep.get("event") == "tamper":
-                self.metrics["integrity_tamper"] = self.metrics.get("integrity_tamper", 0) + 1
-                try:
-                    from ..lifeform.pipeline import net_shield
-                    mod = [os.path.basename(p) for p in rep.get("modified", [])]
-                    miss = [os.path.basename(p) for p in rep.get("missing", [])]
-                    repaired = bool(rep.get("repair", {}).get("ok"))
-                    net_shield().report_tamper(
-                        "integrity_tamper", ",".join(mod + miss) or "code",
-                        "repaired" if repaired else "detected",
-                        {"modified": mod, "missing": miss,
-                         "manifest_valid": rep.get("manifest_valid")})
-                except Exception:
-                    pass
-        return _tick
-
     def restart(self) -> dict:
-        """強制再起動: 既存スレッド/ループを止めて新しい serving スレッドを起こす。
-        スレッド *死亡*(例外失活)からの復旧が主目的。listener を握ったままの完全ハングは
-        同ポート再 bind が確実でない=親プロセス監督が堅牢(正直な限界)。"""
+        """強制再起動: 既存スレッド/ループを止めて新しい serving スレッドを起こす(手動/管理操作
+        向けユーティリティ)。listener を握ったままの完全ハングは同ポート再 bind が確実でない
+        (正直な限界)。"""
         try:
             self.stop(grace=0.0)
         except Exception:
             pass
         self._ready = threading.Event()
         self._stop_event = None
-        self._heartbeat_mono = time.monotonic()
         return self.start()
 
     async def _drain(self, grace: float):
@@ -1549,9 +1431,8 @@ class AsyncEdgeGuard:
 
     def start(self, timeout: float = 5.0) -> dict:
         self._raise_fd_limit()                        # #79: FD ソフト上限を引き上げ(可能なら)
-        from ...profile import cover_thread_name        # #81: スレッド名もステルスに従う
         self._thread = threading.Thread(target=self._run, daemon=True,
-                                        name=cover_thread_name("edge"))
+                                        name="chickennet-edge")
         self._thread.start()
         if not self._ready.wait(timeout):
             return {"ok": False, "error": "起動タイムアウト"}
@@ -1567,7 +1448,7 @@ class AsyncEdgeGuard:
         既定 grace=0 は従来どおり即時停止(後方互換)。別スレッドのループへ drain を投入して待つ。"""
         remaining = None
         loop = self._loop
-        # ループが走っている時だけ drain を投入する。停止済み(例: watchdog の死亡後 restart)へ
+        # ループが走っている時だけ drain を投入する。停止済み(例: restart() 呼び出し直後)へ
         # run_coroutine_threadsafe すると _drain コルーチンが await されず警告+無駄な5s待機になる。
         if loop is not None and loop.is_running():
             try:
@@ -1587,44 +1468,20 @@ class AsyncEdgeGuard:
         return {"ok": True, "stopped": True, "drained": remaining,
                 "metrics": dict(self.metrics)}
 
-    def serve_forever(self, watchdog: bool = True) -> None:
+    def serve_forever(self) -> None:
         info = self.start()
         if not info.get("ok"):
             raise RuntimeError(info.get("error"))
-        from ...profile import cover_brand               # #81: ステルス時は製品名を出さない
-        print(f"{cover_brand('ChickenNet async edge guard')}: "
+        print(f"ChickenNet async edge guard: "
               f"{info['listen']} -> {info['backend']}")
-        # 自己防衛(#47): serving スレッドの死亡/ハングを監視し強制再起動。OSスリープ/一時停止は
-        # 死亡と誤認せず(skew 検出)再起動しない。隠蔽はしない=正直な self-protection。
-        if watchdog:
-            try:
-                from ..core.resilience import Watchdog
-                _period = None
-                try:                              # ファイルすり替え監視(#48): 自身のコードを継続検査
-                    from ..core.integrity import SelfIntegrity
-                    from ..core.atomic_io import default_state_dir
-                    _si = SelfIntegrity(default_state_dir(), repair=True)
-                    _period = self._make_integrity_tick(_si)
-                except Exception:
-                    _period = None
-                self._watchdog = Watchdog(
-                    is_alive=self.is_alive, restart=self.restart,
-                    heartbeat=self.heartbeat, on_suspend=self._absorb_suspend,
-                    on_period=_period, period=30.0, jitter=0.5,    # #50: 検査周期を 15〜45s で乱択
-                    interval=1.0, max_silence=10.0)
-                self._watchdog.start()
-            except Exception:
-                self._watchdog = None
         try:
             while True:
                 time.sleep(0.5)
-                if not self.is_alive() and self._watchdog is None:
-                    break                         # 監視なしでスレッドが死ねば終了(従来挙動)
+                if not self.is_alive():
+                    break                         # serving スレッドが死ねば終了(自動再起動はしない)
         except KeyboardInterrupt:
             pass
         finally:
-            if self._watchdog is not None:
-                self._watchdog.stop()
             self.stop()
 
     # ── マルチコア(SO_REUSEPORT + fork)。可用OSのみ・Windowsは正直に単一へ降格 ──

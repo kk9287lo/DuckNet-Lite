@@ -2,6 +2,92 @@
 
 本プロジェクトの主要な変更点。日付は概ねの目安。詳細は各コミット(`evolution #N`)を参照。
 
+## [Lite-3] — 第3次縮小: 自己防衛の watchdog/親プロセス監督を削除
+
+free / trial ティアから、常駐サービス層の *自動復旧*(auto-recovery/self-healing)機構を削除。
+状態ファイルの HMAC 署名(#52–#54)・in-memory cfg 改竄検知(#85)・迂回検知(#78)は**無関係な
+別機構のため維持**——落ちた/ハングした前衛スレッドを自前で検知・強制再起動する層だけを外す。
+
+- **削除**:
+  - **常駐内 Watchdog** — `AsyncEdgeGuard.serve_forever()`(`engine/services/proxy.py`)から
+    Watchdog(生存監視・ハング検出・強制再起動・OSスリープ吸収)の配線を除去。`serve_forever()`
+    は「起動して `is_alive()` を見張り、スレッドが死んだらプロセスごと終了する」だけの元の
+    素朴な形に戻した。ハートビート専用の周期タスク(`_heartbeat_loop`/`heartbeat()`)、
+    suspend 通知(`_absorb_suspend`)、watchdog 周期タスク閉包(`_make_period_tick`)を削除。
+    `is_alive()`/`restart()` は基本のスレッド状態操作として維持(手動/テストから直接使用可)。
+  - **`engine/core/resilience.py` を削除** — `Watchdog`/`Supervisor`/`measure_skew`/`assess`/
+    `backoff_delay`/`restart_decision` 一式。他モジュールからの参照なし(watchdog/supervisor
+    以外の用途では未使用だったため丸ごと削除可能と確認)。
+  - **親プロセス監督 `--supervise`** — `dataplane/service.py` の CLI フラグと、`Supervisor` を
+    起動するディスパッチ分岐を削除。クラッシュからの自動再起動は OS 層(systemd `Restart=`/
+    Windows サービス回復/launchd `KeepAlive`)にのみ委ねる。
+  - `engine/core/autostart.py` の `build_command()`/`install()` から `supervise` 引数を削除
+    (自動起動登録コマンドに `--supervise` を付与しなくなった)。OS レベルの自動起動登録
+    (ログオン/ブート時の再起動)自体は変更なし。
+  - **迂回検知(#78)/cfg 改竄検知(#85)の呼び出し口を独立**: 従来 watchdog の周期タスクに
+    便乗していた `traffic_stall_check()`/`verify_cfg_integrity()` の定期実行を、watchdog とは
+    無関係な独立の軽量ループ(`AsyncEdgeGuard._periodic_checks_loop`)へ切り離した。どちらも
+    自動復旧とは別物のセキュリティ機能のため、機能自体は維持。
+- **削除(テスト)**: `tests/test_resilience.py` を削除(Watchdog/Supervisor/skew/heartbeat/
+  restart_decision 等、resilience.py 一式のテスト)。`tests/test_autostart.py` の
+  `test_build_command_adds_supervise` を `--supervise` を付与しないことを確認するテストへ
+  差し替え。`tests/run_all.py` の MODULES から `test_resilience` を除去。`test_stall.py`/
+  `test_memtamper.py`(迂回検知/cfg改竄検知の直接テスト)は無関係な独立機能のため変更なし。
+- ドキュメント: README/CHANGELOG/docs/hardening.md/docs/options.md/docs/defenses.md/
+  docs/apt-threat-model.md から `--supervise`/watchdog の記述を除去し、クラッシュ復旧は
+  OS 層の責務であることを明記。`NEXT_STEPS.md` を ChickenNet-Lite の現状に合わせて全面刷新
+  (商用版前提の古い引き継ぎメモを置き換え)。
+- コード品質: `engine/lifeform/pipeline.py` の `inspect()` に残っていたカナリアトークン
+  照合の死コード(`canary.py` は第1次縮小で既に削除済み・常に except 分岐に落ちるだけの無害な
+  残骸)を除去。シグネチャ走査(`sig_hit`)ロジックは変更なし。
+- テスト: **348/348 件緑**(372 件から Watchdog/Supervisor 関連 24 件を削除)。
+
+## [Lite-2] — 第2次縮小: コアの L7 WAF/DDoS + 最小限の可視化のみへ
+
+free / trial ティアを **さらに** 絞り込み、コアの L7 WAF/DDoS リバースプロキシ・エンジン
+(スコアリング/自動BAN/PoWチャレンジ/シグネチャ照合)+ それを操作する最小限の Web 管理
+ダッシュボード(ON/OFF・基本指標・BAN管理)だけを残した。**依存ゼロ**は維持。
+
+- **削除(価値付加機能・上位エディションのみ)**:
+  - **DNS フィルタ(L7検知)** — `engine/lifeform/dns.py`。`dns` サブコマンド・
+    `chickennet-dns` Docker サービス・`docs/dns.md` を削除。
+  - **囮ファイルのダウンロード追跡(ビーコン)** — `engine/lifeform/datasets.py`
+    (参照トークン台帳)。`/c/<token>.png` ビーコン経路・`/api/ledger` を削除。
+  - **SIEM/Webhook 転送** — `engine/lifeform/forwarders.py`(Syslog/Webhook Fanout)・
+    `engine/lifeform/alerts.py`(AlertSink。datasets.py 以外に利用者がいないため同時削除)。
+    `pipeline.py`/`proxy.py`/`service.py` の転送配線(`_forward`/`_txn` の SIEM 経路)を除去。
+    ローカルの改竄可視化(`/api/shield/tamper`)自体は維持。
+  - **構造化トランザクションログ** — `engine/services/txnlog.py`。`txnlog_enabled`/
+    `txnlog_forward` cfg・`proxy.py` の `_txn()` 記録経路・ダッシュボードのトグルを削除。
+  - **自己完全性監視 + 自動修復** — `engine/core/integrity.py`(`SelfIntegrity`)。
+    `--integrity-baseline`/`--integrity-check` CLI フラグと watchdog 周期タイマーへの
+    配線を削除。in-memory cfg 改竄検知(`verify_cfg_integrity`・#85)と状態ファイルの
+    HMAC 署名(#52–#54)は **無関係な別機構のため維持**。
+  - **GeoIP 国別判定** — `engine/lifeform/geoip.py`。`geo_mode=country_allow/country_block`・
+    `geo_countries` cfg・国別テレメトリ(`country_hits`)を削除。CIDR ベースの `geo_mode=allow/block`
+    は維持。
+  - **正のセキュリティモデル(allowlist)** — `engine/lifeform/posmodel.py`。`NetShield.__init__`
+    で無条件生成されていたハード依存(`self._posmodel`)・`inspect()` ホットパスの照合・
+    `reload_posmodel`/`set_posmodel`/`posmodel_status`・`/api/shield/posmodel` を除去。
+  - **ステルス運用(プロセス名偽装)** — `dataplane/profile.py` を削除。`--stealth` CLI フラグと
+    `service.py`(`run()`)の cover 変数配線を除去。`proxy.py`/`edge_config.py` の
+    `profile.cover_thread_name`/`cover_brand` 呼び出しは固定文字列に置換(機能自体は
+    `CHICKENNET_COVER` 環境変数を直接参照するブランド表示のみ残置=後方互換)。
+- **維持(意図的)**: `--supervise`(Watchdog/Supervisor)、`--install-autostart`/
+  `--uninstall-autostart`、`--cluster`(マルチコア待受)、`atomic_io`/`signed_state`
+  (状態永続化の署名整合性)、`origin.py`(バックエンド・バイパス防止)、`accel.py`、`i18n.py`。
+  これらは基本的な信頼性/正当性であり、削ぎ落とす「付加価値機能」ではないと判断。
+- 管理ダッシュボードから該当パネル/API(DNS検知欄・参照トークン台帳欄・国別内訳・
+  トランザクションログ トグル・`/api/detections`・`/api/ledger`・`/api/shield/posmodel`)を除去。
+  ON/OFF・基本 BAN 管理・基本指標は維持(完全な blackbox 化はしない)。
+- ドキュメント: `docs/dns.md` を削除。README/options.md/defenses.md/hardening.md/
+  apt-threat-model.md から該当節を整理。`pyproject.toml` の `geoip` optional-dependency
+  (未使用の `maxminddb` extra)と SBOM/第三者表示を同期。
+- テスト: `test_dns.py`/`test_ops.py`/`test_alertflood.py`/`test_datasets.py`/
+  `test_txnlog.py`/`test_integrity.py`/`test_posmodel.py`/`test_profile.py` を削除、
+  `test_core.py`/`test_hardening.py`/`test_saferegex.py`/`test_memtamper.py`/
+  `test_signed_state.py` から該当ケースを整理。**372/372 件緑**。
+
 ## [Lite] — ChickenNet-Lite(free / trial エディション)分岐
 
 上位(商用)エディションから、コアの L7 WAF/DDoS リバースプロキシ・ゲートウェイ + 最小限の

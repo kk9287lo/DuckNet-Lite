@@ -32,10 +32,8 @@ _COOKIE_NAME = "chickennet_admin"
 from dataplane.engine.lifeform.policy import app_firewall, ZONES, ACTIONS
 from dataplane.engine.lifeform.pipeline import net_shield
 from dataplane.engine.services import edge_config
-from dataplane.engine.core.atomic_io import tail_jsonl, default_state_dir
+from dataplane.engine.core.atomic_io import default_state_dir
 
-# 別プロセスの検知モジュール(dns)が書く永続ログ。読み取り専用で集約表示。
-_DETECTION_LOGS = {"dns": "dns_log.jsonl"}
 # 管理APIのリクエストボディ上限(Content-Length 詐称・巨大ボディのメモリ枯渇防止)。
 _MAX_BODY = 1 << 20
 
@@ -114,30 +112,6 @@ class AdminDashboard:
                 "shield_metrics": sh.metrics(), "top": sh.top_talkers(12),
                 "events": sh.events(40), "zones": ZONES, "actions": ACTIONS,
                 "capabilities": AsyncEdgeGuard.platform_capabilities()}
-
-    def detections(self, n: int = 40) -> dict:
-        """別プロセスの検知ログ(dns)の直近を読み取り専用で集約。
-        ファイルが無ければ空(=そのモジュール未起動)。GUI は制御せず可視化のみ。
-
-        アローリストで除外された接触(action=ignored)は『脅威』ではないので
-        本ビューからは外す(監査用に jsonl 本体には残る。DNS は免除クエリを記録しないので
-        元から出ないが、フィルタは将来の検知ソース追加に備えて一貫させておく)。"""
-        sources, counts = {}, {}
-        for name, fn in _DETECTION_LOGS.items():
-            rows = tail_jsonl(os.path.join(self._state_dir, fn), n * 4)
-            rows = [r for r in rows if r.get("action") != "ignored"][:n]
-            sources[name] = rows
-            counts[name] = len(rows)
-        return {"sources": sources, "counts": counts}
-
-    def ledger_status(self) -> dict:
-        """本命囮の持ち出し追跡(カナリア)。台帳状態 + 直近の pull/hit を返す。"""
-        try:
-            from dataplane.engine.lifeform.datasets import token_ledger
-            cb = token_ledger()
-            return {"present": True, **cb.status(), "recent": cb.log(40)}
-        except Exception:
-            return {"present": False}
 
     def deception_status(self) -> dict:
         """動的デセプション(MTD)の状態。env 駆動・状態レスのため本プロセスの env を反映し、
@@ -292,12 +266,8 @@ def _make_handler(app: AdminDashboard):
             sh = net_shield()
             if path == "/api/state":
                 self._send(200, _j(app.state()))
-            elif path == "/api/detections":
-                self._send(200, _j(app.detections()))
             elif path == "/api/deception":
                 self._send(200, _j(app.deception_status()))
-            elif path == "/api/ledger":
-                self._send(200, _j(app.ledger_status()))
             elif path == "/api/series":
                 self._send(200, _j({"series": sh.series(180)}))
             elif path == "/api/analysis":
@@ -320,8 +290,6 @@ def _make_handler(app: AdminDashboard):
                 self._send(200, _j(sh.subnet_status()))
             elif path == "/api/shield/tamper":          # 改竄検知の可視化(#55)
                 self._send(200, _j(sh.tamper_report()))
-            elif path == "/api/shield/posmodel":        # 正のセキュリティモデル(#62)
-                self._send(200, _j(sh.posmodel_status()))
             elif path == "/api/edge":
                 self._send(200, edge_config.edge_proxy_config(),
                            "text/plain; charset=utf-8")
@@ -361,8 +329,6 @@ def _make_handler(app: AdminDashboard):
                     r = sh.set_path_limits(b.get("rules"))
                 elif path == "/api/shield/blocked_methods":
                     r = sh.set_blocked_methods(b.get("methods"))
-                elif path == "/api/shield/posmodel":        # 正のモデル: 許可リストを設定(#62)
-                    r = sh.set_posmodel(b.get("rules"))
                 elif path == "/api/shield/sig_add":
                     r = sh.add_signature(b.get("name", ""), b.get("pattern", ""),
                                          weight=float(b.get("weight", 40)))
@@ -507,8 +473,6 @@ td .num{font-size:var(--fs-sm)}
 .badge.warn{color:var(--amber);background:color-mix(in srgb,var(--amber) 16%,transparent);border-color:color-mix(in srgb,var(--amber) 35%,transparent)}
 .badge.info{color:var(--purple);background:color-mix(in srgb,var(--purple) 16%,transparent);border-color:color-mix(in srgb,var(--purple) 35%,transparent)}
 .badge.muted{color:var(--dim);background:var(--panel2);border-color:var(--line)}
-.tag{display:inline-block;font-size:var(--fs-xs);font-weight:700;padding:2px 7px;border-radius:6px;font-family:var(--f-mono)}
-.tag-dns{color:var(--blue);background:color-mix(in srgb,var(--blue) 15%,transparent)}
 /* 行リスト(検知/イベント) */
 .feed{max-height:280px;overflow:auto;margin:0;display:flex;flex-direction:column}
 .frow{display:flex;align-items:center;gap:10px;padding:7px 4px;border-bottom:1px solid var(--line2);font-size:var(--fs-sm)}
@@ -588,15 +552,10 @@ canvas,svg{display:block;width:100%}
       </div>
     </section>
     <section class="panel">
-      <div class="phead"><h2>メソッド / 国別</h2><span class="meta" id="geometa">—</span></div>
+      <div class="phead"><h2>HTTPメソッド別</h2></div>
       <div class="pbody">
-        <div class="meta" style="margin:0 0 4px">HTTPメソッド別</div><div id="methbars"></div>
-        <div class="meta" style="margin:8px 0 4px">国別(GeoIP)</div><div id="ctrybars"></div>
+        <div id="methbars"></div>
       </div>
-    </section>
-    <section class="panel wide">
-      <div class="phead"><h2>横展開 / DNS 検知</h2><span class="meta">別プロセス · 読み取り専用</span></div>
-      <div class="pbody tight"><div class="feed" id="detections"></div></div>
     </section>
 
     <div class="sect"><span class="ic">⚙️</span>WAF / 検知設定</div>
@@ -656,7 +615,6 @@ canvas,svg{display:block;width:100%}
       <div class="phead"><h2>詳細防御(評価)</h2><span class="meta" id="advstat">—</span></div>
       <div class="pbody tight">
         <div class="row"><label class="sw"><input type="checkbox" id="sech" class="toggle"> 応答セキュリティヘッダ</label></div>
-        <div class="row"><label class="sw"><input type="checkbox" id="txnlog" class="toggle"> トランザクションログ</label></div>
         <div class="row"><span class="meta">検知の厳格度(paranoia)</span>
           <select id="paranoia" style="background:var(--panel2);color:var(--fg);border:1px solid var(--line);border-radius:var(--r2);padding:6px 9px;font:inherit">
             <option value="1">1 · 保守(誤検知最小)</option>
@@ -689,10 +647,6 @@ canvas,svg{display:block;width:100%}
       <div class="phead"><h2>デセプション(MTD)</h2><span class="meta" id="decepstat">—</span></div>
       <div class="pbody"><pre class="code" id="deception"></pre></div>
     </section>
-    <section class="panel">
-      <div class="phead"><h2>参照トークン台帳</h2><span class="meta" id="ledgerstat">—</span></div>
-      <div class="pbody tight"><div class="feed" id="ledger"></div></div>
-    </section>
 
     <div class="sect"><span class="ic">🔬</span>詳細分析</div>
     <section class="panel wide">
@@ -719,23 +673,23 @@ const JA2EN={
  "解除":"Release","接続中":"Connected","接続不可":"Disconnected",
  "概況":"Overview","脅威モニタリング":"Threat monitoring","WAF / 検知設定":"WAF / detection",
  "アクセス制御・申立":"Access control & appeals","欺瞞":"Deception","詳細分析":"Analysis",
- "リアルタイム通信":"Live traffic","ネットワーク図":"Network map","横展開 / DNS 検知":"Lateral / DNS detection",
+ "リアルタイム通信":"Live traffic","ネットワーク図":"Network map",
  "攻撃イベント":"Attack events","BAN中のIP":"Banned IPs","上位送信元(脅威スコア順)":"Top sources (by score)",
  "APT級の兆候":"APT-grade indicators","シグネチャ別ヒット":"Hits by signature",
- "トラフィック構成(ゾーン / アクション)":"Traffic mix (zone / action)","メソッド / 国別":"By method / country",
+ "トラフィック構成(ゾーン / アクション)":"Traffic mix (zone / action)",
  "WAF 追加シグネチャ(任意・高FP)":"WAF optional signatures (high-FP)","カスタムシグネチャ":"Custom signatures",
  "出口DLP(秘密漏洩)":"Egress DLP (secret leak)","ルール / ハニーポット":"Rules / honeypots",
  "詳細防御(評価)":"Advanced defenses (eval)",
- "応答セキュリティヘッダ":"Response security headers","トランザクションログ":"Transaction log",
+ "応答セキュリティヘッダ":"Response security headers",
  "検知の厳格度(paranoia)":"Detection strictness (paranoia)","ヘッダ":"headers",
  "1 · 保守(誤検知最小)":"1 · conservative (min FP)","2 · やや積極":"2 · moderate",
  "3 · 積極":"3 · aggressive","4 · 最大(高FP許容)":"4 · maximum (high FP ok)",
  "解除リクエスト(異議申立)":"Unban requests (appeals)",
  "デセプション(MTD)":"Deception (MTD)",
- "別プロセス · 読み取り専用":"Separate process · read-only","低速持続 · 規則的ビーコン · 累積":"Low-and-slow · beacon · cumulative",
+ "低速持続 · 規則的ビーコン · 累積":"Low-and-slow · beacon · cumulative",
  "外部(public)推移 · 内訳":"External (public) trend · breakdown","既定OFF · 誤検知許容な環境のみ点灯":"Off by default · enable where FPs OK",
  "中心=本機 / 内→外=loopback·private·public / ノードclickで遮断·解除":"Center=node / in→out=loopback·private·public / click to block·unblock",
- "ゾーン別":"By zone","アクション別":"By action","HTTPメソッド別":"By HTTP method","国別(GeoIP)":"By country (GeoIP)",
+ "ゾーン別":"By zone","アクション別":"By action","HTTPメソッド別":"By HTTP method",
  "許可":"Allow","拒否":"Deny","追加":"Add","エッジ前衛設定DL":"Download edge proxy config",
  "秘密漏洩検知":"Secret leak detection","監査(記録のみ)":"Audit (log only)","遮断(漏洩を送出しない)":"Block (withhold leak)",
  "手動BANするIP":"IP to ban manually","IP/CIDR 例:203.0.113.0/24":"IP/CIDR e.g. 203.0.113.0/24",
@@ -750,14 +704,13 @@ const JA2EN={
  "しきい値(別IP数)":"threshold (distinct IPs)",
  "遮断メソッド(カンマ区切) 例:TRACE,TRACK,CONNECT":"Blocked methods (comma) e.g. TRACE,TRACK,CONNECT",
  "BAN なし":"No bans","(なし)":"(none)","イベントなし":"No events","なし":"none","ヒットなし":"No hits",
- "検知なし / 各検知プロセス未起動":"No detections / detectors not running","カスタムなし":"No custom signatures",
- "削除":"Remove","DLP 無効":"DLP off","漏洩なし":"No leaks","GeoIP DB 未ロード":"GeoIP DB not loaded",
- "GeoIP 無効":"GeoIP off","未起動":"Not running",
+ "カスタムなし":"No custom signatures",
+ "削除":"Remove","DLP 無効":"DLP off","漏洩なし":"No leaks",
  "申立なし":"No appeals","承認":"Approve","却下":"Reject","名前とパターンを入力":"Enter name and pattern",
  "SSTI(テンプレート注入 {{…}})":"SSTI (template injection {{…}})","内部SSRF(localhost/内部IP)":"Internal SSRF (localhost/internal IP)",
  "オープンリダイレクト(=//)":"Open redirect (=//)",
  "要求":"Requests","スロットル":"Throttle","チャレンジ":"Challenge","ブロック":"Block","BAN中":"Banned","漏洩":"Leaks",
- "有効":"on","無効":"off","計":"total","種別":"types","系統":"families","か国":"countries","前":"ago",
+ "有効":"on","無効":"off","計":"total","種別":"types","系統":"families","前":"ago",
  "インターネット(public)を一括遮断します。よろしいですか?":"Block all public (internet) traffic. Are you sure?",
  "(CHICKENNET_DECEPTION 未設定 = 偽装なし)":"(CHICKENNET_DECEPTION unset = no deception)",
  "サンプル攻撃者":"Sample attacker","から見える偽装(隣接窓で必ず別系統):":"sees this deception (adjacent windows always differ):"};
@@ -770,7 +723,7 @@ function applyStatic(){
   if(el.dataset.o===undefined)el.dataset.o=el.textContent.trim();
   el.textContent=LANG==="en"?(JA2EN[el.dataset.o]||el.dataset.o):el.dataset.o;});
  const labels=[...document.querySelectorAll(".controls label.sw")];
- ["dlp","sech","txnlog","throttle","subnetdef"].forEach(id=>{const e=$(id)&&$(id).closest("label");if(e)labels.push(e);});
+ ["dlp","sech","throttle","subnetdef"].forEach(id=>{const e=$(id)&&$(id).closest("label");if(e)labels.push(e);});
  labels.forEach(el=>{const tn=el.lastChild;if(!tn||tn.nodeType!==3)return;
   if(el.dataset.o===undefined)el.dataset.o=tn.nodeValue.trim();
   tn.nodeValue=" "+(LANG==="en"?(JA2EN[el.dataset.o]||el.dataset.o):el.dataset.o);});
@@ -807,10 +760,10 @@ async function refresh(){
  // 出口DLP: 設定の反映 + 漏洩イベントの抽出表示
  const dc=s.shield.cfg;$("dlp").checked=!!dc.dlp_enabled;$("dlpact").value=dc.dlp_action||"audit";
  $("dlpstat").textContent=tr(dc.dlp_enabled?"有効":"無効")+" · "+(dc.dlp_action||"audit")+" · "+tr("漏洩")+" "+nf(m.dlp_leak||0);
- // 詳細防御(評価): 応答ヘッダ / txnログ / paranoia
+ // 詳細防御(評価): 応答ヘッダ / paranoia
  $("sech").checked=!!dc.sec_headers_enabled;
- $("txnlog").checked=!!dc.txnlog_enabled;$("paranoia").value=String(dc.paranoia||1);
- $("advstat").textContent=[dc.sec_headers_enabled&&tr("ヘッダ"),dc.txnlog_enabled&&"txn","P"+(dc.paranoia||1)].filter(Boolean).join(" · ");
+ $("paranoia").value=String(dc.paranoia||1);
+ $("advstat").textContent=[dc.sec_headers_enabled&&tr("ヘッダ"),"P"+(dc.paranoia||1)].filter(Boolean).join(" · ");
  // WAF 任意(高FP)シグネチャのトグル一覧
  const OPTL={ssti:"SSTI(テンプレート注入 {{…}})",ssrf_internal:"内部SSRF(localhost/内部IP)",redirect:"オープンリダイレクト(=//)"};
  const oset=dc.optional_sigs||{};
@@ -845,9 +798,6 @@ async function refresh(){
  $("actbars").innerHTML=barHTML([["allow",m.allow],["throttle",m.throttle],
    ["challenge",m.challenge],["block",m.block]],5);
  $("methbars").innerHTML=barHTML(Object.entries(m.method_hits||{}),8);
- const ctry=Object.entries(m.country_hits||{});
- $("ctrybars").innerHTML=ctry.length?barHTML(ctry,8):'<div class="empty">'+tr("GeoIP DB 未ロード")+'</div>';
- $("geometa").textContent=ctry.length?(ctry.length+" "+tr("か国")):tr("GeoIP 無効");
  // 漏洩した秘密種別の内訳(累積・テレメトリ)
  const lkm=m.dlp_kinds||{},lki=Object.entries(lkm).sort((a,b)=>b[1]-a[1]).slice(0,6);
  $("leakkinds").innerHTML=lki.map(([k,v])=>`<span class="badge danger">${esc(k)} ${v}</span>`).join(" ");
@@ -873,7 +823,6 @@ $("ua").onchange=e=>post("/api/shield/under_attack",{on:e.target.checked}).then(
 $("dlp").onchange=e=>post("/api/shield/config",{dlp_enabled:e.target.checked}).then(refresh);
 $("dlpact").onchange=e=>post("/api/shield/config",{dlp_action:e.target.value}).then(refresh);
 $("sech").onchange=e=>post("/api/shield/config",{sec_headers_enabled:e.target.checked}).then(refresh);
-$("txnlog").onchange=e=>post("/api/shield/config",{txnlog_enabled:e.target.checked}).then(refresh);
 $("paranoia").onchange=e=>post("/api/shield/paranoia",{level:parseInt(e.target.value)}).then(refresh);
 $("throttle").onchange=e=>post("/api/shield/config",{throttle_response:e.target.checked}).then(refresh);
 $("retryaft").onchange=e=>post("/api/shield/config",{throttle_retry_after:parseInt(e.target.value)||0}).then(refresh);
@@ -899,24 +848,8 @@ async function refreshPro(){
    `${(s.ip+"").padStart(15)}  apt ${String(s.apt_score).padStart(3)}  ${s.regular_beacon?"beacon ":""}${s.low_and_slow?"low&slow ":""}${s.banned?"BAN":""}`
   ).join("\n")||"(兆候なし)";}catch(e){}
  try{drawMap(await (await fetch("/api/nodes",{headers:H})).json());}catch(e){}
- try{refreshDetections();}catch(e){}
  try{refreshSigs();}catch(e){}
  try{refreshDeception();}catch(e){}
- try{refreshLedger();}catch(e){}
-}
-async function refreshLedger(){
- let d;try{d=await (await fetch("/api/ledger",{headers:H})).json()}catch(e){return}
- const m=d.metrics||{};
- $("ledgerstat").textContent="pull "+nf(m.pull||0)+" · hit "+nf(m.hit||0)+" · token "+nf(d.tokens||0);
- const rows=(d.recent||[]).slice(-40).reverse();
- $("ledger").innerHTML=rows.map(e=>{
-   const k=e.token?("hit"):(e.name?"pull":"-");
-   const who=esc(e.client||"");
-   const what=esc(e.name||(e.file&&e.file.name)||e.token||"");
-   return `<div class="frow"><span class="time">${tm(e.ts)}</span>`
-    +`<span class="badge danger">${k}</span><span class="desc num">${who}</span>`
-    +`<span class="desc">${what}</span></div>`;
- }).join("")||'<div class="empty">'+tr("なし")+'</div>';
 }
 async function refreshDeception(){
  let d;try{d=await (await fetch("/api/deception",{headers:H})).json()}catch(e){return}
@@ -968,18 +901,6 @@ function setIfBlur(id,val){const e=$(id);if(e&&document.activeElement!==e)e.valu
 function saveBlockedMethods(){
  const m=$("blockmeth").value.split(",").map(s=>s.trim()).filter(Boolean);
  post("/api/shield/blocked_methods",{methods:m}).then(refresh);
-}
-async function refreshDetections(){
- let d;try{d=await (await fetch("/api/detections",{headers:H})).json()}catch(e){return}
- const it=[],S=d.sources||{};
- (S.dns||[]).forEach(r=>it.push({ts:r.ts,src:"dns",sev:r.threat||r.action,desc:`${r.domain||""} · ${r.qtype||""}`,n:r.count}));
- it.sort((a,b)=>(b.ts||0)-(a.ts||0));
- $("detections").innerHTML=it.length?it.slice(0,50).map(o=>
-   `<div class="frow"><span class="time">${tm(o.ts)}</span><span class="tag tag-${o.src}">${o.src}</span>`
-   +`<span class="badge ${sev(o.sev)}">${esc(o.sev||"-")}</span>`
-   +`<span class="desc">${esc(o.desc)}</span>`
-   +`${o.n>1?`<span class="cnt">×${o.n}</span>`:""}</div>`).join("")
-   :'<div class="empty">'+tr("検知なし / 各検知プロセス未起動")+'</div>';
 }
 const _ZR={loopback:55,private:105,public:150,special:150,unknown:150};
 function drawMap(d){

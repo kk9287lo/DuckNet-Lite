@@ -1,14 +1,8 @@
 # =============================================================================
 # ChickenNet-Lite — Docker Compose
 # -----------------------------------------------------------------------------
-# 既定(プロファイル無し)は前衛ゲートウェイのみ起動。DNS の L7 検知は
-# プロファイルで opt-in する(本体とは別プロセス=別コンテナ):
 #   docker compose up -d                        # ゲートウェイ(前衛 + 管理画面)
-#   docker compose --profile dns up -d          # DNS の L7 検知
-#   docker compose --profile all up -d          # すべて
 #
-# 環境変数(任意・compose は同ディレクトリの .env も読む):
-#   CHICKENNET_DNS_UPSTREAM   DNS の上流リゾルバ(既定 1.1.1.1:53)
 # 全コンテナとも非rootで動くため、<1024 はホスト側でのみ公開しコンテナ内は高位ポート。
 # =============================================================================
 services:
@@ -26,16 +20,3 @@ services:
       # リモートから見る場合は SSH トンネル: ssh -L 8081:127.0.0.1:8081 <host>
     command: ["--backend", "host.docker.internal:8080", "--listen", "8443",
               "--admin", "8081", "--admin-host", "0.0.0.0"]
-
-  # DNS の L7 検知(トンネリング/C2/AD偵察)。UDP。既定は監査(止めず可視化)。
-  chickennet-dns:
-    build: .
-    image: chickennet-security:1.0.0
-    restart: unless-stopped
-    profiles: ["dns", "all"]
-    healthcheck:
-      disable: true
-    ports:
-      - "53:5335/udp"
-    command: ["dns", "--host", "0.0.0.0", "--listen", "5335",
-              "--upstream", "${CHICKENNET_DNS_UPSTREAM:-1.1.1.1:53}"]

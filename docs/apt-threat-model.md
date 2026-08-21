@@ -9,11 +9,11 @@
 
 | 攻撃(APT の手口) | 正しい防御層(WAF 外) | ChickenNet の寄与 | 原理的限界 |
 |---|---|---|---|
-| クラウド/vCenter 制圧・**VM スナップショット窃取** | IAM 最小権限・MFA・管理面の分離・KMS | 改竄検知(署名マニフェスト+HMAC 状態署名)。**外部鍵**で窃取しても再署名不能 | ハイパーバイザ全権を握られたらメモリ上の鍵も読める |
+| クラウド/vCenter 制圧・**VM スナップショット窃取** | IAM 最小権限・MFA・管理面の分離・KMS | 改竄検知(HMAC 状態署名)。**外部鍵**で窃取しても再署名不能 | ハイパーバイザ全権を握られたらメモリ上の鍵も読める |
 | **vNIC 再ルーティングで ChickenNet を迂回** / backend 直叩き | ネットワーク分離・SG/NACL・backend を WAF 経由のみ到達可能に | **オリジントークン(#77)**=迂回トラフィックを backend が拒否。**迂回検知(#78)**=トラフィック急停止を警報 | 経路を完全制御されたら最終的には通る |
 | BGP ハイジャック / DNS ポイズニング | **RPKI(ROA)**・**DNSSEC**・証明書透明性監視・HSTS preload | (範囲外) | 経路/名前解決は WAF の外 |
 | CPython コアのゼロデイ(C 層) | OS サンドボックス(seccomp/AppArmor)・最新化 | プロセス分離・最小権限で爆発半径を縮小 | 未知の言語ランタイム脆弱性は事前に防げない |
-| **FD/ソケット枯渇 + 再起動ループ悪用**で OS パニック | OS の `ulimit`/cgroup・systemd `LimitNOFILE`/sysctl | **グローバル接続上限(#79)**・per-IP 上限(#30)・**クラッシュループ遮断(#51)**・slow-body/header タイムアウト | カーネルメモリ枯渇は OS の領分 |
+| **FD/ソケット枯渇 + 再起動ループ悪用**で OS パニック | OS の `ulimit`/cgroup・systemd `LimitNOFILE`/sysctl・`StartLimitBurst`(クラッシュループ遮断) | **グローバル接続上限(#79)**・per-IP 上限(#30)・slow-body/header タイムアウト | カーネルメモリ枯渇は OS の領分 |
 
 ---
 
@@ -47,10 +47,8 @@ def is_from_edge(request) -> bool:
 ## 2. 迂回の能動検知(dead-man's switch・#78)
 
 ChickenNet 経由のトラフィックが *直近 busy だったのに突然ゼロ* になったら、再ルーティングの疑い。
-`stall_detect_enabled`(既定 ON)で `traffic_stall` イベント+SIEM 警報。SIEM 転送を必ず設定:
-```bash
-export CHICKENNET_SYSLOG="udp://siem.internal:514"   # traffic_stall / *_tamper を malicious で転送
-```
+`stall_detect_enabled`(既定 ON)で `traffic_stall` イベントを記録する。ダッシュボード
+(`GET /api/shield/events` / `/api/shield/tamper`)で定期的に監視すること。
 
 ## 3. 資源枯渇ハードニング(#79 + OS 層)
 
@@ -64,25 +62,23 @@ TasksMax=4096
 MemoryMax=2G            # cgroup でメモリを頭打ち(OS 巻き込みを防ぐ)
 Restart=on-failure
 StartLimitIntervalSec=60
-StartLimitBurst=5       # クラッシュループ遮断(アプリ #51 と二重)
+StartLimitBurst=5       # クラッシュループ遮断(OS 層。アプリは自動再起動ロジックを持たない)
 ```
 
 ## 4. 外部鍵(スナップショット窃取への耐性)
 
-状態署名(#52/#54)・完全性(#48)・オリジントークン(#77)の鍵は **VM の外**(KMS/Vault/env 注入)に置く。
+状態署名(#52/#54)・オリジントークン(#77)の鍵は **VM の外**(KMS/Vault/env 注入)に置く。
 VM やディスクのスナップショットを抜かれても、鍵が無ければ **状態の偽造もトークンの偽造もできない**。
 ```bash
 export CHICKENNET_STATE_KEY="$(vault read -field=k secret/chickennet/state)"
-export CHICKENNET_INTEGRITY_KEY="$(vault read -field=k secret/chickennet/integrity)"
 export CHICKENNET_ORIGIN_KEY="$(vault read -field=k secret/chickennet/origin)"
 ```
 
-## 5. 完全性 / 改竄検知(#48–#55)
+## 5. 状態改竄検知(#52–#55)
 
-deploy 時に既知良好を固定し、ランタイムで継続検証(改竄=自動修復+SIEM):
-```bash
-python -m dataplane --integrity-baseline    # deploy 直後・信頼できる時点で基準化
-```
+状態ファイル(BAN/設定)は HMAC 署名され、無署名/改竄されたものは fail-safe で破棄される
+(`state_tamper` イベント)。in-memory の cfg すり替えも MAC で検知し、ディスクの署名済み状態から
+自動復元する(`memory_tamper`)。ダッシュボード `GET /api/shield/tamper` で要約+直近イベントを確認する。
 
 ---
 
@@ -93,8 +89,7 @@ python -m dataplane --integrity-baseline    # deploy 直後・信頼できる時
 - [ ] **インフラ IAM**: 管理コンソール MFA・最小権限・管理面の分離・監査ログ。
 - [ ] **鍵**: `CHICKENNET_*_KEY` を VM 外(KMS/Vault)に。ディスクに置かない。
 - [ ] **OS**: systemd ハードニング + `LimitNOFILE`/`MemoryMax`/`TasksMax`、`chattr +i`/読取専用マウント(docs/hardening.md)。
-- [ ] **検知**: `CHICKENNET_SYSLOG`/`CHICKENNET_WEBHOOK` で SIEM 転送。`stall_detect_enabled`・改竄イベントを監視。
-- [ ] **完全性**: deploy 時 `--integrity-baseline`。ランタイム自動検証(既定 watchdog)。
+- [ ] **検知**: ダッシュボード(`/api/shield/events` / `/api/shield/tamper`)を定期監視。`stall_detect_enabled`・改竄イベントを確認。
 - [ ] **最新化**: CPython・OS を最新に。seccomp/AppArmor で syscall を絞る。
 
 ## 関連

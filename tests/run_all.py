@@ -19,15 +19,10 @@ os.environ.setdefault("CHICKENNET_OFFLINE", "1")
 
 MODULES = [
     "test_core",                # 管理ダッシュボード制御API
-    "test_dns",                 # DNS の L7 検知(トンネリング/C2/AD偵察)
-    "test_datasets",          # 本命囮ハニーファイル + カナリア追跡
     "test_logio",               # 追記ログのローテーション(肥大防止)
     "test_banner",              # 動的デセプション(偽Serverバナーで指紋攪乱)
-    "test_profile",             # ステルス運用(低プロファイル化・製品名秘匿)
     "test_hardening",           # ReDoS/脆弱性・未知攻撃ファズ・資源境界・ホットパス健全性
-    "test_ops",                 # 運用機能: SIEM転送(Syslog/Webhook)
     "test_secheaders",          # 応答セキュリティヘッダ注入
-    "test_txnlog",              # 構造化トランザクションログ
     "test_paranoia",            # 検知の段階的厳格度(paranoia レベル)
     "test_health",              # データプレーンのヘルスチェック(LB/オーケストレータ用)
     "test_bans",                # 累犯BANエスカレーション(常習攻撃者を重く罰する)
@@ -40,13 +35,10 @@ MODULES = [
     "test_connlimit",           # per-IP 同時接続上限(接続枯渇/slowloris 増幅対策)
     "test_keepalive",           # keep-alive 越しの検査回避を封じる(Connection: close 強制)
     "test_realip",              # 信頼proxy背後の実クライアントIP解決(XFF・既定は信頼しない)
-    "test_resilience",          # 自己防衛: 生存監視/強制再起動/一時停止からの安定復帰(watchdog)
-    "test_integrity",           # 自己防衛: ファイルすり替え検知+ベースラインからの強制修復
     "test_signed_state",        # 自己防衛: 可変状態ファイルの HMAC 署名による改竄耐性
     "test_autostart",           # 自己防衛: 起動時自動起動の登録(透明・公認の場所のみ)
     "test_respscore",           # 応答アウェア脅威スコア(4xx連射=列挙/ブルートフォース検知)
     "test_bodyscan",            # 要求ボディ検査(POST/JSON 本文の SQLi/XSS/RCE/SSTI=head死角)
-    "test_posmodel",            # 正のセキュリティモデル(許可した パス/メソッド だけ通す allowlist)
     "test_botconsistency",      # ヘッダ整合性ボット検知(UA偽装ツールを低FP加点)
     "test_slowbody",            # スロー POST(R-U-Dead-Yet)対策(ボディ総受信時間に上限)
     "test_cookieharden",        # Set-Cookie ハードニング(SameSite/Secure/HttpOnly 補完)
@@ -62,7 +54,6 @@ MODULES = [
     "test_cachepoison",         # キャッシュ汚染ヘッダ除去(非信頼の X-Forwarded-Host 等を落とす)
     "test_rangedos",            # Range ヘッダ DoS 対策(多数レンジ=Apache Killer を遮断)
     "test_origin",              # バックエンド・バイパス防止(エッジ経由を証明する時間有界トークン)
-    "test_alertflood",          # AlertSink distinct-key 有界化 + /c/ 未知トークン抑制(無防備入口)
     "test_buttonmash",          # ボタン連打(並行/二重送信)スキャン: スレッド安全・更新取りこぼし無し
     "test_memtamper",           # in-memory cfg すり替え検知+署名ディスクからの復元
     "test_stall",               # 迂回検知(busy→突然ゼロ=バイパスの疑いを警報)

@@ -9,18 +9,11 @@ ChickenNet の挙動は **CLI 引数**・**環境変数**・**設定キー(cfg)*
 | 変数 | 既定 | 説明 |
 | --- | --- | --- |
 | `CHICKENNET_LANG` | (自動) | サーバ生成文言の言語 `ja`/`en`。未設定なら OS ロケールに追随(英語環境は自動 en、それ以外 ja)。 |
-| `CHICKENNET_COVER` | (空) | **ステルス名**。設定すると製品名(ログ/スレッド名/起動バナー/管理ダッシュボードのタイトル・ヘッダ/生成設定コメント)を露出させず、この名前で偽装。 |
 | `CHICKENNET_STATE_DIR` | OS 既定 | 状態ファイル(BAN/設定/署名/テレメトリ)の保存先。 |
 | `CHICKENNET_STATE_KEY` | (生成) | 状態ファイル署名の HMAC 鍵。**外部鍵推奨**(未設定時は state_dir に 0600 で生成=同ディスク root には弱い)。 |
 | `CHICKENNET_OFFLINE` | (空) | 外部接続を一切しない(テスト/隔離環境)。 |
 | `CHICKENNET_DRAIN_TIMEOUT` | `60` | 応答転送の書込み(drain)デッドライン秒(#9 slow-read/zero-window 対策)。 |
-| `CHICKENNET_ALERT_QPS` | `20` | SIEM/Webhook 転送の最大送信レート(毎秒)。0 で無効。 |
-| `CHICKENNET_ALERT_CAP` | `1024` | アラート転送キューの容量(超過は drop-oldest・抑制サマリで可視化)。 |
-| `CHICKENNET_SYSLOG` | (空) | Syslog 転送先 `udp://h:514` / `tcp://h:601` / `h:port`。 |
-| `CHICKENNET_SYSLOG_FACILITY` | `16` | Syslog ファシリティ(0–23・既定 local0)。 |
-| `CHICKENNET_WEBHOOK` | (空) | Webhook 転送先 URL(`{"text":...}` 形式で POST)。 |
 | `CHICKENNET_HEALTH_PATH` | (空) | LB 死活監視用に即 200 を返す予約パス(WAF/バックエンド非経由)。 |
-| `CHICKENNET_DNS_UPSTREAM` | — | `dns` サブコマンドの上流リゾルバ(既定 `1.1.1.1:53`)。 |
 
 ## 主な設定キー(cfg)
 
@@ -40,7 +33,6 @@ ChickenNet の挙動は **CLI 引数**・**環境変数**・**設定キー(cfg)*
 | `subnet_defense` | `False` | サブネット(/24・/64)集約防御(opt-in)。 |
 | `jwt_inspect_enabled` | `True` | JWT(`alg:none`/許可外 alg)遮断。 |
 | `cookie_harden_enabled` / `cors_harden_enabled` | `True` / `True` | Set-Cookie 補完 / CORS 無害化。 |
-| `posmodel_enabled` / `posmodel_mode` | `False` / `enforce` | 正のセキュリティモデル(allowlist)と enforce/audit。 |
 | `graphql_enabled` | `False` | GraphQL 深さ/複雑度/イントロスペクション制限。 |
 | `upload_scan_enabled` | `True` | アップロード危険拡張子検査。 |
 | `path_override_block` / `method_override_block` | `True` / `False` | ACL バイパス(X-Original-URL 等)/ メソッドオーバーライド遮断。 |
@@ -54,13 +46,3 @@ ChickenNet の挙動は **CLI 引数**・**環境変数**・**設定キー(cfg)*
 | `stall_detect_enabled` | `True` | 迂回検知(busy→突然ゼロ)。 |
 | `persist_bans` | `True` | BAN を再起動を跨いで永続化(署名付き・ロールバック耐性)。 |
 | `trusted_proxies` | `[]` | 信頼 proxy の CIDR(背後で XFF から実IPを採用。既定は XFF 不信)。 |
-
-> **DNS 検知**(`python -m dataplane dns`)は別途 `rrl_max_per_sec`(既定 30・応答レート制限)など
-> DNS 専用の設定を持ちます。
-
-## サブコマンド
-
-| コマンド | 説明 |
-| --- | --- |
-| `python -m dataplane …` | ゲートウェイ(前衛 + 管理 API)。既定。 |
-| `python -m dataplane dns` | DNS の L7 検知(別プロセス)。 |

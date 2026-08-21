@@ -65,7 +65,7 @@ def build_sbom() -> dict:
                     "name": "ChickenNet L7 Security Commercial License"}}],
             },
         },
-        # 配布物に同梱する第三者ライブラリは無い。実行環境(Python)と任意 extra のみ列挙。
+        # 配布物に同梱する第三者ライブラリは無い。実行環境(Python)のみ列挙。
         "components": [
             {
                 "type": "platform",
@@ -77,22 +77,10 @@ def build_sbom() -> dict:
                 "licenses": [{"license": {"id": "PSF-2.0"}}],
                 "properties": [{"name": "requires-python", "value": ">=3.10"}],
             },
-            {
-                "type": "library",
-                "bom-ref": "maxminddb",
-                "name": "maxminddb",
-                "scope": "optional",
-                "purl": "pkg:pypi/maxminddb",
-                "description": ("Optional GeoIP lookups; only present if the "
-                                "user installs the 'geoip' extra."),
-                "licenses": [{"license": {"id": "Apache-2.0"}}],
-                "properties": [{"name": "extra", "value": "geoip"}],
-            },
         ],
         "dependencies": [
             {"ref": app_ref, "dependsOn": ["cpython"]},
             {"ref": "cpython", "dependsOn": []},
-            {"ref": "maxminddb", "dependsOn": []},
         ],
     }
 

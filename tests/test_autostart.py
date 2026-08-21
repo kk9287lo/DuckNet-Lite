@@ -8,18 +8,15 @@ from dataplane.engine.core import autostart as A
 from dataplane.service import _strip_autostart_flags
 
 
-def test_build_command_adds_supervise():
+def test_build_command_wraps_args():
     cmd = A.build_command(["--backend", "127.0.0.1:8080", "--listen", "8443"])
     assert cmd[1:3] == ["-m", "dataplane"]
-    assert "--supervise" in cmd
     assert "--backend" in cmd and "8443" in cmd
-    # 既に --supervise 指定なら二重化しない
-    cmd2 = A.build_command(["--supervise", "--listen", "8443"])
-    assert cmd2.count("--supervise") == 1
+    assert "--supervise" not in cmd   # 親監督フラグは廃止済み(OS の自動再起動に委ねる)
 
 
 def test_quote_handles_spaces():
-    s = A._quote(["C:\\Program Files\\python.exe", "-m", "dataplane", "--stealth", "Disk Indexer"])
+    s = A._quote(["C:\\Program Files\\python.exe", "-m", "dataplane", "--admin-host", "Disk Indexer"])
     assert '"C:\\Program Files\\python.exe"' in s and '"Disk Indexer"' in s
     assert " -m dataplane " in s
 

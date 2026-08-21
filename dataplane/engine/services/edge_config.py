@@ -42,9 +42,8 @@ def export_banlist(path: str = "") -> dict:
         path = os.path.join(os.path.expanduser("~"), ".chickennet",
                             "edge_banlist.txt")
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    from ...profile import cover_brand        # ステルス時は生成物にも製品名を出さない
     with open(path, "w", encoding="utf-8") as f:
-        f.write(f"# {cover_brand('ChickenNet')} edge banlist "
+        f.write(f"# ChickenNet edge banlist "
                 f"(generated {time.strftime('%Y-%m-%d %H:%M:%S')})\n")
         for ip in sorted(ips):
             f.write(ip + "\n")
@@ -56,8 +55,7 @@ def edge_proxy_config(banlist_path: str = "/etc/chickennet/edge_banlist.txt",
                       listen: int = 8080) -> str:
     """BANリストを読み、命中したら return 444(即切断)するプロキシ設定を返す。
     綺麗なアクセスだけを backend(本体 Web サービス)へ proxy_pass する。"""
-    from ...profile import cover_brand
-    return f"""# === {cover_brand('ChickenNet')} edge shredder (Lua対応リバースプロキシ) ===
+    return f"""# === ChickenNet edge shredder (Lua対応リバースプロキシ) ===
 # 生成物: NetShield/firewall の判定を「カーネル手前」で 444 Drop する前衛。
 # banlist は `banlist 出力ツール` が定期的に更新する想定(1行1IP/CIDR)。
 #

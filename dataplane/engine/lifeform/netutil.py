@@ -2,7 +2,7 @@
 netutil.py — IP/CIDR の小さな共有ヘルパ(依存ゼロ)
 ====================================================================================
 アローリスト照合(信頼送信元の除外)を各所で個別実装していたのを1つに束ねる。
-AlertSink と DnsFilter が共通で使う。
+proxy.py の信頼 proxy(trusted_proxies)判定などが共通で使う。
 """
 from __future__ import annotations
 

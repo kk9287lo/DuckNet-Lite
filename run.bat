@@ -4,7 +4,6 @@ rem ChickenNet L7 Security - 起動ランチャ (Windows / cmd)
 rem -----------------------------------------------------------------------------
 rem 役割: Python を堅牢に検出し、バージョンを確認し、UTF-8 を整えて製品本体へ委譲する。
 rem   run.bat                      ... ゲートウェイ(前衛 + 管理ダッシュボード)
-rem   run.bat dns        --help    ... DNS の L7 検知
 rem   run.bat --help               ... 製品の全オプション
 rem
 rem 環境変数 / 設定:

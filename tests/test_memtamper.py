@@ -50,24 +50,10 @@ def test_type_change_tamper_restored():
 
 
 def test_tamper_reported():
-    from dataplane.engine.lifeform import pipeline as P
-    sent = []
-
-    class _FO:
-        active = True
-        def emit(self, ev, src, verdict):
-            sent.append((ev.get("kind"), verdict))
-
     with tempfile.TemporaryDirectory() as d:
         sh = NetShield(state_dir=d)
         sh.set_config(challenge_score=40)
         sh.cfg["challenge_score"] = 999999             # out-of-band 改変(既定と異なる値)
-        orig = P.default_fanout
-        P.default_fanout = lambda: _FO()
-        try:
-            sh.verify_cfg_integrity()
-        finally:
-            P.default_fanout = orig
+        sh.verify_cfg_integrity()
         assert sh.metrics()["tamper"]["count"] >= 1
-        assert ("memory_tamper", "malicious") in sent or any(
-            k == "memory_tamper" for k, _ in sent)
+        assert sh.metrics()["tamper"]["last"]["kind"] == "memory_tamper"
