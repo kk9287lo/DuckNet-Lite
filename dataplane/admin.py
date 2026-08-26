@@ -84,13 +84,12 @@ def _metrics_exposition(sh) -> str:
 
 class AdminDashboard:
     def __init__(self, host: str = "127.0.0.1", port: int = 8081, token: str = "",
-                 license_mgr=None, state_dir: str = "",
+                 state_dir: str = "",
                  brand: str = "", logo: str = "🦅",
                  subtitle: str = "L7 防御 — 管理ダッシュボード"):
         self.host = host
         self.port = port
         self.token = token or secrets.token_urlsafe(24)
-        self.license_mgr = license_mgr
         # 画面の表示名/アイコン。ステルス運用では汎用名(例 "System Health Monitor")に
         # 差し替えて、管理画面のタイトル/ヘッダ/Server ヘッダから製品を伏せる。明示が無ければ
         # CHICKENNET_COVER env を尊重し(遮断ページと同じ秘匿源=適用漏れを防ぐ)、無ければ製品名。
@@ -314,6 +313,13 @@ def _make_handler(app: AdminDashboard):
                     r = (fw.add_rule(b.get("net", ""), b.get("action", "deny"))
                          if b.get("op") != "remove"
                          else fw.remove_rule(b.get("net", "")))
+                elif path == "/api/firewall/resolve":
+                    # ゾーン policy が "prompt" の未知接続(保留)を承認(allow)/拒否(deny)する。
+                    # これが無いと prompt は deny と等価な行き止まりになる(#2)。
+                    remember = bool(b.get("remember", True))
+                    r = (fw.approve(b.get("id", ""), remember=remember)
+                         if b.get("approve")
+                         else fw.deny_pending(b.get("id", ""), remember=remember))
                 elif path == "/api/shield/toggle":
                     r = sh.enable() if b.get("on") else sh.disable()
                 elif path == "/api/shield/config":
@@ -615,6 +621,7 @@ canvas,svg{display:block;width:100%}
             <option value="3">3 · 積極</option>
             <option value="4">4 · 最大(高FP許容)</option>
           </select></div>
+        <div class="row"><span class="meta" id="tamperstat">—</span></div>
       </div>
     </section>
 
@@ -631,6 +638,10 @@ canvas,svg{display:block;width:100%}
     <section class="panel">
       <div class="phead"><h2>解除リクエスト(異議申立)</h2></div>
       <div class="pbody"><table id="appeals"><tbody></tbody></table></div>
+    </section>
+    <section class="panel">
+      <div class="phead"><h2>承認待ち接続(ファイアウォール)</h2><span class="meta">zone policy=prompt の未知接続</span></div>
+      <div class="pbody"><table id="fwpending"><tbody></tbody></table></div>
     </section>
 
     <div class="sect"><span class="ic">🌐</span>欺瞞</div>
@@ -661,7 +672,7 @@ function sev(s){s=(s||"").toLowerCase();
 /* 言語(i18n): 既定は日本語=サーバHTMLそのまま。EN はクライアントで適用。 */
 const JA2EN={
  "ファイアウォール":"Firewall","DDoS / 侵入防御":"DDoS / Intrusion","🌍 グローバル遮断":"🌍 Global block",
- "解除":"Release","接続中":"Connected","接続不可":"Disconnected",
+ "解除":"Release","接続中":"Connected","接続不可":"Disconnected","認証エラー・再読込":"Auth error — reload",
  "概況":"Overview","脅威モニタリング":"Threat monitoring","WAF / 検知設定":"WAF / detection",
  "アクセス制御・申立":"Access control & appeals","欺瞞":"Deception","詳細分析":"Analysis",
  "リアルタイム通信":"Live traffic","ネットワーク図":"Network map",
@@ -676,6 +687,8 @@ const JA2EN={
  "1 · 保守(誤検知最小)":"1 · conservative (min FP)","2 · やや積極":"2 · moderate",
  "3 · 積極":"3 · aggressive","4 · 最大(高FP許容)":"4 · maximum (high FP ok)",
  "解除リクエスト(異議申立)":"Unban requests (appeals)",
+ "承認待ち接続(ファイアウォール)":"Pending connections (firewall)","zone policy=prompt の未知接続":"Unknown connections under zone policy=prompt",
+ "承認待ちなし":"No pending connections",
  "デセプション(MTD)":"Deception (MTD)",
  "低速持続 · 規則的ビーコン · 累積":"Low-and-slow · beacon · cumulative",
  "外部(public)推移 · 内訳":"External (public) trend · breakdown","既定OFF · 誤検知許容な環境のみ点灯":"Off by default · enable where FPs OK",
@@ -704,7 +717,10 @@ const JA2EN={
  "有効":"on","無効":"off","計":"total","種別":"types","系統":"families","前":"ago",
  "インターネット(public)を一括遮断します。よろしいですか?":"Block all public (internet) traffic. Are you sure?",
  "(CHICKENNET_DECEPTION 未設定 = 偽装なし)":"(CHICKENNET_DECEPTION unset = no deception)",
- "サンプル攻撃者":"Sample attacker","から見える偽装(隣接窓で必ず別系統):":"sees this deception (adjacent windows always differ):"};
+ "サンプル攻撃者":"Sample attacker","から見える偽装(隣接窓で必ず別系統):":"sees this deception (adjacent windows always differ):",
+ "残":"remaining ","組込":"built-in","カスタム":"custom","危険除外":"unsafe-excluded",
+ "(兆候なし)":"(no indicators)","本機":"This host","失敗":"failed",
+ "改竄検知":"Tamper detection","直近":"Last"};
 let LANG="ja";try{LANG=localStorage.getItem("fn-lang")||"ja"}catch(e){}
 function tr(s){if(LANG!=="en"||s==null)return s;const k=String(s).trim();return JA2EN[k]!==undefined?JA2EN[k]:s;}
 function applyStatic(){
@@ -738,9 +754,20 @@ function setTheme(t){document.documentElement.dataset.theme=t;try{localStorage.s
 $("theme").onclick=()=>setTheme(document.documentElement.dataset.theme==="light"?"dark":"light");
 $("lang").textContent=LANG==="en"?"日本語":"EN";applyStatic();
 async function post(p,b){return (await fetch(p,{method:"POST",headers:H,body:JSON.stringify(b)})).json()}
+// 認証エラー(401 / {ok:false})はネットワーク断とは別物として扱う: cookie失効・トークン不一致等
+// (例: サーバ再起動でトークンが再生成された)で接続断ではなくデータが"正常"に見えてしまうのを防ぐ。
+function isAuthFail(e){return !!(e&&e.authFail)}
+function markAuthError(){$("conn").className="pill bad";$("connt").textContent=tr("認証エラー・再読込");}
+async function guardedFetch(path){
+ const resp=await fetch(path,{headers:H});
+ let data=null;try{data=await resp.json()}catch(e){}
+ if(resp.status===401||(data&&data.ok===false)){const err=new Error("auth");err.authFail=true;throw err;}
+ return data;
+}
 async function refresh(){
- let s;try{s=await (await fetch("/api/state",{headers:H})).json()}catch(e){
-  $("conn").className="pill bad";$("connt").textContent=tr("接続不可");return}
+ let s;try{s=await guardedFetch("/api/state")}catch(e){
+  if(isAuthFail(e)){markAuthError();}else{$("conn").className="pill bad";$("connt").textContent=tr("接続不可");}
+  return}
  $("conn").className="pill ok";$("connt").textContent=tr("接続中");
  $("fw").checked=s.firewall.enabled;$("sh").checked=s.shield.cfg.enabled;
  const m=s.shield_metrics;
@@ -749,12 +776,20 @@ async function refresh(){
    ["漏洩",m.dlp_leak,"i-red"]]
    .map(([l,n,a])=>`<div class="kpi ${a}"><div class="kn">${nf(n)}</div><div class="kl">${esc(tr(l))}</div></div>`).join("");
  // 出口DLP: 設定の反映 + 漏洩イベントの抽出表示
+ // dlp_enabled はサブフラグに過ぎず、実際の稼働は本体(dc.enabled)とのAND(pipeline.py dlp_active()と同一条件) —
+ // 本体OFF中に「有効」と表示して安心させない(#5)。
  const dc=s.shield.cfg;$("dlp").checked=!!dc.dlp_enabled;$("dlpact").value=dc.dlp_action||"audit";
- $("dlpstat").textContent=tr(dc.dlp_enabled?"有効":"無効")+" · "+(dc.dlp_action||"audit")+" · "+tr("漏洩")+" "+nf(m.dlp_leak||0);
+ const dlpOn=!!dc.enabled&&!!dc.dlp_enabled;
+ $("dlpstat").textContent=tr(dlpOn?"有効":"無効")+" · "+(dc.dlp_action||"audit")+" · "+tr("漏洩")+" "+nf(m.dlp_leak||0);
  // 詳細防御(評価): 応答ヘッダ / paranoia
  $("sech").checked=!!dc.sec_headers_enabled;
  $("paranoia").value=String(dc.paranoia||1);
  $("advstat").textContent=[dc.sec_headers_enabled&&tr("ヘッダ"),"P"+(dc.paranoia||1)].filter(Boolean).join(" · ");
+ // 改竄検知の可視化(#55): 件数+直近イベントをダッシュボードに要約表示(READMEの記載どおり実物を出す)
+ const tp=m.tamper||{};
+ const tpCount=nf(tp.count||0)+(LANG==="en"?"":"件");
+ const tpLast=tp.last?((tp.last.kind||"")+" "+tm(tp.last.ts)):tr("(なし)");
+ $("tamperstat").textContent=tr("改竄検知")+": "+tpCount+" · "+tr("直近")+": "+tpLast;
  // WAF 任意(高FP)シグネチャのトグル一覧
  const OPTL={ssti:"SSTI(テンプレート注入 {{…}})",ssrf_internal:"内部SSRF(localhost/内部IP)",redirect:"オープンリダイレクト(=//)"};
  const oset=dc.optional_sigs||{};
@@ -778,9 +813,9 @@ async function refresh(){
  setIfBlur("blockmeth",(dc.blocked_methods||[]).join(","));
  $("opsstat").textContent=[dc.throttle_response!==false&&"429",dc.subnet_defense&&tr("分散"),
    (dc.blocked_methods||[]).length+tr("メソッド")].filter(Boolean).join(" · ");
- try{const sn=await (await fetch("/api/shield/subnet",{headers:H})).json();
+ try{const sn=await guardedFetch("/api/shield/subnet");
   $("subnetmeta").textContent=tr("追跡")+" "+nf(sn.tracked_subnets||0)+" · hot "+nf(sn.hot_subnets||0)
-   +" · "+tr("遮断メソッド")+": "+((dc.blocked_methods||[]).join(", ")||tr("なし"));}catch(e){}
+   +" · "+tr("遮断メソッド")+": "+((dc.blocked_methods||[]).join(", ")||tr("なし"));}catch(e){if(isAuthFail(e))markAuthError();}
  // シグネチャ別ヒット / トラフィック構成(累積・テレメトリ)= 横棒グラフ(共通ヘルパ)
  const si=Object.entries(m.sig_hits||{});
  $("sigmetatop").textContent=tr("計")+" "+nf(si.reduce((a,x)=>a+x[1],0))+" · "+tr("種別")+" "+si.length;
@@ -797,9 +832,9 @@ async function refresh(){
    `<div class="frow"><span class="time">${tm(e.ts)}</span><span class="badge danger">leak</span>`
    +`<span class="desc num">${esc(e.ip||"")}</span>`
    +`<span class="desc">${esc((e.kinds||[]).join(", "))}</span></div>`).join("")
-   ||'<div class="empty">'+tr(dc.dlp_enabled?"漏洩なし":"DLP 無効")+'</div>';
+   ||'<div class="empty">'+tr(dlpOn?"漏洩なし":"DLP 無効")+'</div>';
  $("bans").querySelector("tbody").innerHTML=(s.shield.bans||[]).map(b=>
-   `<tr><td class="num">${esc(b.ip)}</td><td class="num">残${Math.round(b.remain_sec)}s</td>
+   `<tr><td class="num">${esc(b.ip)}</td><td class="num">${esc(tr("残"))}${Math.round(b.remain_sec)}s</td>
    <td><span class="badge ${b.score>40?"danger":"warn"}">score ${b.score}</span></td>
    <td><button class="ghost" onclick="unban('${esc(b.ip)}')">${tr("解除")}</button></td></tr>`).join("")
    ||'<tr><td colspan="4" class="empty">'+tr("BAN なし")+'</td></tr>';
@@ -807,6 +842,13 @@ async function refresh(){
  $("events").innerHTML=(s.events||[]).slice(-60).reverse().map(e=>
    `<div class="frow"><span class="time">${tm(e.ts)}</span><span class="badge ${sev(e.kind)}">${esc(e.kind)}</span>`
    +`<span class="desc num">${esc(e.ip||"")}</span></div>`).join("")||'<div class="empty">'+tr("イベントなし")+'</div>';
+ // ゾーン policy=prompt の保留接続(#2): アピール一覧と同じ承認/拒否UXで、行き止まりを解消
+ $("fwpending").querySelector("tbody").innerHTML=((s.firewall||{}).pending||[]).map(p=>
+   `<tr><td class="num">${esc(p.ip)}</td><td><span class="badge info">${esc(p.zone)}</span></td>
+   <td class="num">${tm(p.ts)}</td>
+   <td><button onclick="resolvePending('${esc(p.id)}',true)">${tr("承認")}</button>
+   <button class="red" onclick="resolvePending('${esc(p.id)}',false)">${tr("却下")}</button></td></tr>`).join("")
+   ||'<tr><td colspan="4" class="empty">'+tr("承認待ちなし")+'</td></tr>';
 }
 $("fw").onchange=e=>post("/api/firewall/toggle",{on:e.target.checked}).then(refresh);
 $("sh").onchange=e=>post("/api/shield/toggle",{on:e.target.checked}).then(refresh);
@@ -819,30 +861,30 @@ $("retryaft").onchange=e=>post("/api/shield/config",{throttle_retry_after:parseI
 $("subnetdef").onchange=e=>post("/api/shield/config",{subnet_defense:e.target.checked}).then(refresh);
 $("subthr").onchange=e=>post("/api/shield/config",{subnet_threshold:parseInt(e.target.value)||1}).then(refresh);
 async function refreshPro(){
- try{const s=(await (await fetch("/api/series",{headers:H})).json()).series||[];drawChart(s);
+ try{const s=(await guardedFetch("/api/series")).series||[];drawChart(s);
   drawSpark("leaktrend",s.map(x=>x.dlp_leak||0));
   drawSpark("sigtrend",s.map(x=>x.sig_total||0));
-  drawSpark("pubtrend",s.map(x=>x.pub||0));}catch(e){}
- try{const ap=(await (await fetch("/api/appeals",{headers:H})).json()).appeals||[];
+  drawSpark("pubtrend",s.map(x=>x.pub||0));}catch(e){if(isAuthFail(e))markAuthError();}
+ try{const ap=(await guardedFetch("/api/appeals")).appeals||[];
   $("appeals").querySelector("tbody").innerHTML=ap.map(a=>
    `<tr><td class="num">${esc(a.ip)}</td><td><span class="badge ${a.status==="pending"?"warn":"muted"}">${esc(a.status)}</span></td>
    <td>${esc((a.reason||"").slice(0,40))}</td>
    <td>${a.status==="pending"?`<button onclick="resolveAppeal('${esc(a.ip)}',true)">${tr("承認")}</button>
    <button class="red" onclick="resolveAppeal('${esc(a.ip)}',false)">${tr("却下")}</button>`:""}</td></tr>`
-  ).join("")||'<tr><td colspan="4" class="empty">'+tr("申立なし")+'</td></tr>';}catch(e){}
- try{const an=await (await fetch("/api/analysis",{headers:H})).json();
+  ).join("")||'<tr><td colspan="4" class="empty">'+tr("申立なし")+'</td></tr>';}catch(e){if(isAuthFail(e))markAuthError();}
+ try{const an=await guardedFetch("/api/analysis");
   $("analysis").textContent=JSON.stringify({actions:an.actions,by_zone:an.by_zone,
-   top_signatures:an.top_signatures,event_kinds:an.event_kinds,active_bans:an.active_bans},null,2);}catch(e){}
- try{const ap=await (await fetch("/api/apt",{headers:H})).json();
+   top_signatures:an.top_signatures,event_kinds:an.event_kinds,active_bans:an.active_bans},null,2);}catch(e){if(isAuthFail(e))markAuthError();}
+ try{const ap=await guardedFetch("/api/apt");
   $("apt").textContent=(ap.suspects||[]).map(s=>
    `${(s.ip+"").padStart(15)}  apt ${String(s.apt_score).padStart(3)}  ${s.regular_beacon?"beacon ":""}${s.low_and_slow?"low&slow ":""}${s.banned?"BAN":""}`
-  ).join("\n")||"(兆候なし)";}catch(e){}
- try{drawMap(await (await fetch("/api/nodes",{headers:H})).json());}catch(e){}
+  ).join("\n")||tr("(兆候なし)");}catch(e){if(isAuthFail(e))markAuthError();}
+ try{drawMap(await guardedFetch("/api/nodes"));}catch(e){if(isAuthFail(e))markAuthError();}
  try{refreshSigs();}catch(e){}
  try{refreshDeception();}catch(e){}
 }
 async function refreshDeception(){
- let d;try{d=await (await fetch("/api/deception",{headers:H})).json()}catch(e){return}
+ let d;try{d=await guardedFetch("/api/deception")}catch(e){if(isAuthFail(e))markAuthError();return}
  $("decepstat").innerHTML=`<span class="badge ${d.enabled?"info":"muted"}">${tr(d.enabled?"有効":"無効")}</span>`
    +` ${tr("系統")} ${d.family_count||0}`;
  if(!d.enabled){$("deception").textContent=tr("(CHICKENNET_DECEPTION 未設定 = 偽装なし)")+"\n"+tr("系統")+": "
@@ -853,9 +895,9 @@ async function refreshDeception(){
    +rows.join("\n");
 }
 async function refreshSigs(){
- let d;try{d=await (await fetch("/api/shield/signatures",{headers:H})).json()}catch(e){return}
- $("sigmeta").textContent=`組込 ${(d.builtin||[]).length} · カスタム ${d.custom_active||0}`
-   +(d.custom_blocked?` · 危険除外 ${d.custom_blocked}`:"");
+ let d;try{d=await guardedFetch("/api/shield/signatures")}catch(e){if(isAuthFail(e))markAuthError();return}
+ $("sigmeta").textContent=`${tr("組込")} ${(d.builtin||[]).length} · ${tr("カスタム")} ${d.custom_active||0}`
+   +(d.custom_blocked?` · ${tr("危険除外")} ${d.custom_blocked}`:"");
  $("customsigs").querySelector("tbody").innerHTML=(d.custom||[]).map(c=>
    `<tr><td class="num">${esc(c.name)}</td><td><span class="num">${esc((c.pattern||"").slice(0,48))}</span></td>`
    +`<td><button class="ghost" data-signame="${esc(c.name)}">${tr("削除")}</button></td></tr>`).join("")
@@ -869,7 +911,7 @@ async function addSig(){
  const name=$("signame").value.trim(),pattern=$("sigpat").value;
  if(!name||!pattern){$("sigerr").textContent=tr("名前とパターンを入力");return;}
  const r=await post("/api/shield/sig_add",{name,pattern});
- $("sigerr").textContent=r.ok?"":("✗ "+(r.error||"失敗"));
+ $("sigerr").textContent=r.ok?"":("✗ "+(r.error||tr("失敗")));
  if(r.ok){$("signame").value="";$("sigpat").value="";}
  refreshSigs();
 }
@@ -880,7 +922,7 @@ async function addPathLimit(){
  if(!path||!(rate>0)){$("prerr").textContent=tr("パスと毎秒(>0)を入力");return;}
  const rule={path,rate};if(burst>0)rule.burst=burst;
  const r=await post("/api/shield/path_limits",{rules:curPathLimits.concat([rule])});
- $("prerr").textContent=r.ok?"":("✗ "+(r.error||"失敗"));
+ $("prerr").textContent=r.ok?"":("✗ "+(r.error||tr("失敗")));
  if(r.ok){$("prpath").value="";$("prrate").value="";$("prburst").value="";}
  refresh();
 }
@@ -897,7 +939,7 @@ function drawMap(d){
  const W=1040,Hh=300,cx=W/2,cy=Hh/2;
  const line=cssv("--line"),fg=cssv("--fg"),blue=cssv("--blue"),green=cssv("--green"),amber=cssv("--amber"),red=cssv("--brand");
  let g=`<circle cx="${cx}" cy="${cy}" r="24" fill="${blue}"/>`
-   +`<text x="${cx}" y="${cy+4}" fill="#fff" font-size="11" font-weight="700" text-anchor="middle">本機</text>`;
+   +`<text x="${cx}" y="${cy+4}" fill="#fff" font-size="11" font-weight="700" text-anchor="middle">${esc(tr("本機"))}</text>`;
  const byz={};(d.nodes||[]).forEach(n=>{(byz[n.zone]=byz[n.zone]||[]).push(n)});
  Object.keys(byz).forEach(z=>{const arr=byz[z],r=_ZR[z]||150;
   arr.forEach((n,i)=>{const a=(i/Math.max(1,arr.length))*Math.PI*2;
@@ -954,6 +996,7 @@ function drawChart(s){
  $("chartleg").innerHTML=`<span style="color:${blue}">●</span> req/s &nbsp;<span style="color:${red}">●</span> block/s &nbsp;· peak ${mx.toFixed(1)}/s`;
 }
 function resolveAppeal(ip,ok){post("/api/appeal/resolve",{ip,approve:ok}).then(()=>{refresh();refreshPro();})}
+function resolvePending(id,ok){post("/api/firewall/resolve",{id,approve:ok}).then(()=>{refresh();refreshPro();})}
 function unban(ip){post("/api/shield/unban",{ip}).then(refresh)}
 function ban(){post("/api/shield/ban",{ip:$("banip").value}).then(refresh)}
 function rule(a){post("/api/firewall/rule",{net:$("ruleip").value,action:a}).then(refresh)}
