@@ -397,8 +397,9 @@ a{color:var(--blue)}
 .pill.ok .dot{background:var(--green);box-shadow:0 0 0 0 var(--green);animation:pulse 2s infinite}
 .pill.bad{color:var(--red)}.pill.bad .dot{background:var(--red)}
 @keyframes pulse{0%{box-shadow:0 0 0 0 color-mix(in srgb,var(--green) 70%,transparent)}70%{box-shadow:0 0 0 7px transparent}100%{box-shadow:0 0 0 0 transparent}}
-.iconbtn{font-size:16px;line-height:1;width:36px;height:36px;border-radius:var(--r2);cursor:pointer;
- background:var(--panel2);border:1px solid var(--line);color:var(--fg)}
+.iconbtn{font-size:16px;line-height:1;min-width:36px;height:36px;padding:0 8px;border-radius:var(--r2);
+ cursor:pointer;background:var(--panel2);border:1px solid var(--line);color:var(--fg);display:inline-flex;
+ align-items:center;justify-content:center;white-space:nowrap}
 .iconbtn:hover{border-color:var(--blue)}
 .wrap{max-width:1280px;margin:0 auto;padding:clamp(14px,2.5vw,26px)}
 /* 操作行 */
