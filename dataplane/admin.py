@@ -19,6 +19,7 @@ import hmac
 import http.cookies
 import json
 import os
+import re
 import secrets
 import threading
 import time
@@ -32,7 +33,8 @@ _COOKIE_NAME = "chickennet_admin"
 from dataplane.engine.lifeform.policy import app_firewall, ZONES, ACTIONS
 from dataplane.engine.lifeform.pipeline import net_shield
 from dataplane.engine.services import edge_config
-from dataplane.engine.core.atomic_io import default_state_dir
+from dataplane.engine.core.atomic_io import (default_state_dir, tail_jsonl,
+                                                      append_jsonl)
 
 # 管理APIのリクエストボディ上限(Content-Length 詐称・巨大ボディのメモリ枯渇防止)。
 _MAX_BODY = 1 << 20
@@ -82,6 +84,92 @@ def _metrics_exposition(sh) -> str:
     return "\n".join(out) + "\n"
 
 
+def _audit_entry(path: str, b: dict, r: dict, pre_cfg: dict, pre_fw: dict):
+    """成功した mutating POST 1件から監査ログ行を組み立てる。
+    (summary, before, after, revert) を返す。ログに残す価値が無ければ None
+    (例: /api/shield/config で実際には何も変わらなかった呼び出し)。
+
+    このフォークのルート一覧に合わせて絞ってある(honeypot/intel_reload/posmodel/
+    under_attack は Lite に存在しないため対象外)。revert は「単純なスカラー設定値」を
+    1回だけ元に戻すための {endpoint, body} のみ持たせる。add/remove系(シグネチャ・
+    ルール・BAN等)は一覧操作で戻せるためここでは revert を付けない。"""
+    def cfgrevert(key, before):
+        return {"endpoint": "/api/shield/config", "body": {key: before}}
+
+    if path == "/api/firewall/toggle":
+        on = bool(b.get("on"))
+        return (f"firewall {'enabled' if on else 'disabled'}", pre_fw["enabled"], on,
+                {"endpoint": path, "body": {"on": pre_fw["enabled"]}})
+    if path == "/api/firewall/policy":
+        zone, action = b.get("zone", ""), b.get("action", "")
+        before = pre_fw["policy"].get(zone)
+        return (f"firewall zone '{zone}' policy -> {action}", before, action, None)
+    if path == "/api/firewall/rule":
+        net = b.get("net", "")
+        if b.get("op") == "remove":
+            prev = next((x for x in pre_fw["rules"] if x.get("net") == net), None)
+            return (f"firewall rule {net} removed", prev, None, None)
+        return (f"firewall rule {net} -> {b.get('action', 'deny')}", None,
+                {"net": net, "action": b.get("action", "deny")}, None)
+    if path == "/api/firewall/resolve":
+        approve = bool(b.get("approve"))
+        ip = r.get("ip", "")
+        return (f"pending connection {ip or b.get('id', '')} {'approved' if approve else 'denied'}",
+                None, {"id": b.get("id", ""), "approve": approve, "ip": ip}, None)
+    if path == "/api/shield/toggle":
+        on = bool(b.get("on"))
+        return (f"shield {'enabled' if on else 'disabled'}", pre_cfg.get("enabled"), on,
+                {"endpoint": path, "body": {"on": pre_cfg.get("enabled")}})
+    if path == "/api/shield/config":
+        changed = r.get("changed") or {}
+        if not changed:
+            return None
+        before = {k: pre_cfg.get(k) for k in changed}
+        parts = [f"{k}: {before[k]} -> {v}" for k, v in changed.items()]
+        revert = None
+        if len(changed) == 1:
+            (k, v), = changed.items()
+            revert = cfgrevert(k, before[k])
+        return ("config: " + "; ".join(parts), before, changed, revert)
+    if path == "/api/shield/optional_sig":
+        name, on = b.get("name", ""), bool(b.get("on"))
+        before = bool((pre_cfg.get("optional_sigs") or {}).get(name))
+        return (f"optional signature '{name}' -> {'on' if on else 'off'}", before, on,
+                {"endpoint": path, "body": {"name": name, "on": before}})
+    if path == "/api/shield/paranoia":
+        before = pre_cfg.get("paranoia")
+        after = r.get("paranoia")
+        return (f"paranoia level {before} -> {after}", before, after,
+                (cfgrevert("paranoia", before) if before is None else
+                 {"endpoint": "/api/shield/paranoia", "body": {"level": before}}))
+    if path == "/api/shield/path_limits":
+        after = r.get("path_limits", [])
+        before = pre_cfg.get("path_limits")
+        return (f"path limits updated ({len(after)} rules)", before, after, None)
+    if path == "/api/shield/blocked_methods":
+        after = r.get("blocked_methods", [])
+        before = pre_cfg.get("blocked_methods")
+        return (f"blocked methods -> {', '.join(after) or '(none)'}", before, after, None)
+    if path == "/api/shield/sig_add":
+        return (f"signature '{b.get('name', '')}' added", None,
+                {"name": b.get("name", ""), "pattern": b.get("pattern", "")}, None)
+    if path == "/api/shield/sig_remove":
+        return (f"signature '{b.get('name', '')}' removed", {"name": b.get("name", "")}, None, None)
+    if path == "/api/shield/unban":
+        return (f"IP {b.get('ip', '')} unbanned", {"ip": b.get("ip", "")}, None, None)
+    if path == "/api/shield/ban":
+        return (f"IP {b.get('ip', '')} banned manually", None, {"ip": b.get("ip", "")}, None)
+    if path == "/api/appeal/resolve":
+        ip, approve = b.get("ip", ""), bool(b.get("approve"))
+        return (f"appeal {ip} {'approved' if approve else 'denied'}", None,
+                {"ip": ip, "approve": approve}, None)
+    if path == "/api/global_block":
+        on = bool(b.get("on"))
+        before = pre_fw["policy"].get("public")
+        return (f"global block -> {'on' if on else 'off'}", before, "deny" if on else "allow", None)
+    return None
+
+
 class AdminDashboard:
     def __init__(self, host: str = "127.0.0.1", port: int = 8081, token: str = "",
                  state_dir: str = "",
@@ -100,6 +188,33 @@ class AdminDashboard:
         self._state_dir = state_dir or default_state_dir()
         self._server = None
         self._thread = None
+
+    # ── 監査ログ ──
+    @property
+    def _audit_path(self) -> str:
+        # self._state_dir は construction 後にテストが直接差し替える運用なので、ここも
+        # __init__ でキャッシュせず毎回その場で組み立てる(キャッシュすると差し替えが効かず
+        # 別テスト間で監査ログが混線する)。
+        return os.path.join(self._state_dir, "admin_audit.jsonl")
+
+    def record_audit(self, path: str, b: dict, r: dict, pre_cfg: dict, pre_fw: dict) -> None:
+        """成功した mutating POST 1件を admin_audit.jsonl へ追記する。失敗しても本処理は
+        止めない(監査は付随機能・可用性を落とさない)。他の JSONL ログと同じ既定ローテーション
+        (5MB・世代1)を append_jsonl の既定値で踏襲する。"""
+        try:
+            built = _audit_entry(path, b, r, pre_cfg, pre_fw)
+            if not built:
+                return
+            summary, before, after, revert = built
+            append_jsonl(self._audit_path, {"ts": time.time(), "endpoint": path,
+                                            "summary": summary, "before": before,
+                                            "after": after, "revert": revert})
+        except Exception:
+            pass
+
+    def audit_log(self, n: int = 200) -> dict:
+        """直近の監査ログ(新しい順)。GET /api/admin_audit が返す。"""
+        return {"entries": tail_jsonl(self._audit_path, n)}
 
     # ── 状態取得 ──
     def state(self) -> dict:
@@ -267,7 +382,12 @@ def _make_handler(app: AdminDashboard):
             elif path == "/api/deception":
                 self._send(200, _j(app.deception_status()))
             elif path == "/api/series":
-                self._send(200, _j({"series": sh.series(180)}))
+                # チャートの時間範囲ズームがクライアント側の既存retained分をフルに切り出せる
+                # よう、サーバ側の返却上限を _series の実容量(maxlen=600・約10分)まで返す。
+                # 新たな長期保存は追加しない(既にメモリ上にある分をそのまま返すだけ)。
+                self._send(200, _j({"series": sh.series(600)}))
+            elif path == "/api/admin_audit":
+                self._send(200, _j(app.audit_log()))
             elif path == "/api/analysis":
                 self._send(200, _j(sh.analysis()))
             elif path == "/api/appeals":
@@ -304,6 +424,11 @@ def _make_handler(app: AdminDashboard):
             path = self.path.split("?")[0]
             b = self._body()
             fw, sh = app_firewall(), net_shield()
+            # 監査ログ用の変更前スナップショット。個々の分岐へ計装せず、ここ1箇所で変更前を
+            # 取り、成功後にもう1箇所(下の record_audit 呼び出し)でログする ―― 唯一のフック
+            # 2点(取得/記録)だけで全 mutating ルートを横断カバーする。
+            pre_cfg = dict(sh.cfg)
+            pre_fw = {"enabled": fw.enabled, "policy": dict(fw.policy), "rules": list(fw.rules)}
             try:
                 if path == "/api/firewall/toggle":
                     r = fw.enable() if b.get("on") else fw.disable()
@@ -347,10 +472,29 @@ def _make_handler(app: AdminDashboard):
                 elif path == "/api/global_block":
                     fw.enable()
                     r = fw.set_policy("public", "deny" if b.get("on") else "allow")
+                elif path == "/api/shield/sig_test":
+                    # カスタムシグネチャの試験(状態は一切変更しない・読み取り専用)。まず既存の
+                    # validate_pattern(ReDoS/安全性検査)へ通し、危険なパターンは
+                    # コンパイル/マッチすら試みない(危険パターンを試験名目で実行させない)。
+                    pattern, sample = b.get("pattern", ""), str(b.get("sample", ""))[:4096]
+                    err = sh.validate_pattern(pattern)
+                    if err:
+                        r = {"ok": True, "matches": False, "error": err}
+                    else:
+                        try:
+                            r = {"ok": True, "matches": bool(re.search(pattern, sample)), "error": None}
+                        except re.error as e:
+                            r = {"ok": True, "matches": False, "error": str(e)}
                 else:
                     self._send(404, _j({"ok": False, "error": "not found"}))
                     return
                 self._send(200, _j(r))
+                # set_paranoia() は paranoia_status() をそのまま返すため "ok" キーを持たない
+                # (エラー系は明示的に "ok": False を返す) — 単純に r.get("ok") だけで判定すると
+                # paranoia 変更が監査ログに一切残らない。「"ok" が明示的に False でなければ成功」
+                # として扱う(sig_test は _audit_entry が None を返すため二重に安全)。
+                if isinstance(r, dict) and r.get("ok", True) is not False:
+                    app.record_audit(path, b, r, pre_cfg, pre_fw)
             except Exception as e:
                 self._send(200, _j({"ok": False, "error": str(e)}))
     return H
@@ -486,9 +630,65 @@ td .num{font-size:var(--fs-sm)}
 .note{color:var(--faint);font-size:var(--fs-xs);margin-top:10px}
 canvas,svg{display:block;width:100%}
 ::-webkit-scrollbar{width:9px;height:9px}::-webkit-scrollbar-thumb{background:var(--line);border-radius:9px}
+/* トースト通知 */
+.toastwrap{position:fixed;right:16px;bottom:16px;z-index:300;display:flex;flex-direction:column-reverse;
+ gap:8px;max-width:min(360px,calc(100vw - 32px));pointer-events:none}
+.toast{display:flex;align-items:center;gap:10px;padding:10px 12px;border-radius:var(--r2);background:var(--panel);
+ border:1px solid var(--line);box-shadow:var(--shadow);font-size:var(--fs-sm);color:var(--fg);
+ opacity:0;transform:translateY(8px);transition:opacity .18s,transform .18s;pointer-events:auto}
+.toast.show{opacity:1;transform:translateY(0)}
+.toast.ok{border-color:color-mix(in srgb,var(--green) 45%,var(--line))}
+.toast.ok::before{content:"✓";color:var(--green);font-weight:700}
+.toast.err{border-color:color-mix(in srgb,var(--red) 45%,var(--line))}
+.toast.err::before{content:"✕";color:var(--red);font-weight:700}
+.toast.info::before{content:"ℹ";color:var(--blue);font-weight:700}
+.toast .ttext{flex:1;min-width:0;overflow-wrap:anywhere}
+.toast .tclose{background:transparent;border:0;color:var(--faint);padding:0 2px;font-size:14px;
+ line-height:1;cursor:pointer}
+.toast .tclose:hover{color:var(--fg)}
+/* 確認ダイアログ */
+.modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,.5);display:flex;align-items:center;
+ justify-content:center;z-index:250;padding:16px}
+.modal{background:var(--panel);border:1px solid var(--line);border-radius:var(--r);box-shadow:var(--shadow);
+ padding:20px;max-width:420px;width:100%}
+.modal-msg{font-size:var(--fs-md);color:var(--fg);margin-bottom:16px;line-height:1.5;white-space:pre-line}
+.modal-actions{display:flex;justify-content:flex-end;gap:8px}
+/* 初回ロードのスケルトン: 『本当にゼロ』ではなく『まだ届いていない』と分かるように */
+.skel-bar{display:inline-block;height:.85em;min-width:24px;border-radius:4px;vertical-align:middle;
+ background:linear-gradient(90deg,var(--panel2) 25%,var(--line2) 37%,var(--panel2) 63%);
+ background-size:400% 100%;animation:skel 1.4s ease-in-out infinite}
+@keyframes skel{0%{background-position:100% 50%}100%{background-position:0 50%}}
+.kpi.skel .kn{margin-bottom:2px}
+/* ボタンのビジー状態: 二重送信防止 + 進行中フィードバック */
+button.busy{color:transparent!important;pointer-events:none;position:relative}
+button.busy::after{content:"";position:absolute;left:50%;top:50%;width:13px;height:13px;
+ margin:-6.5px 0 0 -6.5px;border-radius:50%;border:2px solid rgba(255,255,255,.55);
+ border-top-color:#fff;animation:spin .6s linear infinite}
+button.ghost.busy::after,button.red.busy::after{border-color:var(--line);border-top-color:var(--fg)}
+@keyframes spin{to{transform:rotate(360deg)}}
+/* チャート時間範囲ズーム */
+.chartzoom{display:inline-flex;gap:4px;margin-left:10px}
+.chartzoom button{padding:3px 9px;font-size:var(--fs-xs)}
+.chartzoom button.active{background:var(--blue);color:#fff;border-color:var(--blue)}
+/* テーブル検索/ソート */
+th.sortable{cursor:pointer;user-select:none}
+th.sortable:hover{color:var(--fg)}
+th.sortable .sortarrow{display:inline-block;width:9px;font-size:9px;color:var(--blue)}
+.searchrow{margin-top:0}
+.searchrow input{flex:1;min-width:120px}
 @media(prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
 @media(max-width:560px){.brand small{display:none}.wrap{padding:14px}}
 </style></head><body>
+<div class="toastwrap" id="toastwrap"></div>
+<div class="modal-overlay" id="confirmOverlay" style="display:none">
+  <div class="modal">
+    <div class="modal-msg" id="confirmMsg"></div>
+    <div class="modal-actions">
+      <button class="ghost" id="confirmCancel">キャンセル</button>
+      <button class="red" id="confirmOk">実行</button>
+    </div>
+  </div>
+</div>
 <div class="bar">
   <div class="brand"><span class="logo">__LOGO__</span><div>__BRAND__<small>__SUBTITLE__</small></div></div>
   <div class="spacer"></div>
@@ -501,14 +701,19 @@ canvas,svg{display:block;width:100%}
     <label class="sw"><input type="checkbox" id="fw" class="toggle"> ファイアウォール</label>
     <label class="sw"><input type="checkbox" id="sh" class="toggle"> DDoS / 侵入防御</label>
     <div class="spacer"></div>
-    <button class="red" onclick="globalBlock(true)">🌍 グローバル遮断</button>
-    <button class="ghost" onclick="globalBlock(false)">解除</button>
+    <button class="red" onclick="globalBlock(true,this)">🌍 グローバル遮断</button>
+    <button class="ghost" onclick="globalBlock(false,this)">解除</button>
   </div>
   <div class="kpis" id="cards"></div>
   <div class="grid">
     <div class="sect"><span class="ic">📈</span>概況</div>
     <section class="panel wide">
-      <div class="phead"><h2>リアルタイム通信</h2><span class="meta" id="chartleg">req/s · block/s</span></div>
+      <div class="phead"><h2>リアルタイム通信</h2><span class="meta" id="chartleg">req/s · block/s</span>
+        <div class="chartzoom" id="chartzoom">
+          <button class="ghost" data-sec="300" onclick="setChartWindow(300)">5m</button>
+          <button class="ghost" data-sec="1800" onclick="setChartWindow(1800)">30m</button>
+          <button class="ghost active" data-sec="all" onclick="setChartWindow(Infinity)">全期間</button>
+        </div></div>
       <div class="pbody"><canvas id="chart" height="180" style="height:180px"></canvas></div>
     </section>
     <section class="panel wide">
@@ -518,14 +723,30 @@ canvas,svg{display:block;width:100%}
 
     <div class="sect"><span class="ic">🛡</span>脅威モニタリング</div>
     <section class="panel">
-      <div class="phead"><h2>攻撃イベント</h2></div>
-      <div class="pbody tight"><div class="feed" id="events"></div></div>
+      <div class="phead"><h2>攻撃イベント</h2><span class="meta" id="eventsmeta">—</span></div>
+      <div class="pbody tight">
+        <div class="row searchrow" style="margin:8px 8px 0"><input id="eventsearch" placeholder="IP/種別で絞り込み" oninput="renderEvents()">
+        <button class="ghost" onclick="exportData('events','csv')">CSV</button>
+        <button class="ghost" onclick="exportData('events','json')">JSON</button></div>
+        <div class="feed" id="events"></div>
+      </div>
     </section>
     <section class="panel">
-      <div class="phead"><h2>BAN中のIP</h2></div>
-      <div class="pbody"><table id="bans"><tbody></tbody></table>
+      <div class="phead"><h2>BAN中のIP</h2><span class="meta" id="bansmeta">—</span></div>
+      <div class="pbody">
+        <div class="row searchrow"><input id="bansearch" placeholder="IPで絞り込み" oninput="renderBans()">
+        <button class="ghost" onclick="exportData('bans','csv')">CSV</button>
+        <button class="ghost" onclick="exportData('bans','json')">JSON</button></div>
+        <table id="bans"><thead><tr>
+          <th style="width:22px"><input type="checkbox" id="banall" onchange="toggleAllBans(this.checked)" title="表示中の全行を選択"></th>
+          <th>IP</th><th class="sortable" data-sort="remain">残り時間<span class="sortarrow"></span></th>
+          <th class="sortable" data-sort="score">スコア<span class="sortarrow"></span></th><th></th>
+        </tr></thead><tbody></tbody></table>
+        <div class="row"><button class="ghost" onclick="unbanSelected(this)">選択解除</button>
+        <button class="red ghost" onclick="unbanAll(this)">全解除</button></div>
         <div class="row"><input id="banip" placeholder="手動BANするIP">
-        <button class="red" onclick="ban()">BAN</button></div></div>
+        <button class="red" onclick="ban(this)">BAN</button></div>
+      </div>
     </section>
     <section class="panel">
       <div class="phead"><h2>上位送信元(脅威スコア順)</h2></div>
@@ -565,11 +786,16 @@ canvas,svg{display:block;width:100%}
     <section class="panel">
       <div class="phead"><h2>カスタムシグネチャ</h2><span class="meta" id="sigmeta">—</span></div>
       <div class="pbody">
+        <div class="row" style="margin-top:0"><button class="ghost" onclick="exportData('sigs','csv')">CSV</button>
+        <button class="ghost" onclick="exportData('sigs','json')">JSON</button></div>
         <table id="customsigs"><tbody></tbody></table>
         <div class="row"><input id="signame" placeholder="名前 例:my-rule">
         <input id="sigpat" placeholder="正規表現 例:evil-?bot"></div>
-        <div class="row"><button onclick="addSig()">追加</button>
+        <div class="row"><button onclick="addSig(this)">追加</button>
         <span class="meta" id="sigerr"></span></div>
+        <div class="row"><input id="sigtestsample" placeholder="テスト対象の文字列(パス/UA/ヘッダ値など)" title="実際に追加する前に、このパターンがサンプル文字列にマッチするかを試せます(状態は変更されません)。">
+        <button class="ghost" onclick="testSig(this)">テスト</button>
+        <span class="meta" id="sigtestresult"></span></div>
       </div>
     </section>
     <section class="panel">
@@ -579,7 +805,7 @@ canvas,svg{display:block;width:100%}
         <div class="row"><input id="prpath" placeholder="パス前方一致 例:/login">
         <input id="prrate" type="number" step="0.1" placeholder="毎秒 例:0.5" style="max-width:130px">
         <input id="prburst" type="number" step="1" placeholder="バースト 例:5" style="max-width:130px"></div>
-        <div class="row"><button onclick="addPathLimit()">追加</button>
+        <div class="row"><button onclick="addPathLimit(this)">追加</button>
         <span class="meta" id="prerr"></span></div>
       </div>
     </section>
@@ -589,10 +815,19 @@ canvas,svg{display:block;width:100%}
         <div class="row"><label class="sw"><input type="checkbox" id="throttle" class="toggle"> レート超過に429応答</label>
           <input id="retryaft" type="number" step="1" min="0" placeholder="Retry-After 秒" style="max-width:150px"></div>
         <div class="row"><label class="sw"><input type="checkbox" id="subnetdef" class="toggle"> サブネット集約防御</label>
-          <input id="subthr" type="number" step="1" min="1" placeholder="しきい値(別IP数)" style="max-width:170px"></div>
+          <input id="subthr" type="number" step="1" min="1" placeholder="しきい値(別IP数)" style="max-width:170px"
+          title="同一サブネット(IPv4は/24・IPv6は/64)内でこの数の別IPがBANされると分散攻撃(ボットネット等)とみなし、そのサブネットの新規IPに事前スコアを加点します(即BANはしません・共有NAT巻き添え回避のため既定OFF)。"></div>
         <div class="row"><span class="meta" id="subnetmeta">—</span></div>
         <div class="row"><input id="blockmeth" placeholder="遮断メソッド(カンマ区切) 例:TRACE,TRACK,CONNECT">
-          <button onclick="saveBlockedMethods()">適用</button></div>
+          <button onclick="saveBlockedMethods(this)">適用</button>
+          <span class="meta" id="methoderr"></span></div>
+        <div class="row"><input id="maxconnip" type="number" step="1" min="0" placeholder="上限接続数/IP(0=無制限)" style="max-width:180px"
+          title="1つのIPが同時に保持できる接続数の上限。0=無制限。超過分は即切断し、接続保持型のflood(スロットループ等)を防ぎます。">
+          <input id="connrateip" type="number" step="1" min="0" placeholder="新規接続/秒/IP(0=無制限)" style="max-width:190px"
+          title="1つのIPからの新規接続を1秒あたりこの数までに制限。0=無制限。接続→即RST/即切断を高速反復するRSTフラッド/churnフラッドを、リクエスト解析より手前の安価な段階で遮断します。">
+          <input id="maxtotalconn" type="number" step="1" min="0" placeholder="全体同時接続上限(0=無制限)" style="max-width:200px"
+          title="サーバ全体の同時接続数の上限。0=無制限。超過分は即切断し、大量接続によるFD/メモリ枯渇でサーバごと落ちるのを防ぎます。"></div>
+        <div class="row"><label class="sw" title="転送するリクエストのConnectionをcloseへ書き換え、1接続=1リクエストに強制します。OFFにするとkeep-alive越しの2本目以降のリクエストが検査されずに素通りする恐れがあります(検査回避対策・既定ON推奨)。"><input type="checkbox" id="forceclose" class="toggle"> keep-alive を強制切断</label></div>
       </div>
     </section>
     <section class="panel">
@@ -600,7 +835,7 @@ canvas,svg{display:block;width:100%}
       <div class="pbody tight">
         <div class="row">
           <label class="sw"><input type="checkbox" id="dlp" class="toggle"> 秘密漏洩検知</label>
-          <select id="dlpact" style="background:var(--panel2);color:var(--fg);border:1px solid var(--line);border-radius:var(--r2);padding:6px 9px;font:inherit">
+          <select id="dlpact" title="応答本文にAPIキー等の秘密が含まれていた場合の挙動。監査=記録のみで送出は止めません。遮断=漏洩を検知した応答を送出せず遮断します。" style="background:var(--panel2);color:var(--fg);border:1px solid var(--line);border-radius:var(--r2);padding:6px 9px;font:inherit">
             <option value="audit">監査(記録のみ)</option>
             <option value="block">遮断(漏洩を送出しない)</option>
           </select>
@@ -615,7 +850,7 @@ canvas,svg{display:block;width:100%}
       <div class="pbody tight">
         <div class="row"><label class="sw"><input type="checkbox" id="sech" class="toggle"> 応答セキュリティヘッダ</label></div>
         <div class="row"><span class="meta">検知の厳格度(paranoia)</span>
-          <select id="paranoia" style="background:var(--panel2);color:var(--fg);border:1px solid var(--line);border-radius:var(--r2);padding:6px 9px;font:inherit">
+          <select id="paranoia" title="検知の段階的な厳格度。レベルを上げるほど誤検知が起きやすい任意シグネチャを段階的に有効化します(2:オープンリダイレクト → 3:+内部SSRF → 4:+テンプレート注入)。既定は1(常時ONの低誤検知ルールのみ)。" style="background:var(--panel2);color:var(--fg);border:1px solid var(--line);border-radius:var(--r2);padding:6px 9px;font:inherit">
             <option value="1">1 · 保守(誤検知最小)</option>
             <option value="2">2 · やや積極</option>
             <option value="3">3 · 積極</option>
@@ -630,8 +865,8 @@ canvas,svg{display:block;width:100%}
       <div class="phead"><h2>アクセスルール</h2></div>
       <div class="pbody">
         <div class="row"><input id="ruleip" placeholder="IP/CIDR 例:203.0.113.0/24">
-        <button onclick="rule('allow')">許可</button>
-        <button class="red" onclick="rule('deny')">拒否</button>
+        <button onclick="rule('allow',this)">許可</button>
+        <button class="red" onclick="rule('deny',this)">拒否</button>
         <button class="ghost" onclick="edge()">エッジ前衛設定DL</button></div>
       </div>
     </section>
@@ -640,8 +875,12 @@ canvas,svg{display:block;width:100%}
       <div class="pbody"><table id="appeals"><tbody></tbody></table></div>
     </section>
     <section class="panel">
-      <div class="phead"><h2>承認待ち接続(ファイアウォール)</h2><span class="meta">zone policy=prompt の未知接続</span></div>
-      <div class="pbody"><table id="fwpending"><tbody></tbody></table></div>
+      <div class="phead"><h2>承認待ち接続(ファイアウォール)</h2><span class="meta" id="pendingmeta">—</span></div>
+      <div class="pbody">
+        <div class="row" style="margin-top:0"><button onclick="approveAllPending(this)">すべて承認</button>
+        <button class="red ghost" onclick="denyAllPending(this)">すべて拒否</button></div>
+        <table id="fwpending"><tbody></tbody></table>
+      </div>
     </section>
 
     <div class="sect"><span class="ic">🌐</span>欺瞞</div>
@@ -654,6 +893,10 @@ canvas,svg{display:block;width:100%}
     <section class="panel wide">
       <div class="phead"><h2>詳細分析</h2></div>
       <div class="pbody"><pre class="code" id="analysis"></pre></div>
+    </section>
+    <section class="panel wide">
+      <div class="phead"><h2>変更履歴(監査ログ)</h2><span class="meta" id="auditmeta">—</span></div>
+      <div class="pbody tight"><div class="feed" id="auditlog"></div></div>
     </section>
   </div>
 </div>
@@ -707,6 +950,7 @@ const JA2EN={
  "追跡":"tracked","遮断メソッド":"Blocked methods","Retry-After 秒":"Retry-After sec",
  "しきい値(別IP数)":"threshold (distinct IPs)",
  "遮断メソッド(カンマ区切) 例:TRACE,TRACK,CONNECT":"Blocked methods (comma) e.g. TRACE,TRACK,CONNECT",
+ "無視":"Ignored",
  "BAN なし":"No bans","(なし)":"(none)","イベントなし":"No events","なし":"none","ヒットなし":"No hits",
  "カスタムなし":"No custom signatures",
  "削除":"Remove","DLP 無効":"DLP off","漏洩なし":"No leaks",
@@ -720,7 +964,55 @@ const JA2EN={
  "サンプル攻撃者":"Sample attacker","から見える偽装(隣接窓で必ず別系統):":"sees this deception (adjacent windows always differ):",
  "残":"remaining ","組込":"built-in","カスタム":"custom","危険除外":"unsafe-excluded",
  "(兆候なし)":"(no indicators)","本機":"This host","失敗":"failed",
- "改竄検知":"Tamper detection","直近":"Last"};
+ "改竄検知":"Tamper detection","直近":"Last",
+ /* トースト/確認ダイアログ/汎用保存文言 */
+ "キャンセル":"Cancel","実行":"Confirm","保存しました":"Saved",
+ "ファイアウォールを更新しました":"Firewall updated","シールドを更新しました":"Shield updated",
+ "DLP設定を保存しました":"DLP settings saved","設定を保存しました":"Settings saved",
+ "検知の厳格度を変更しました":"Detection strictness changed",
+ "このシグネチャを削除しますか?":"Delete this signature?","追加に失敗":"Add failed","削除に失敗":"Delete failed",
+ "シグネチャを追加しました":"Signature added","シグネチャを削除しました":"Signature deleted",
+ "このレート制限ルールを削除しますか?":"Delete this rate-limit rule?",
+ "ルールを削除しました":"Rule deleted","レート制限を追加しました":"Rate limit added",
+ "遮断メソッドを保存しました":"Blocked methods saved","保存に失敗":"Save failed",
+ "この申立を却下しますか?":"Reject this appeal?","申立を承認しました":"Appeal approved",
+ "申立を却下しました":"Appeal rejected","処理に失敗":"Action failed",
+ "この接続を拒否しますか?":"Deny this connection?","接続を承認しました":"Connection approved",
+ "接続を拒否しました":"Connection denied","BANを解除しました":"IP unbanned","解除に失敗":"Unban failed",
+ "このIPをBANしますか?":"Ban this IP?","IPをBANしました":"IP banned","BANに失敗":"Ban failed",
+ "このIP/CIDRを拒否ルールに追加しますか?":"Add this IP/CIDR as a deny rule?","ルールを追加しました":"Rule added",
+ "拒否ルールを追加しました":"Deny rule added","グローバル遮断を有効にしました":"Global block enabled",
+ "グローバル遮断を解除しました":"Global block released",
+ /* テーブル検索/ソート */
+ "IPで絞り込み":"Filter by IP","IP/種別で絞り込み":"Filter by IP/kind","該当なし":"No matches",
+ "残り時間":"Remaining","スコア":"Score",
+ /* より実用的な空状態 */
+ "カスタムシグネチャなし — 下のフォームから追加できます(組込シグネチャで拾えないパターン用)":
+  "No custom signatures yet — add one below to catch patterns the built-in signatures don't cover",
+ "承認待ちなし — ゾーンポリシーが「承認待ち」のゾーンで新規接続があるとここに表示されます":
+  "No pending connections — new connections appear here when a zone's policy is \"prompt\"",
+ "申立なし — BANされた利用者が異議申立を送るとここに表示されます":
+  "No appeals yet — requests appear here when a banned user submits one",
+ /* 変更履歴(監査ログ) */
+ "変更履歴(監査ログ)":"Change history (audit log)","元に戻す":"Revert","変更履歴なし":"No changes yet",
+ "元に戻しました":"Reverted","復元に失敗":"Revert failed",
+ /* チャートのズーム */
+ "全期間":"All",
+ /* シグネチャの試験(ドライラン) */
+ "テスト":"Test","テスト対象の文字列(パス/UA/ヘッダ値など)":"Sample to test (path/UA/header value…)",
+ "パターンを入力":"Enter a pattern","エラー":"Error","無効なパターン":"Invalid pattern",
+ "一致":"Match","不一致":"No match",
+ /* エクスポート */
+ "エクスポートしました":"Exported",
+ /* 一括操作 */
+ "選択なし":"Nothing selected","選択したIPを解除しました":"Unbanned selected IPs",
+ "BAN中の全IPを解除します。よろしいですか?":"Unban all currently banned IPs. Are you sure?",
+ "すべてのBANを解除しました":"Unbanned all IPs","選択解除":"Unban selected","全解除":"Unban all",
+ "すべて承認":"Approve all","すべて拒否":"Deny all",
+ "すべての承認待ち接続を承認します。よろしいですか?":"Approve all pending connections. Are you sure?",
+ "すべて承認しました":"Approved all","すべて拒否しました":"Denied all",
+ "上限接続数/IP(0=無制限)":"Max conns/IP (0=unlimited)","新規接続/秒/IP(0=無制限)":"New conns/sec/IP (0=unlimited)",
+ "全体同時接続上限(0=無制限)":"Total conn limit (0=unlimited)","keep-alive を強制切断":"Force keep-alive close"};
 let LANG="ja";try{LANG=localStorage.getItem("fn-lang")||"ja"}catch(e){}
 function tr(s){if(LANG!=="en"||s==null)return s;const k=String(s).trim();return JA2EN[k]!==undefined?JA2EN[k]:s;}
 function applyStatic(){
@@ -730,11 +1022,15 @@ function applyStatic(){
   if(el.dataset.o===undefined)el.dataset.o=el.textContent.trim();
   el.textContent=LANG==="en"?(JA2EN[el.dataset.o]||el.dataset.o):el.dataset.o;});
  const labels=[...document.querySelectorAll(".controls label.sw")];
- ["dlp","sech","throttle","subnetdef"].forEach(id=>{const e=$(id)&&$(id).closest("label");if(e)labels.push(e);});
+ ["dlp","sech","throttle","subnetdef","forceclose"].forEach(id=>{const e=$(id)&&$(id).closest("label");if(e)labels.push(e);});
  labels.forEach(el=>{const tn=el.lastChild;if(!tn||tn.nodeType!==3)return;
   if(el.dataset.o===undefined)el.dataset.o=tn.nodeValue.trim();
   tn.nodeValue=" "+(LANG==="en"?(JA2EN[el.dataset.o]||el.dataset.o):el.dataset.o);});
  document.querySelectorAll(".sect").forEach(el=>{const tn=el.lastChild;if(!tn||tn.nodeType!==3)return;
+  if(el.dataset.o===undefined)el.dataset.o=tn.nodeValue.trim();
+  tn.nodeValue=LANG==="en"?(JA2EN[el.dataset.o]||el.dataset.o):el.dataset.o;});
+ // ソート可能な列見出し(先頭テキストノード + 矢印用span)。.sect と対称(こちらは先頭側)。
+ document.querySelectorAll("th.sortable").forEach(el=>{const tn=el.firstChild;if(!tn||tn.nodeType!==3)return;
   if(el.dataset.o===undefined)el.dataset.o=tn.nodeValue.trim();
   tn.nodeValue=LANG==="en"?(JA2EN[el.dataset.o]||el.dataset.o):el.dataset.o;});
  document.querySelectorAll("input[placeholder]").forEach(el=>{
@@ -763,6 +1059,60 @@ async function guardedFetch(path){
  let data=null;try{data=await resp.json()}catch(e){}
  if(resp.status===401||(data&&data.ok===false)){const err=new Error("auth");err.authFail=true;throw err;}
  return data;
+}
+/* トースト通知: kind は ok/err/info。~3秒で自動消去・手動での×閉じにも対応。 */
+function toast(message,kind){
+ const wrap=$("toastwrap");if(!wrap)return;
+ const el=document.createElement("div");el.className="toast "+(kind||"info");
+ const t=document.createElement("span");t.className="ttext";t.textContent=message;
+ const x=document.createElement("button");x.className="tclose";x.setAttribute("aria-label","close");x.textContent="×";
+ el.appendChild(t);el.appendChild(x);wrap.appendChild(el);
+ requestAnimationFrame(()=>el.classList.add("show"));
+ const hide=()=>{el.classList.remove("show");setTimeout(()=>el.remove(),220);};
+ const timer=setTimeout(hide,3000);
+ x.onclick=()=>{clearTimeout(timer);hide();};
+}
+/* ボタンのビジー状態: 二重送信防止 + 進行中フィードバック(disabled+スピナー)。 */
+function busy(btn,on){
+ if(!btn)return;
+ if(on){if(btn.dataset.obusy===undefined)btn.dataset.obusy="1";btn.disabled=true;btn.classList.add("busy");}
+ else{btn.disabled=false;btn.classList.remove("busy");delete btn.dataset.obusy;}
+}
+/* post + トースト: 成否をトーストで知らせ、btn があれば送信中ビジー表示する。既存の post()
+   はそのまま(内部/連続呼び出し用)に残し、ユーザー操作の起点はこちらへ寄せる。post() 自体は
+   例外を投げても(このダッシュボードの post() は sibling と違い try/catch していない)ここで
+   捕まえてトースト表示に落とす。 */
+async function postT(p,b,btn,okMsg,errPrefix){
+ busy(btn,true);
+ let r;try{r=await post(p,b);}catch(e){r={ok:false,error:String(e)};}
+ busy(btn,false);
+ if(r&&r.ok)toast(okMsg||tr("保存しました"),"ok");
+ else toast((errPrefix?errPrefix+": ":"")+(r&&r.error?r.error:tr("失敗")),"err");
+ return r;
+}
+/* 確認ダイアログ: 破壊的操作向けのスタイル付きモーダル。confirm() の置き換え。 */
+function confirmDialog(message){
+ return new Promise(resolve=>{
+  const ov=$("confirmOverlay"),ok=$("confirmOk"),cancel=$("confirmCancel");
+  $("confirmMsg").textContent=message;
+  ov.style.display="flex";
+  const done=v=>{ov.style.display="none";ok.onclick=null;cancel.onclick=null;ov.onclick=null;
+   document.removeEventListener("keydown",onKey);resolve(v);};
+  const onKey=e=>{if(e.key==="Escape")done(false);if(e.key==="Enter")done(true);};
+  ok.onclick=()=>done(true);cancel.onclick=()=>done(false);
+  ov.onclick=e=>{if(e.target===ov)done(false);};
+  document.addEventListener("keydown",onKey);
+  ok.focus();
+ });
+}
+/* 初回ロードのスケルトン: /api/state 到着前は『0』ではなく『未取得』と分かる表示にする。 */
+function showSkeleton(){
+ const bar=w=>`<span class="skel-bar" style="width:${w}"></span>`;
+ $("cards").innerHTML=Array.from({length:6}).map(()=>
+  `<div class="kpi skel"><div class="kn">${bar("44%")}</div><div class="kl">${bar("72%")}</div></div>`).join("");
+ $("top").textContent="…";$("apt").textContent="…";
+ $("events").innerHTML=`<div class="frow skel"><span class="time">${bar("40px")}</span><span class="desc">${bar("60%")}</span></div>`.repeat(4);
+ $("bans").querySelector("tbody").innerHTML=`<tr class="skel"><td colspan="5">${bar("90%")}</td></tr>`.repeat(3);
 }
 async function refresh(){
  let s;try{s=await guardedFetch("/api/state")}catch(e){
@@ -795,7 +1145,7 @@ async function refresh(){
  const oset=dc.optional_sigs||{};
  $("optsigs").innerHTML=(s.shield.optional_signatures||[]).map(n=>
    `<div class="row"><label class="sw"><input type="checkbox" class="toggle" ${oset[n]?"checked":""}`
-   +` onchange="post('/api/shield/optional_sig',{name:'${esc(n)}',on:this.checked}).then(refresh)">`
+   +` onchange="postT('/api/shield/optional_sig',{name:'${esc(n)}',on:this.checked},null,tr('設定を保存しました')).then(refresh)">`
    +` ${esc(tr(OPTL[n]||n))}</label></div>`).join("")||'<div class="empty">'+tr("なし")+'</div>';
  // パス別レート制限(per-path token bucket): 現在のルール一覧 + 削除
  curPathLimits=dc.path_limits||[];
@@ -803,7 +1153,7 @@ async function refresh(){
  $("pathlimits").querySelector("tbody").innerHTML=curPathLimits.map((r,i)=>
    `<tr><td><span class="num">${esc(r.path)}</span></td><td class="num">${r.rate}/s</td>`
    +`<td class="num">burst ${r.burst}</td>`
-   +`<td><button class="ghost" onclick="removePathLimit(${i})">${tr("削除")}</button></td></tr>`).join("")
+   +`<td><button class="ghost" onclick="removePathLimit(${i},this)">${tr("削除")}</button></td></tr>`).join("")
    ||'<tr><td colspan="4" class="empty">'+tr("ルールなし")+'</td></tr>';
  // レート/メソッド/分散(運用): #24/#25/#26 のトグルと値。free-text は編集中クロバー回避。
  $("throttle").checked=dc.throttle_response!==false;
@@ -811,6 +1161,14 @@ async function refresh(){
  setIfBlur("retryaft",String(dc.throttle_retry_after!=null?dc.throttle_retry_after:1));
  setIfBlur("subthr",String(dc.subnet_threshold!=null?dc.subnet_threshold:8));
  setIfBlur("blockmeth",(dc.blocked_methods||[]).join(","));
+ // 上限接続数/IP・新規接続レート/IP・全体同時接続上限・keep-alive強制切断: pipeline.py の
+ // _DEFAULTS には存在するが元々ダッシュボードUIが無かった4項目(#4)。汎用 /api/shield/config
+ // を再利用する。conn_rate_per_ip 等は int 既定値のため set_config() の型チェックが float を
+ // 黙って弾く — parseFloat ではなく parseInt を使うこと。
+ setIfBlur("maxconnip",String(dc.max_conn_per_ip!=null?dc.max_conn_per_ip:0));
+ setIfBlur("connrateip",String(dc.conn_rate_per_ip!=null?dc.conn_rate_per_ip:0));
+ setIfBlur("maxtotalconn",String(dc.max_total_conn!=null?dc.max_total_conn:20000));
+ $("forceclose").checked=dc.force_conn_close!==false;
  $("opsstat").textContent=[dc.throttle_response!==false&&"429",dc.subnet_defense&&tr("分散"),
    (dc.blocked_methods||[]).length+tr("メソッド")].filter(Boolean).join(" · ");
  try{const sn=await guardedFetch("/api/shield/subnet");
@@ -833,35 +1191,134 @@ async function refresh(){
    +`<span class="desc num">${esc(e.ip||"")}</span>`
    +`<span class="desc">${esc((e.kinds||[]).join(", "))}</span></div>`).join("")
    ||'<div class="empty">'+tr(dlpOn?"漏洩なし":"DLP 無効")+'</div>';
- $("bans").querySelector("tbody").innerHTML=(s.shield.bans||[]).map(b=>
-   `<tr><td class="num">${esc(b.ip)}</td><td class="num">${esc(tr("残"))}${Math.round(b.remain_sec)}s</td>
-   <td><span class="badge ${b.score>40?"danger":"warn"}">score ${b.score}</span></td>
-   <td><button class="ghost" onclick="unban('${esc(b.ip)}')">${tr("解除")}</button></td></tr>`).join("")
-   ||'<tr><td colspan="4" class="empty">'+tr("BAN なし")+'</td></tr>';
+ curBans=s.shield.bans||[];renderBans();
  $("top").textContent=(s.top||[]).map(t=>`${(t.ip+"").padStart(15)}  score ${String(t.score).padStart(4)}  win ${t.reqs_window}  hits ${t.hits} ${t.banned?"BAN":""}`).join("\n")||tr("(なし)");
- $("events").innerHTML=(s.events||[]).slice(-60).reverse().map(e=>
-   `<div class="frow"><span class="time">${tm(e.ts)}</span><span class="badge ${sev(e.kind)}">${esc(e.kind)}</span>`
-   +`<span class="desc num">${esc(e.ip||"")}</span></div>`).join("")||'<div class="empty">'+tr("イベントなし")+'</div>';
+ curEvents=s.events||[];renderEvents();
  // ゾーン policy=prompt の保留接続(#2): アピール一覧と同じ承認/拒否UXで、行き止まりを解消
- $("fwpending").querySelector("tbody").innerHTML=((s.firewall||{}).pending||[]).map(p=>
+ const pend=(s.firewall||{}).pending||[];curPending=pend;
+ $("pendingmeta").textContent=pend.length?String(pend.length):"—";
+ $("fwpending").querySelector("tbody").innerHTML=pend.map(p=>
    `<tr><td class="num">${esc(p.ip)}</td><td><span class="badge info">${esc(p.zone)}</span></td>
    <td class="num">${tm(p.ts)}</td>
-   <td><button onclick="resolvePending('${esc(p.id)}',true)">${tr("承認")}</button>
-   <button class="red" onclick="resolvePending('${esc(p.id)}',false)">${tr("却下")}</button></td></tr>`).join("")
-   ||'<tr><td colspan="4" class="empty">'+tr("承認待ちなし")+'</td></tr>';
+   <td><button onclick="resolvePending('${esc(p.id)}',true,this)">${tr("承認")}</button>
+   <button class="red" onclick="resolvePending('${esc(p.id)}',false,this)">${tr("却下")}</button></td></tr>`).join("")
+   ||'<tr><td colspan="4" class="empty">'+tr("承認待ちなし — ゾーンポリシーが「承認待ち」のゾーンで新規接続があるとここに表示されます")+'</td></tr>';
 }
-$("fw").onchange=e=>post("/api/firewall/toggle",{on:e.target.checked}).then(refresh);
-$("sh").onchange=e=>post("/api/shield/toggle",{on:e.target.checked}).then(refresh);
-$("dlp").onchange=e=>post("/api/shield/config",{dlp_enabled:e.target.checked}).then(refresh);
-$("dlpact").onchange=e=>post("/api/shield/config",{dlp_action:e.target.value}).then(refresh);
-$("sech").onchange=e=>post("/api/shield/config",{sec_headers_enabled:e.target.checked}).then(refresh);
-$("paranoia").onchange=e=>post("/api/shield/paranoia",{level:parseInt(e.target.value)}).then(refresh);
-$("throttle").onchange=e=>post("/api/shield/config",{throttle_response:e.target.checked}).then(refresh);
-$("retryaft").onchange=e=>post("/api/shield/config",{throttle_retry_after:parseInt(e.target.value)||0}).then(refresh);
-$("subnetdef").onchange=e=>post("/api/shield/config",{subnet_defense:e.target.checked}).then(refresh);
-$("subthr").onchange=e=>post("/api/shield/config",{subnet_threshold:parseInt(e.target.value)||1}).then(refresh);
+/* BAN中IPテーブル: 検索/ソート/一括選択。curBans はサーバから取得した最新配列。 */
+let curBans=[],banSort={key:null,dir:1},banSel=new Set(),lastBanRows=[];
+function renderBans(){
+ const q=($("bansearch").value||"").toLowerCase();
+ let rows=curBans.filter(b=>!q||String(b.ip).toLowerCase().includes(q));
+ if(banSort.key){
+  rows=rows.slice().sort((a,b)=>{
+   const av=banSort.key==="score"?a.score:a.remain_sec,bv=banSort.key==="score"?b.score:b.remain_sec;
+   return ((av||0)-(bv||0))*banSort.dir;
+  });
+ }
+ lastBanRows=rows;
+ $("bansmeta").textContent=curBans.length?(rows.length+"/"+curBans.length):"—";
+ $("bans").querySelector("tbody").innerHTML=rows.map(b=>
+   `<tr><td><input type="checkbox" class="bansel" data-ip="${esc(b.ip)}" ${banSel.has(b.ip)?"checked":""}></td>`
+   +`<td class="num">${esc(b.ip)}</td><td class="num">${esc(tr("残"))}${Math.round(b.remain_sec)}s</td>`
+   +`<td><span class="badge ${b.score>40?"danger":"warn"}">score ${b.score}</span></td>`
+   +`<td><button class="ghost" onclick="unban('${esc(b.ip)}',this)">${tr("解除")}</button></td></tr>`).join("")
+   ||'<tr><td colspan="5" class="empty">'+tr(curBans.length?"該当なし":"BAN なし")+'</td></tr>';
+ document.querySelectorAll(".bansel").forEach(cb=>cb.onchange=()=>{
+  if(cb.checked)banSel.add(cb.dataset.ip);else banSel.delete(cb.dataset.ip);
+  $("banall").checked=rows.length>0&&rows.every(b=>banSel.has(b.ip));
+ });
+ $("banall").checked=rows.length>0&&rows.every(b=>banSel.has(b.ip));
+}
+$("bans").querySelector("thead").addEventListener("click",e=>{
+ const th=e.target.closest("th.sortable");if(!th)return;
+ const k=th.dataset.sort;
+ banSort.dir=(banSort.key===k)?-banSort.dir:-1;
+ banSort.key=k;
+ document.querySelectorAll("#bans th.sortable .sortarrow").forEach(s=>s.textContent="");
+ th.querySelector(".sortarrow").textContent=banSort.dir<0?"▼":"▲";
+ renderBans();
+});
+function toggleAllBans(checked){
+ lastBanRows.forEach(b=>{if(checked)banSel.add(b.ip);else banSel.delete(b.ip);});
+ renderBans();
+}
+async function unbanSelected(btn){
+ const ips=[...banSel];
+ if(!ips.length){toast(tr("選択なし"),"info");return;}
+ busy(btn,true);
+ for(const ip of ips)await post("/api/shield/unban",{ip});
+ busy(btn,false);
+ banSel.clear();
+ toast(tr("選択したIPを解除しました"),"ok");
+ refresh();
+}
+async function unbanAll(btn){
+ if(!curBans.length)return;
+ if(!(await confirmDialog(tr("BAN中の全IPを解除します。よろしいですか?"))))return;
+ busy(btn,true);
+ for(const b of curBans)await post("/api/shield/unban",{ip:b.ip});
+ busy(btn,false);
+ banSel.clear();
+ toast(tr("すべてのBANを解除しました"),"ok");
+ refresh();
+}
+/* 攻撃イベント: 検索フィルタ。curEvents はサーバから取得した最新配列。 */
+let curEvents=[];
+function renderEvents(){
+ const q=($("eventsearch").value||"").toLowerCase();
+ const rows=curEvents.filter(e=>!q||String(e.ip||"").toLowerCase().includes(q)||String(e.kind||"").toLowerCase().includes(q));
+ $("eventsmeta").textContent=curEvents.length?(rows.length+"/"+curEvents.length):"—";
+ $("events").innerHTML=rows.slice(-300).slice().reverse().map(e=>
+   `<div class="frow"><span class="time">${tm(e.ts)}</span><span class="badge ${sev(e.kind)}">${esc(e.kind)}</span>`
+   +`<span class="desc num">${esc(e.ip||"")}</span></div>`).join("")
+   ||'<div class="empty">'+tr(curEvents.length?"該当なし":"イベントなし")+'</div>';
+}
+/* 承認待ち接続の一括操作: 承認は影響が大きいため確認、拒否は安全側なので確認なし。 */
+let curPending=[];
+async function approveAllPending(btn){
+ if(!curPending.length)return;
+ if(!(await confirmDialog(tr("すべての承認待ち接続を承認します。よろしいですか?"))))return;
+ busy(btn,true);
+ for(const p of curPending)await post("/api/firewall/resolve",{id:p.id,approve:true});
+ busy(btn,false);
+ toast(tr("すべて承認しました"),"ok");
+ refresh();
+}
+async function denyAllPending(btn){
+ if(!curPending.length)return;
+ busy(btn,true);
+ for(const p of curPending)await post("/api/firewall/resolve",{id:p.id,approve:false});
+ busy(btn,false);
+ toast(tr("すべて拒否しました"),"ok");
+ refresh();
+}
+$("fw").onchange=e=>postT("/api/firewall/toggle",{on:e.target.checked},null,tr("ファイアウォールを更新しました")).then(refresh);
+$("sh").onchange=e=>postT("/api/shield/toggle",{on:e.target.checked},null,tr("シールドを更新しました")).then(refresh);
+$("dlp").onchange=e=>postT("/api/shield/config",{dlp_enabled:e.target.checked},null,tr("DLP設定を保存しました")).then(refresh);
+$("dlpact").onchange=e=>postT("/api/shield/config",{dlp_action:e.target.value},null,tr("DLP設定を保存しました")).then(refresh);
+$("sech").onchange=e=>postT("/api/shield/config",{sec_headers_enabled:e.target.checked},null,tr("設定を保存しました")).then(refresh);
+$("paranoia").onchange=e=>postT("/api/shield/paranoia",{level:parseInt(e.target.value)},null,tr("検知の厳格度を変更しました")).then(refresh);
+$("throttle").onchange=e=>postT("/api/shield/config",{throttle_response:e.target.checked},null,tr("設定を保存しました")).then(refresh);
+$("retryaft").onchange=e=>postT("/api/shield/config",{throttle_retry_after:parseInt(e.target.value)||0},null,tr("設定を保存しました")).then(refresh);
+$("subnetdef").onchange=e=>postT("/api/shield/config",{subnet_defense:e.target.checked},null,tr("設定を保存しました")).then(refresh);
+$("subthr").onchange=e=>postT("/api/shield/config",{subnet_threshold:parseInt(e.target.value)||1},null,tr("設定を保存しました")).then(refresh);
+$("maxconnip").onchange=e=>postT("/api/shield/config",{max_conn_per_ip:parseInt(e.target.value)||0},null,tr("設定を保存しました")).then(refresh);
+$("connrateip").onchange=e=>postT("/api/shield/config",{conn_rate_per_ip:parseInt(e.target.value)||0},null,tr("設定を保存しました")).then(refresh);
+$("maxtotalconn").onchange=e=>postT("/api/shield/config",{max_total_conn:parseInt(e.target.value)||0},null,tr("設定を保存しました")).then(refresh);
+$("forceclose").onchange=e=>postT("/api/shield/config",{force_conn_close:e.target.checked},null,tr("設定を保存しました")).then(refresh);
+/* チャートの時間範囲ズーム: 既にクライアントが取得済みの /api/series 配列を切り出すだけ。
+   サーバ側の保持期間(pipeline._series・約10分)より長い範囲を要求することはしない。 */
+let chartWindow=Infinity;
+function setChartWindow(sec){
+ chartWindow=sec;
+ document.querySelectorAll("#chartzoom button").forEach(b=>
+  b.classList.toggle("active",(sec===Infinity&&b.dataset.sec==="all")||Number(b.dataset.sec)===sec));
+ try{refreshPro()}catch(e){}
+}
 async function refreshPro(){
- try{const s=(await guardedFetch("/api/series")).series||[];drawChart(s);
+ try{let s=(await guardedFetch("/api/series")).series||[];
+  if(chartWindow!==Infinity&&s.length){const cutoff=s[s.length-1].t-chartWindow;s=s.filter(x=>x.t>=cutoff);}
+  drawChart(s);
   drawSpark("leaktrend",s.map(x=>x.dlp_leak||0));
   drawSpark("sigtrend",s.map(x=>x.sig_total||0));
   drawSpark("pubtrend",s.map(x=>x.pub||0));}catch(e){if(isAuthFail(e))markAuthError();}
@@ -869,9 +1326,9 @@ async function refreshPro(){
   $("appeals").querySelector("tbody").innerHTML=ap.map(a=>
    `<tr><td class="num">${esc(a.ip)}</td><td><span class="badge ${a.status==="pending"?"warn":"muted"}">${esc(a.status)}</span></td>
    <td>${esc((a.reason||"").slice(0,40))}</td>
-   <td>${a.status==="pending"?`<button onclick="resolveAppeal('${esc(a.ip)}',true)">${tr("承認")}</button>
-   <button class="red" onclick="resolveAppeal('${esc(a.ip)}',false)">${tr("却下")}</button>`:""}</td></tr>`
-  ).join("")||'<tr><td colspan="4" class="empty">'+tr("申立なし")+'</td></tr>';}catch(e){if(isAuthFail(e))markAuthError();}
+   <td>${a.status==="pending"?`<button onclick="resolveAppeal('${esc(a.ip)}',true,this)">${tr("承認")}</button>
+   <button class="red" onclick="resolveAppeal('${esc(a.ip)}',false,this)">${tr("却下")}</button>`:""}</td></tr>`
+  ).join("")||'<tr><td colspan="4" class="empty">'+tr("申立なし — BANされた利用者が異議申立を送るとここに表示されます")+'</td></tr>';}catch(e){if(isAuthFail(e))markAuthError();}
  try{const an=await guardedFetch("/api/analysis");
   $("analysis").textContent=JSON.stringify({actions:an.actions,by_zone:an.by_zone,
    top_signatures:an.top_signatures,event_kinds:an.event_kinds,active_bans:an.active_bans},null,2);}catch(e){if(isAuthFail(e))markAuthError();}
@@ -882,6 +1339,27 @@ async function refreshPro(){
  try{drawMap(await guardedFetch("/api/nodes"));}catch(e){if(isAuthFail(e))markAuthError();}
  try{refreshSigs();}catch(e){}
  try{refreshDeception();}catch(e){}
+ try{refreshAudit();}catch(e){}
+}
+/* 変更履歴(監査ログ) */
+let curAudit=[];
+async function refreshAudit(){
+ let d;try{d=await guardedFetch("/api/admin_audit")}catch(e){if(isAuthFail(e))markAuthError();return}
+ const rows=(d&&d.entries)||[];curAudit=rows;
+ $("auditmeta").textContent=rows.length?String(rows.length):"—";
+ $("auditlog").innerHTML=rows.map((e,i)=>{
+   const rv=e.revert?`<button class="ghost" data-auditidx="${i}">${tr("元に戻す")}</button>`:"";
+   return `<div class="frow"><span class="time">${tm(e.ts)}</span>`
+    +`<span class="desc">${esc(e.summary||e.endpoint||"")}</span>${rv}</div>`;
+ }).join("")||'<div class="empty">'+tr("変更履歴なし")+'</div>';
+}
+$("auditlog").addEventListener("click",e=>{
+ const b=e.target.closest("button[data-auditidx]");if(!b)return;
+ const entry=curAudit[parseInt(b.dataset.auditidx)];
+ if(entry&&entry.revert)revertAudit(entry.revert,b);
+});
+function revertAudit(revert,btn){
+ postT(revert.endpoint,revert.body,btn,tr("元に戻しました"),tr("復元に失敗")).then(()=>{refresh();refreshAudit();});
 }
 async function refreshDeception(){
  let d;try{d=await guardedFetch("/api/deception")}catch(e){if(isAuthFail(e))markAuthError();return}
@@ -894,45 +1372,69 @@ async function refreshDeception(){
  $("deception").textContent=tr("サンプル攻撃者")+" "+d.sample_seed+" "+tr("から見える偽装(隣接窓で必ず別系統):")+"\n"
    +rows.join("\n");
 }
+let curCustomSigs=[];
 async function refreshSigs(){
  let d;try{d=await guardedFetch("/api/shield/signatures")}catch(e){if(isAuthFail(e))markAuthError();return}
+ curCustomSigs=d.custom||[];
  $("sigmeta").textContent=`${tr("組込")} ${(d.builtin||[]).length} · ${tr("カスタム")} ${d.custom_active||0}`
    +(d.custom_blocked?` · ${tr("危険除外")} ${d.custom_blocked}`:"");
- $("customsigs").querySelector("tbody").innerHTML=(d.custom||[]).map(c=>
+ $("customsigs").querySelector("tbody").innerHTML=curCustomSigs.map(c=>
    `<tr><td class="num">${esc(c.name)}</td><td><span class="num">${esc((c.pattern||"").slice(0,48))}</span></td>`
    +`<td><button class="ghost" data-signame="${esc(c.name)}">${tr("削除")}</button></td></tr>`).join("")
-   ||'<tr><td colspan="3" class="empty">'+tr("カスタムなし")+'</td></tr>';
+   ||'<tr><td colspan="3" class="empty">'+tr("カスタムシグネチャなし — 下のフォームから追加できます(組込シグネチャで拾えないパターン用)")+'</td></tr>';
 }
 $("customsigs").addEventListener("click",e=>{
  const b=e.target.closest("button[data-signame]");
- if(b)removeSig(b.dataset.signame);
+ if(b)removeSig(b.dataset.signame,b);
 });
-async function addSig(){
+async function addSig(btn){
  const name=$("signame").value.trim(),pattern=$("sigpat").value;
  if(!name||!pattern){$("sigerr").textContent=tr("名前とパターンを入力");return;}
- const r=await post("/api/shield/sig_add",{name,pattern});
+ const r=await postT("/api/shield/sig_add",{name,pattern},btn,tr("シグネチャを追加しました"),tr("追加に失敗"));
  $("sigerr").textContent=r.ok?"":("✗ "+(r.error||tr("失敗")));
- if(r.ok){$("signame").value="";$("sigpat").value="";}
+ if(r.ok){$("signame").value="";$("sigpat").value="";$("sigtestresult").textContent="";}
  refreshSigs();
 }
-function removeSig(name){post("/api/shield/sig_remove",{name}).then(refreshSigs);}
+async function removeSig(name,btn){
+ if(!(await confirmDialog(tr("このシグネチャを削除しますか?")+" "+name)))return;
+ postT("/api/shield/sig_remove",{name},btn,tr("シグネチャを削除しました"),tr("削除に失敗")).then(refreshSigs);
+}
+/* シグネチャのドライラン試験: 追加前にサーバ側の validate_pattern(ReDoS検査)を通した上で
+   マッチ確認のみ行う読み取り専用API。状態は一切変更しない。 */
+async function testSig(btn){
+ const pattern=$("sigpat").value,sample=$("sigtestsample").value;
+ if(!pattern){$("sigtestresult").innerHTML='<span class="badge muted">'+tr("パターンを入力")+'</span>';return;}
+ busy(btn,true);
+ let r;try{r=await post("/api/shield/sig_test",{pattern,sample});}finally{busy(btn,false);}
+ if(!r||!r.ok){$("sigtestresult").innerHTML='<span class="badge danger">'+tr("エラー")+'</span>';return;}
+ if(r.error){$("sigtestresult").innerHTML='<span class="badge danger">'+tr("無効なパターン")+': '+esc(r.error)+'</span>';}
+ else{$("sigtestresult").innerHTML=r.matches?'<span class="badge warn">'+tr("一致")+'</span>':'<span class="badge muted">'+tr("不一致")+'</span>';}
+}
 let curPathLimits=[];
-async function addPathLimit(){
+async function addPathLimit(btn){
  const path=$("prpath").value.trim(),rate=parseFloat($("prrate").value),burst=parseFloat($("prburst").value);
  if(!path||!(rate>0)){$("prerr").textContent=tr("パスと毎秒(>0)を入力");return;}
  const rule={path,rate};if(burst>0)rule.burst=burst;
- const r=await post("/api/shield/path_limits",{rules:curPathLimits.concat([rule])});
+ const r=await postT("/api/shield/path_limits",{rules:curPathLimits.concat([rule])},btn,tr("レート制限を追加しました"),tr("追加に失敗"));
  $("prerr").textContent=r.ok?"":("✗ "+(r.error||tr("失敗")));
  if(r.ok){$("prpath").value="";$("prrate").value="";$("prburst").value="";}
  refresh();
 }
-function removePathLimit(i){
- post("/api/shield/path_limits",{rules:curPathLimits.filter((_,j)=>j!==i)}).then(refresh);
+async function removePathLimit(i,btn){
+ if(!(await confirmDialog(tr("このレート制限ルールを削除しますか?"))))return;
+ postT("/api/shield/path_limits",{rules:curPathLimits.filter((_,j)=>j!==i)},btn,tr("ルールを削除しました"),tr("削除に失敗")).then(refresh);
 }
 function setIfBlur(id,val){const e=$(id);if(e&&document.activeElement!==e)e.value=val;}  // 編集中は上書きしない
-function saveBlockedMethods(){
+async function saveBlockedMethods(btn){
  const m=$("blockmeth").value.split(",").map(s=>s.trim()).filter(Boolean);
- post("/api/shield/blocked_methods",{methods:m}).then(refresh);
+ postT("/api/shield/blocked_methods",{methods:m},btn,tr("遮断メソッドを保存しました"),tr("保存に失敗")).then(r=>{
+  // バックエンドは英字以外・重複を黙って除外するため、送った物と実際に保存された物を突き合わせて
+  // ドロップされたトークンをその場で表示する。
+  const kept=new Set((r.blocked_methods||[]).map(x=>String(x).toUpperCase()));
+  const dropped=m.filter(x=>!kept.has(x.toUpperCase()));
+  $("methoderr").textContent=dropped.length?(tr("無視")+": "+dropped.join(", ")):"";
+  refresh();
+ });
 }
 const _ZR={loopback:55,private:105,public:150,special:150,unknown:150};
 function drawMap(d){
@@ -951,11 +1453,14 @@ function drawMap(d){
  $("netmap").innerHTML=g;
 }
 function toggleNode(ip,banned){
- if(banned){post("/api/shield/unban",{ip}).then(refreshPro);}
- else{post("/api/firewall/rule",{net:ip,action:"deny"}).then(refreshPro);}
+ if(banned){postT("/api/shield/unban",{ip},null,tr("BANを解除しました")).then(refreshPro);}
+ else{postT("/api/firewall/rule",{net:ip,action:"deny"},null,tr("拒否ルールを追加しました")).then(refreshPro);}
 }
-function globalBlock(on){if(on&&!confirm(tr("インターネット(public)を一括遮断します。よろしいですか?")))return;
- post("/api/global_block",{on}).then(()=>{refresh();refreshPro();});}
+async function globalBlock(on,btn){
+ if(on&&!(await confirmDialog(tr("インターネット(public)を一括遮断します。よろしいですか?"))))return;
+ postT("/api/global_block",{on},btn,on?tr("グローバル遮断を有効にしました"):tr("グローバル遮断を解除しました"),tr("処理に失敗"))
+  .then(()=>{refresh();refreshPro();});
+}
 function barHTML(entries,limit){
  const e=entries.filter(x=>x[1]).sort((a,b)=>b[1]-a[1]),mx=Math.max(1,...e.map(x=>x[1]));
  return e.slice(0,limit||10).map(([k,v])=>
@@ -995,13 +1500,49 @@ function drawChart(s){
  ln("r",blue);ln("b",red);
  $("chartleg").innerHTML=`<span style="color:${blue}">●</span> req/s &nbsp;<span style="color:${red}">●</span> block/s &nbsp;· peak ${mx.toFixed(1)}/s`;
 }
-function resolveAppeal(ip,ok){post("/api/appeal/resolve",{ip,approve:ok}).then(()=>{refresh();refreshPro();})}
-function resolvePending(id,ok){post("/api/firewall/resolve",{id,approve:ok}).then(()=>{refresh();refreshPro();})}
-function unban(ip){post("/api/shield/unban",{ip}).then(refresh)}
-function ban(){post("/api/shield/ban",{ip:$("banip").value}).then(refresh)}
-function rule(a){post("/api/firewall/rule",{net:$("ruleip").value,action:a}).then(refresh)}
+async function resolveAppeal(ip,ok,btn){
+ if(!ok&&!(await confirmDialog(tr("この申立を却下しますか?")+" "+ip)))return;
+ postT("/api/appeal/resolve",{ip,approve:ok},btn,ok?tr("申立を承認しました"):tr("申立を却下しました"),tr("処理に失敗"))
+  .then(()=>{refresh();refreshPro();});
+}
+async function resolvePending(id,ok,btn){
+ if(!ok&&!(await confirmDialog(tr("この接続を拒否しますか?"))))return;
+ postT("/api/firewall/resolve",{id,approve:ok},btn,ok?tr("接続を承認しました"):tr("接続を拒否しました"),tr("処理に失敗")).then(refresh);
+}
+function unban(ip,btn){postT("/api/shield/unban",{ip},btn,tr("BANを解除しました"),tr("解除に失敗")).then(refresh)}
+async function ban(btn){
+ const ip=$("banip").value;if(!ip)return;
+ if(!(await confirmDialog(tr("このIPをBANしますか?")+" "+ip)))return;
+ postT("/api/shield/ban",{ip},btn,tr("IPをBANしました"),tr("BANに失敗")).then(refresh);
+}
+async function rule(a,btn){
+ const net=$("ruleip").value;if(!net)return;
+ if(a==="deny"&&!(await confirmDialog(tr("このIP/CIDRを拒否ルールに追加しますか?")+" "+net)))return;
+ postT("/api/firewall/rule",{net,action:a},btn,tr("ルールを追加しました"),tr("追加に失敗")).then(refresh);
+}
 async function edge(){const t=await (await fetch("/api/edge",{headers:H})).text();
  const u=URL.createObjectURL(new Blob([t]));const a=document.createElement("a");a.href=u;a.download="chickennet_edge.conf";a.click()}
+/* CSV/JSON エクスポート: 既に取得済みの配列をそのままファイル化するだけ(追加取得なし)。 */
+function toCSV(rows,cols){
+ const q=v=>{const s=v==null?"":String(v);return /[",\n]/.test(s)?'"'+s.replace(/"/g,'""')+'"':s;};
+ return [cols.join(",")].concat(rows.map(r=>cols.map(c=>q(r[c])).join(","))).join("\r\n");
+}
+function downloadFile(filename,text,mime){
+ const blob=new Blob([text],{type:mime||"text/plain"});
+ const u=URL.createObjectURL(blob);
+ const a=document.createElement("a");a.href=u;a.download=filename;document.body.appendChild(a);a.click();a.remove();
+ setTimeout(()=>URL.revokeObjectURL(u),1000);
+}
+function exportData(which,fmt){
+ let rows=[],cols=[],name="";
+ if(which==="bans"){rows=curBans;cols=["ip","score","remain_sec"];name="banned_ips";}
+ else if(which==="events"){rows=curEvents;cols=["ts","kind","ip"];name="attack_events";}
+ else if(which==="sigs"){rows=curCustomSigs;cols=["name","category","pattern","weight"];name="custom_signatures";}
+ else return;
+ if(fmt==="json")downloadFile(name+".json",JSON.stringify(rows,null,2),"application/json");
+ else downloadFile(name+".csv",toCSV(rows,cols),"text/csv");
+ toast(tr("エクスポートしました"),"ok");
+}
 addEventListener("resize",()=>{try{refreshPro()}catch(e){}});
-refresh();refreshPro();setInterval(refresh,2000);setInterval(refreshPro,2000);
+showSkeleton();refresh();refreshPro();setInterval(refresh,2000);setInterval(refreshPro,2000);
 </script></body></html>"""

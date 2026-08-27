@@ -332,6 +332,85 @@ def test_dashboard_ops_policy_wiring():
             FW._FW, ND._SHIELD = ofw, osh
 
 
+def test_dashboard_admin_audit_wiring():
+    # 管理アクション監査ログ: mutating POST が成功すると admin_audit.jsonl に1件残り、
+    # GET /api/admin_audit で新しい順に取得できる。単純なスカラー設定は revert 情報を持つ。
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        ofw, osh = FW._FW, ND._SHIELD
+        adm, url, token = _admin_with_temp(tmp)
+        adm._state_dir = tmp     # 監査ログの置き場も隔離(他テストと混線させない)
+        try:
+            _, html = _req(url + "/")
+            assert b'id="auditlog"' in html and "変更履歴".encode() in html
+            # 初期状態は空
+            d = json.loads(_req(url + "/api/admin_audit", token=token)[1])
+            assert d["entries"] == []
+            # shield ON → 監査ログに1件、revert は shield ON前の状態(False)へ戻す内容
+            code, body = _req(url + "/api/shield/toggle", token=token, body={"on": True})
+            assert code == 200 and json.loads(body)["ok"] is True
+            d = json.loads(_req(url + "/api/admin_audit", token=token)[1])
+            assert len(d["entries"]) == 1
+            e = d["entries"][0]
+            assert e["endpoint"] == "/api/shield/toggle"
+            assert e["revert"] == {"endpoint": "/api/shield/toggle", "body": {"on": False}}
+            # paranoia 変更: set_paranoia() は paranoia_status() を返すため "ok" キーを持たない
+            # ―― それでも監査フックが記録できることを回帰的に確認する(素朴な r.get("ok") 判定
+            # だけだとここが記録されない)。
+            code, body = _req(url + "/api/shield/paranoia", token=token, body={"level": 3})
+            assert code == 200 and json.loads(body)["paranoia"] == 3
+            d = json.loads(_req(url + "/api/admin_audit", token=token)[1])
+            assert len(d["entries"]) == 2
+            assert d["entries"][0]["endpoint"] == "/api/shield/paranoia"   # 新しい順
+            assert d["entries"][0]["after"] == 3
+            # 失敗した呼び出し(存在しないカスタムシグネチャ削除でも ok:True を返す設計だが、
+            # 追加自体が失敗するケースで確認): 不正な signature 名は監査ログに残らない
+            before_n = len(d["entries"])
+            code, body = _req(url + "/api/shield/sig_add", token=token,
+                              body={"name": "bad name!", "pattern": "x"})
+            assert json.loads(body)["ok"] is False
+            d = json.loads(_req(url + "/api/admin_audit", token=token)[1])
+            assert len(d["entries"]) == before_n
+        finally:
+            adm.stop()
+            FW._FW, ND._SHIELD = ofw, osh
+
+
+def test_dashboard_sig_test_wiring():
+    # シグネチャのドライラン試験: 状態を一切変更せず(監査ログにも残さず)、
+    # validate_pattern の ReDoS/安全性検査を経てからマッチ判定のみ返す。
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        ofw, osh = FW._FW, ND._SHIELD
+        adm, url, token = _admin_with_temp(tmp)
+        adm._state_dir = tmp     # 監査ログの置き場も隔離(他テストと混線させない)
+        try:
+            _, html = _req(url + "/")
+            assert b'id="sigtestsample"' in html
+            # 一致するサンプル
+            code, body = _req(url + "/api/shield/sig_test", token=token,
+                              body={"pattern": "evil-?bot", "sample": "evilbot/1.0"})
+            r = json.loads(body)
+            assert code == 200 and r["ok"] is True and r["matches"] is True and r["error"] is None
+            # 不一致
+            r = json.loads(_req(url + "/api/shield/sig_test", token=token,
+                                body={"pattern": "evil-?bot", "sample": "friendly-crawler"})[1])
+            assert r["matches"] is False and r["error"] is None
+            # ReDoS パターンは validate_pattern で弾かれ、コンパイル/マッチは試みられない
+            r = json.loads(_req(url + "/api/shield/sig_test", token=token,
+                                body={"pattern": r"(a+)+$", "sample": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa!"})[1])
+            assert r["ok"] is True and r["matches"] is False and r["error"]
+            # 状態は一切変更されない: カスタムシグネチャ一覧に残らない
+            sig = json.loads(_req(url + "/api/shield/signatures", token=token)[1])
+            assert sig["custom"] == []
+            # 監査ログにも残らない(読み取り専用)
+            d = json.loads(_req(url + "/api/admin_audit", token=token)[1])
+            assert d["entries"] == []
+        finally:
+            adm.stop()
+            FW._FW, ND._SHIELD = ofw, osh
+
+
 def test_admin_token_cookie_not_handed_to_unauth_remote():
     # 脆弱性修正(#37): `/` は無条件で admin トークン Cookie を配っていた=非localhost公開時に
     # 誰でも GET / でトークンを取得し全制御APIを乗っ取れた。配布を localhost/認証済みに限定。
