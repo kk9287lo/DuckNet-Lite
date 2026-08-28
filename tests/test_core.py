@@ -1189,6 +1189,47 @@ def test_b6_triple_encoded_traversal_is_decoded_and_caught():
         assert "traversal" in (d.get("reason") or ""), d
 
 
+def test_b7_sql_comment_stripping_dotall_and_bound_widened_bypass_is_caught():
+    # 深掘りSQLi監査で実証: 一般/版付きコメント除去 regex が (1) DOTALL 無しで '.' が実改行に
+    # マッチせず、CRLF→';' 正規化(より後段)より前の複数行コメント(UNION/*\n*/SELECT。実DBで
+    # 有効な "UNION SELECT")を認識できず、(2) 境界 {0,200}? が200文字を超えるコメント本体
+    # (パディング攻撃)で不成立になり、いずれの場合もコメントが未除去のまま残って
+    # union/select・drop/table・waitfor/delay 等の隣接要求(\s(;]*等)を破っていた。
+    # 実装検証: real SQLite で UNION/*<300文字埋め>*/SELECT は実際に有効なSQLとして実行される
+    # (=本物の攻撃)ことを確認済み(コメントは常にトークン区切りとして働くのみで、
+    # SEL/**/ECT のようなキーワード内分割は逆に実DBで再結合されない=無害。後者は意図的に
+    # 未対応のまま=対応すると新規誤検知/過剰な複雑化のリスクが高くベンチマークにも合わない)。
+    from dataplane.engine.lifeform.pipeline import _normalize_for_scan, _SIG_RE
+    rgx = dict(_SIG_RE)
+    # (1) 実改行を含む複数行コメント(DOTALL 欠如で旧実装は素通り)
+    assert rgx["sqli"].search(_normalize_for_scan("1' UNION/*\n*/SELECT username,password FROM users--")), \
+        "multi-line comment UNION/*\\n*/SELECT"
+    # (2) 200文字超のコメント本体(境界の有界lazy quantifierが不成立になっていた)
+    filler = "A" * 300
+    assert rgx["sqli"].search(_normalize_for_scan(
+        f"1' UNION/*{filler}*/SELECT username,password FROM users--")), "oversized comment UNION..SELECT"
+    assert rgx["sqli"].search(_normalize_for_scan(
+        f"1'; DROP/*{filler}*/TABLE users--")), "oversized comment DROP..TABLE"
+    assert rgx["sqli_blind"].search(_normalize_for_scan(
+        f"1'; WAITFOR/*{filler}*/DELAY '0:0:5'--")), "oversized comment WAITFOR..DELAY"
+    # 既存の真陽性(短い/一行コメント・versioned comment 丸ごとラップ)は回帰なし
+    assert rgx["sqli"].search(_normalize_for_scan("1' UNION/**/SELECT username,password FROM users--"))
+    assert rgx["sqli"].search(_normalize_for_scan("1' UNION/*!50000SELECT*/username,password FROM users--"))
+    assert rgx["sqli"].search(_normalize_for_scan("1' UNION SELECT username,password FROM users--"))
+    # 誤検知なし: コメントを含む良性テキスト(ミニファイ済CSS/JS片の貼り付け等によくある形)
+    assert not rgx["sqli"].search(_normalize_for_scan(
+        "note: /* TODO refactor later */ this widget needs a redesign"))
+    assert not rgx["sqli"].search(_normalize_for_scan(
+        "body{color:red}/*header style*/.header{margin:0}"))
+    # プレフィルタがこの新規キャッチを取りこぼさない(needle は既存の union/select/drop table/
+    # waitfor がそのまま使えるので accel.py の変更は不要=スーパーセット維持を確認)
+    import dataplane.engine.core.accel as accel
+    for s in [f"1' UNION/*{filler}*/SELECT username,password FROM users--",
+              "1' UNION/*\n*/SELECT username,password FROM users--"]:
+        b = _normalize_for_scan(s)
+        assert accel.prescan_suspicious(b.encode("utf-8")) > 0, s
+
+
 def test_f1_scanner_ua_is_scoped_to_user_agent_field_only():
     # ライブ監査で実証したFP: scanner_ua は本来UA文字列の識別が目的なのに、汎用走査面
     # (path+query+UA混成/本文)全体に対して判定していたため、bio欄の自由記述
