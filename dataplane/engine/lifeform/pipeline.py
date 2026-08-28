@@ -52,35 +52,52 @@ from ..core import saferegex
 # 入力も走査前に正規化+長さ上限([[_MAX_SCAN]])するので、巧妙な難読化と巨大入力の
 # 両方を抑える(ただし正規表現WAFは原理的に完全ではない=多層防御の一枚と明記)。
 _SIGNATURES = [
-    ("sqli", r"(?i)(\bunion\b[\s(]*(?:(?:all|distinct)[\s(]+)?\bselect\b|\bor\b\s+1\s*=\s*1|'\s*--|\bselect\b.{0,120}?\bfrom\b.{0,120}?\bwhere\b|\bdrop\b\s+\btable\b)"),
+    ("sqli", r"(?i)(\bunion\b[\s(;]*(?:(?:all|distinct)[\s(;]+)?\bselect\b|\bor\b[\s;]+1\s*=\s*1|'[\s;]*--|\bselect\b.{0,120}?\bfrom\b.{0,120}?\bwhere\b|\bdrop\b[\s;]+\btable\b)"),
+    # F7(検討・不採用): document.cookie 単独をエクスフィル文脈(fetch(/XHR/sendBeacon/img src等)
+    # との近接必須にする案を検証したが、既存の回帰テスト test_prescan_is_a_true_superset_of_signatures
+    # (tests/test_logio.py)が bare "document.cookie" を xss の代表的真陽性サンプルとして明示的に
+    # 要求しており、これを崩すと既存の確立された真陽性検知を弱める(タスク方針=既存の真陽性検知を
+    # 犠牲にする narrowing はしない、に反する)。安全な絞り込みが見つからなかったため据え置き
+    # (既知の限界として文書化。F7参照)。
     ("xss", r"(?i)(<\s*script|onerror\s*=|javascript:|vbscript:|data:text/html|<\s*img[^>]{0,200}?onerror|document\.cookie)"),
-    ("traversal", r"(?i)(\.\./|\.\.\\|/etc/passwd|/etc/shadow|/etc/hosts|/proc/self|c:\\windows\\|\bwin\.ini\b|\bboot\.ini\b|\.\.;)"),
-    ("rce", r"(?i)(;\s*(cat|wget|curl|bash|sh|nc|powershell)\b|\$\([^)]*\)|`[^`]*`|\|\s*(nc|bash)\b|\(\)\s\{|<\?php\b|<\?=)"),
+    ("traversal", r"(?i)((?:\.\./){2,}|(?:\.\.\\){2,}|/etc/passwd|/etc/shadow|/etc/hosts|/proc/self|c:\\windows\\|\bwin\.ini\b|\bboot\.ini\b|\.\.;)"),
+    ("rce", r"(?i)((?:;|\|\||&&)\s*(cat|wget|curl|bash|sh|nc|powershell)\b|\$\([^)]*\)|`[^`]*`|\|\s*(nc|bash|sh|curl|wget|python)\b|\(\)\s\{|<\?php\b|<\?=)"),
     ("scanner_ua", r"(?i)\b(sqlmap|nikto|nmap|masscan|acunetix|nessus|dirbuster|gobuster|wpscan|zgrab|nuclei|httpx)\b"),
     ("sensitive_path", r"(?i)(/\.env\b|/wp-login|/xmlrpc\.php|/phpmyadmin|/\.git/|/\.aws/|/actuator/|/\.ssh/)"),
     # ブラインド/時間/エラーベース SQLi: union/恒真式に出ない別系統(関数呼び・遅延・メタ表)。
-    ("sqli_blind", r"(?i)(\bsleep\s*\(|\bbenchmark\s*\(|\bpg_sleep\s*\(|\bwaitfor\s+delay\b|\bextractvalue\s*\(|\bupdatexml\s*\(|\bload_file\s*\(|\binto\s+(?:out|dump)file\b|\binformation_schema\b)"),
-    # NoSQL(Mongo)演算子注入: id[$ne]=1 / $where。配列添字 filter[name] とは $ 接頭で区別=低誤検知。
-    ("nosqli", r"(?i)(\[\$(?:ne|gt|lt|gte|lte|eq|in|nin|regex|where|exists|or|and|not|nor|all|elemmatch|mod|size|type)\b|\$where\b)"),
-    # SSRF/LFI ラッパー: php://filter, file://, gopher:// 等の危険スキーム(http/https は対象外)。
-    ("lfi", r"(?i)(php|file|gopher|dict|expect|phar|netdoc)://"),
+    # information_schema はスキーマ修飾参照(information_schema.tables 等)必須=地の文の
+    # 単発言及(「information_schemaを調べたい」等)を誤検知しない(実SQLiは常にドット修飾で使う)。
+    ("sqli_blind", r"(?i)(\bsleep\s*\(|\bbenchmark\s*\(|\bpg_sleep\s*\(|\bwaitfor[\s;]+delay\b|\bextractvalue\s*\(|\bupdatexml\s*\(|\bload_file\s*\(|\binto[\s;]+(?:out|dump)file\b|\binformation_schema\.\w+)"),
+    # NoSQL(Mongo)演算子注入: id[$ne]=1 / $where(配列添字形)、または {"$ne": ...} / $gt: ...
+    # (JSONネイティブのキー形・コロン付き)。配列添字 filter[name] とは $ 接頭で区別=低誤検知。
+    ("nosqli", r"(?i)(\[\$(?:ne|gt|lt|gte|lte|eq|in|nin|regex|where|exists|or|and|not|nor|all|elemmatch|mod|size|type)\b|\$where\b|[\"']?\$(?:ne|gt|lt|gte|lte|eq|in|nin|regex|where|exists|or|and|not|nor|all|elemmatch|mod|size|type)\b\s*[\"']?\s*:)"),
+    # SSRF/LFI ラッパー: php://filter, gopher://, dict:// 等の危険スキーム(http/https は対象外)。
+    # file:// のみ、地の文のファイル共有リンク言及(「file://server/share/x.pdf」等)が多いので
+    # パラメータ値位置(= の直後)限定にして誤検知を減らす。他スキームはほぼ常に悪性=無条件。
+    ("lfi", r"(?i)((?:php|gopher|dict|expect|phar|netdoc)://|=file://)"),
     # Log4Shell(JNDI ルックアップ): ${jndi:ldap://…}。直接形を捕捉(深い ${lower:} 入れ子は対象外)。
     ("jndi", r"(?i)(\$\{jndi:|\bjndi:(?:ldap|ldaps|rmi|dns|iiop|nis|corba)\b)"),
     # SSRF クラウドメタデータ: IMDS(169.254.169.254 等)/メタデータホスト。資格情報窃取の的。
     # これらはユーザー入力にまず現れない=ほぼ誤検知ゼロ(部分一致 169.254 や /latest/news は非該当)。
-    ("ssrf", r"(?i)(169\.254\.169\.254|metadata\.google\.internal|100\.100\.100\.200|fd00:ec2::254|/latest/meta-data/|/computemetadata/)"),
+    # 10進(2852039166)/16進(0xa9fea9fe)表記の IMDS IP も同一ホストに解決される=バイパスになる
+    # ため追加。ただし裸の大数値(注文合計/タイムスタンプ/ハッシュ等)を誤検知しないよう、URL
+    # authority 位置(:// または @ の直後)限定にする。パスも /latest/dynamic・/latest/user-data
+    # (末尾 / 任意)まで拡張(旧は /latest/meta-data/ の末尾 / 必須・このパスのみだった)。
+    ("ssrf", r"(?i)(169\.254\.169\.254|metadata\.google\.internal|100\.100\.100\.200|fd00:ec2::254|/latest/(?:meta-data|dynamic|user-data)\b|/computemetadata/|(?:://|@)2852039166\b|(?:://|@)0xa9fea9fe\b)"),
     # プロトタイプ汚染(Node.js)+ クラスローダ汚染(Spring4Shell)。ユーザー入力にまず現れない。
     ("proto", r"(?i)(__proto__|constructor\W{0,4}prototype|class\W{0,4}module\W{0,4}classloader)"),
     # CRLF/レスポンスヘッダ注入: %0d%0a は正規化で ; になる(step5)。; に続くレスポンスヘッダ名は
     # 応答分割/ヘッダ注入の企図。;location 等は ; 付きで照合するので ?location=x は誤検知しない。
     # CRLF/レスポンスヘッダ注入 + メールヘッダ注入(%0a 後の bcc/cc/to/mime-version 等)。
     ("crlf", r"(?i);(set-cookie|location|refresh|content-type|content-length|content-disposition|bcc|cc|to|mime-version|content-transfer-encoding):"),
-    # XXE: <!ENTITY 定義、または外部 SYSTEM 付き DOCTYPE。良性 <!doctype html> は system 無しで非該当。
-    ("xxe", r"(?i)(<!entity|<!doctype[^>]{0,120}?system)"),
+    # XXE: <!ENTITY 定義、外部 SYSTEM 付き DOCTYPE、または PUBLIC 外部識別子形(公開識別子+
+    # 取得可能な system 識別子URIの2連続引用符=外部サブセットの時のみ出現)。良性 <!doctype html>
+    # は引用符が無いので非該当。
+    ("xxe", r"(?i)(<!entity|<!doctype[^>]{0,120}?system|<!doctype[^>]{0,120}?public\s+[\"'][^\"']*[\"']\s+[\"'])"),
     # OGNL/Struts2(S2-*)・式言語経由 RCE の核語。ユーザー入力にまず現れない=低FP。
     ("ognl", r"(?i)(_memberaccess|@java\.lang\.runtime|@java\.lang\.processbuilder|#context\[|ognl\.)"),
     # SSI(Server Side Includes)注入: <!--#exec / #include 等。ユーザー入力にまず現れない=低FP。
-    ("ssi", r"(?i)<!--#\s*(exec|include|echo|config|fsize|flastmod|printenv|set)\b"),
+    ("ssi", r"(?i)<!--#[\s;]*(exec|include|echo|config|fsize|flastmod|printenv|set)\b"),
     # LDAP インジェクション: フィルタメタ文字の注入形 )(| / *)( / )(uid= 等。良性 (a)(b) は非該当。
     ("ldapi", r"(?i)(\)\(\||\)\(&|\*\)\(|\)\([a-z]+=)"),
     # ── 以下はオプション(_OPTIONAL_SIGS・既定OFF)。コンパイルは常時・評価は cfg で個別ON時のみ ──
@@ -302,6 +319,15 @@ _DEFAULTS = {
 }
 # 既定OFFの高FPシグネチャ(テンプレ/内部IPはアプリ次第で正規にも現れる=オプトイン運用)。
 _OPTIONAL_SIGS = frozenset({"ssti", "ssrf_internal", "redirect"})
+# フィールド限定シグネチャ(#FP: scanner_ua/sensitive_path): この2つは意味的に『そのフィールド
+# 自体』を指す時だけ攻撃シグナルであり、汎用走査面(path+query+UA混成/各ヘッダ値/本文)に
+# 混ざった自由記述内での言及(bioに「nmapやsqlmapに詳しい」/問い合わせ本文に「/wp-login.phpに
+# アクセスできない」等)まで拾うと即BAN級の誤検知になる(実証済)。_scan_signatures の汎用走査
+# ループからはこの2つを除外し、inspect() が user_agent / path それぞれ専用に個別評価する
+# (only= 引数)。他の全カテゴリの走査方式は変えない=最小限のスコープ。
+_UA_ONLY_SIGS = frozenset({"scanner_ua"})
+_PATH_ONLY_SIGS = frozenset({"sensitive_path"})
+_FIELD_SCOPED_SIGS = _UA_ONLY_SIGS | _PATH_ONLY_SIGS
 # 段階的厳格度(evolution #16)→ そのレベルで有効化する任意シグネチャ。レベルが上がるほど
 # 検知は積極的(誤検知も増える)。新たな任意シグネチャはこのマップに足すだけで段階に組める。
 _PARANOIA_TIERS = {
@@ -491,7 +517,11 @@ def _normalize_for_scan(s: str) -> str:
                 pass                          # 壊れたデコーダで防御を止めない(素通りより安全側)
     try:
         from urllib.parse import unquote_plus
-        for _ in range(2):                   # 多重%エンコードを最大2回戻す(WAF定石)
+        # 多重%エンコードを最大5回戻す(WAF定石は2回だが、三重以上のエンコード(例: ".."の
+        # 三重エンコード %25252e%25252e)は2回では実体の "." まで戻らずtraversal等が素通りする
+        # =実証済バイパス。5回は上限のみで、実際は『変化が無くなった時点』で即break=素通り側
+        # (既に完全復号済みの通常トラフィック=大多数)は従来どおり1〜2回で抜ける・低速化しない。
+        for _ in range(5):
             dec = unquote_plus(s)
             if dec == s:
                 break
@@ -619,9 +649,11 @@ def _stacked_query_suspect(blob: str) -> bool:
 # DOMイベントハンドラ系 XSS の *構造* 検知 — 個別ハンドラ名の列挙(prescan需要)を避け、
 # 『タグ内に on<名前>= が現れる』形で捕捉する(<svg onload= / <div onclick= / <svg/onload=)。
 # literal '<タグ' を要求するため、?onload=1 のような素の引数は対象外=低誤検知。タグと
-# ハンドラの間は同一タグ内(>を跨がない)・区切りは空白か / を許容。prescan ゲート外で常時評価。
+# ハンドラの間は同一タグ内(>を跨がない)・区切りは空白か / (または ; = 生改行が正規化で
+# 変換された区切り文字。CRLF注入 <svg\nonload=… を \s 限定だと見逃すため追加)を許容。
+# prescan ゲート外で常時評価。
 _XSS_HANDLER_RE = re.compile(
-    r"<\s*[a-z][a-z0-9]{0,15}[^>]{0,200}?[\s/]on[a-z]{3,12}\s*=", re.I)
+    r"<\s*[a-z][a-z0-9]{0,15}[^>]{0,200}?[\s/;]on[a-z]{3,12}\s*=", re.I)
 
 
 def _xss_event_handler_suspect(blob: str) -> bool:
@@ -1414,10 +1446,15 @@ class NetShield:
                 continue
         self._geo_nets = nets
 
-    def _scan_signatures(self, blob: str):
+    def _scan_signatures(self, blob: str, *, only: frozenset | None = None):
         """1走査面(正規化済み文字列)への署名/構造検知。(name, weight) or (None, 0.0)を返す。
         prescan ゲート付き builtin署名 + 常時カスタム署名 + 構造検知(恒真式/スタック/XSSハンドラ)。
-        evolution #39 でフィールド独立走査のため inspect から切り出した(挙動は従来どおり)。"""
+        evolution #39 でフィールド独立走査のため inspect から切り出した(挙動は従来どおり)。
+        only: 指定時はこの名前集合の builtin 署名『だけ』を判定する専用フィールド走査
+        (#FP: scanner_ua/sensitive_path・_FIELD_SCOPED_SIGS)。カスタム署名/構造検知はスキップ
+        (専用フィールド走査は特定カテゴリの的確な判定が目的で、汎用の意味的検知とは別関心)。
+        only=None(既定=汎用走査)では _FIELD_SCOPED_SIGS に属す名は評価しない(専用呼び出し
+        でのみ判定=フィールド混成による誤検知を避ける)。"""
         if not blob:
             return None, 0.0
         # 高速プレフィルタ(Rust継ぎ目でnative化可)。核語が皆無なら高価な正規表現を丸ごとスキップ
@@ -1426,10 +1463,17 @@ class NetShield:
         if accel.prescan_suspicious(blob.encode("utf-8", "replace")) > 0:
             opt = self.cfg.get("optional_sigs", {})
             for name, rgx in _SIG_RE:
+                if only is not None:
+                    if name not in only:
+                        continue                 # 専用フィールド走査=指定カテゴリのみ判定
+                elif name in _FIELD_SCOPED_SIGS:
+                    continue                     # 汎用走査では専用フィールド系は判定しない(#FP)
                 if name in _OPTIONAL_SIGS and not opt.get(name):
                     continue                     # 高FPシグネチャは cfg で有効化された時のみ評価
                 if saferegex.search(rgx, blob, _MAX_SCAN):   # 入力上限で ReDoS 面積を有界化
                     return name, _SIG_WEIGHT.get(name, 30)
+        if only is not None:
+            return None, 0.0                     # 専用フィールド走査はここまで(カスタム/構造検知は対象外)
         # カスタムシグネチャ(ユーザー/AI追加)は prescanゲートを通さず常時評価(needleに無いため)。
         for name, _cat, rgx, w in self._custom_re:
             if saferegex.search(rgx, blob, _MAX_SCAN):
@@ -1468,6 +1512,16 @@ class NetShield:
         _targets.extend(h for h in (headers or "").split("\n") if h)
         blob = _normalize_for_scan(_targets[0])    # 主走査面(reason/後続参照の後方互換用)
         sig_hit, sig_weight = self._scan_signatures(blob)
+        # フィールド限定シグネチャ(#FP: scanner_ua/sensitive_path・_FIELD_SCOPED_SIGS)は上の汎用
+        # 走査面(path+query+UA混成)からは除外済み。ここで各々の専用フィールド *単体* を対象に
+        # 個別判定する(scanner_ua=user_agentのみ/sensitive_path=pathのみ)。bio等の自由記述
+        # フィールド内の言及や、query/headers越しの言及では判定しない=意味論どおりのスコープ。
+        if sig_hit is None and user_agent:
+            sig_hit, sig_weight = self._scan_signatures(
+                _normalize_for_scan(user_agent), only=_UA_ONLY_SIGS)
+        if sig_hit is None and path:
+            sig_hit, sig_weight = self._scan_signatures(
+                _normalize_for_scan(path), only=_PATH_ONLY_SIGS)
         for _t in _targets[1:_MAX_SCAN_FIELDS]:    # ヘッダ各値を独立面として(必要分だけ)走査
             if sig_hit is not None:
                 break

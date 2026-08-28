@@ -140,10 +140,13 @@ def hamming_distance(a, b) -> int:
 # 高速版へ差し替える(ctypes呼び出し中はGIL解放=並行性も改善・clearで即可逆)。
 _PRESCAN_NEEDLES = [
     b"union", b"select", b"1=1", b"--", b"drop table",
+    b"drop;table",                                      # CRLF注入 drop\ntable(正規化後 ;)対策
     b"script", b"onerror", b"javascript:", b"document.cookie",
     b"..", b"/etc/passwd", b"/proc/", b"windows\\",
     b";cat", b";wget", b";curl", b";bash", b";sh", b";nc", b";powershell",
-    b"|nc", b"|bash", b"$(", b"`",
+    b"|nc", b"|bash", b"|sh", b"|curl", b"|wget", b"|python",  # rce: パイプ経由の宛先拡張
+    b"&&", b"||",                                       # rce: &&/||区切りのコマンド連結
+    b"$(", b"`",
     b"sqlmap", b"nikto", b"nmap", b"masscan", b"acunetix", b"nessus",
     b"dirbuster", b"gobuster", b"wpscan", b"zgrab", b"nuclei", b"httpx",
     b"/.env", b"/wp-login", b"xmlrpc.php", b"phpmyadmin",
@@ -151,17 +154,23 @@ _PRESCAN_NEEDLES = [
     # ブラインド/時間/エラーベース SQLi(sqli_blind 分岐の核語。pg_sleep は "sleep" が内包)
     b"sleep", b"benchmark", b"waitfor", b"extractvalue", b"updatexml",
     b"load_file", b"outfile", b"dumpfile", b"information_schema",
-    b"[$", b"$where",                                   # NoSQL(Mongo)演算子注入
+    b"[$", b"$where",                                   # NoSQL(Mongo)演算子注入(配列添字/bare)
+    # NoSQL(Mongo)演算子注入: JSONネイティブのキー形({"$ne": ...} 等・コロン付き)の核語。
+    b"$ne", b"$gt", b"$lt", b"$eq", b"$in", b"$nin", b"$regex", b"$exists",
+    b"$or", b"$and", b"$not", b"$nor", b"$all", b"$elemmatch", b"$mod",
+    b"$size", b"$type",
     b"php://", b"file://", b"gopher://", b"dict://",     # SSRF/LFI ラッパー
     b"expect://", b"phar://", b"netdoc://",
     b"jndi:",                                           # Log4Shell(JNDI)
     b"169.254.169.254", b"metadata.google", b"100.100.100.200",  # SSRF クラウドメタデータ
     b"fd00:ec2", b"/latest/meta-data", b"/computemetadata",
+    b"/latest/dynamic", b"/latest/user-data",           # SSRF: IMDS パス拡張
+    b"2852039166", b"0xa9fea9fe",                       # SSRF: IMDS IP の10進/16進表記
     b"vbscript:", b"data:text/html",                   # XSS(追加スキーム)
     b"__proto__", b"prototype",                        # プロトタイプ汚染
     b";set-cookie", b";location", b";refresh",          # CRLF/レスポンスヘッダ注入(正規化後 ;)
     b";content-type", b";content-length", b";content-disposition",
-    b"<!entity", b"<!doctype",                          # XXE
+    b"<!entity", b"<!doctype",                          # XXE(SYSTEM形・PUBLIC形とも <!doctype 必須)
     b"classloader",                                     # Spring4Shell(クラスローダ汚染)
     b"/etc/shadow", b"/etc/hosts", b"win.ini", b"boot.ini",  # traversal 追加LFI標的(..; は .. が内包)
     b"() {", b"<?php", b"<?=",                          # Shellshock / PHP コード注入(rce)
