@@ -61,8 +61,7 @@ def build_sbom() -> dict:
                 "purl": f"pkg:pypi/ducknet-security@{ver}",
                 "description": ("Lightweight L7 DDoS/WAF security gateway "
                                 "(stdlib only, zero runtime dependencies)."),
-                "licenses": [{"license": {
-                    "name": "DuckNet L7 Security Commercial License"}}],
+                "licenses": [{"license": {"id": "AGPL-3.0-or-later"}}],
             },
         },
         # 配布物に同梱する第三者ライブラリは無い。実行環境(Python)のみ列挙。

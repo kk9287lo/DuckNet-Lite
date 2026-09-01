@@ -83,8 +83,11 @@ WAF 外で運用者が装備すべき統制(RPKI/DNSSEC/IAM/cgroup 等)を4フ�
 - 大規模・全コア活用は Linux で `--cluster`(SO_REUSEPORT)。Windows等は単一プロセスへ降格。
 
 ## ライセンス / 調達情報
-- DuckNet-Lite は free / trial エディション(商用ライセンス管理機能自体を含みません)。
-  利用条件は [LICENSE.txt](LICENSE.txt) を参照。上位(商用)エディションが必要な場合はベンダーへ
+- DuckNet-Lite は **GNU Affero General Public License v3.0 以降(AGPL-3.0-or-later)** の
+  フリーソフトウェアです(商用ライセンス管理機能自体を含みません)。全文は
+  [LICENSE.txt](LICENSE.txt) を参照。AGPL はネットワーク経由でも本製品(の改変版含む)を
+  利用させる場合、利用者に対応するソースコードを提供する義務を伴います(第13条)。
+  この義務を負わずに利用したい場合や、上位(商用)エディションが必要な場合はベンダーへ
   お問い合わせください。
 - 第三者ソフトウェア表示: [THIRD_PARTY_NOTICES.txt](THIRD_PARTY_NOTICES.txt)
   （本製品は**同梱する第三者コードなし**＝依存ゼロ）

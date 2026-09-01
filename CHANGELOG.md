@@ -2,6 +2,27 @@
 
 本プロジェクトの主要な変更点。日付は概ねの目安。詳細は各コミット(`evolution #N`)を参照。
 
+## [Lite] — ライセンスを GNU AGPL-3.0-or-later に変更
+
+DuckNet-Lite 自体のライセンスを、従来のテンプレート的な商用ライセンス文言(「評価利用のみ許諾・
+商用再配布/SaaS提供には別途契約」)から、正式な **GNU Affero General Public License v3.0 以降**
+へ変更した。上位(商用)エディションの DuckNet 本体はこの変更の対象外(従来の商用ライセンス
+モデルのまま)。
+
+- `LICENSE.txt` を GNU AGPL-3.0 の公式全文(gnu.org 配布のもの)に差し替え、本製品への適用ヘッダを
+  先頭に付与。
+- `pyproject.toml` に `License :: OSI Approved :: GNU Affero General Public License v3 or later
+  (AGPLv3+)` 分類子を追加(`license = {file = "LICENSE.txt"}` は既存のまま有効)。
+- `THIRD_PARTY_NOTICES.txt`: 本製品自体のライセンスへの参照節を追加。ついでに、round-1 の
+  enterprise/ 削除後も残っていた `dataplane/enterprise/ed25519.py` への古い参照(既に存在しない
+  パス)を除去。
+- `tools/gen_sbom.py`/`sbom.cdx.json`: コンポーネントのライセンスを `AGPL-3.0-or-later`
+  (SPDX識別子)に更新し、SBOM を再生成。
+- `README.md`: ライセンス節を AGPL の内容(特に第13条のネットワーク経由利用時のソース提供義務)
+  を明記する形に更新。
+- `NEXT_STEPS.md`: 「LICENSE.txt がテンプレート文言のまま」という既知の未解消項目を解消済みとして
+  更新。
+
 ## [Lite-5] — 第5次縮小: ハニーポット(囮URLパス)を削除
 
 free / trial ティアから、偵察AI/スキャナ向けの **囮URLパス**(隠し管理フォルダ・バックアップ・

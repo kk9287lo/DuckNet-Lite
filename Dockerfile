@@ -4,7 +4,7 @@ FROM python:3.12-slim
 LABEL org.opencontainers.image.title="DuckNet L7 Security" \
       org.opencontainers.image.description="Lightweight L7 DDoS/WAF security gateway (stdlib only, zero runtime deps)" \
       org.opencontainers.image.version="1.0.0" \
-      org.opencontainers.image.licenses="LicenseRef-DuckNet-Commercial" \
+      org.opencontainers.image.licenses="AGPL-3.0-or-later" \
       org.opencontainers.image.source="https://example.com/ducknet"
 
 WORKDIR /app

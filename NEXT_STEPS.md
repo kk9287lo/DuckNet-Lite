@@ -73,8 +73,9 @@ Web 管理ダッシュボードだけを残した構成になっています。�
   コミットする方針。エージェントは実行しない)。
 - **Docker の実ビルド確認は未実施**(この環境に docker 無し)。`docker build .` での動作確認と、
   `--supervise` 依存が無いこと(entrypoint/CMD に古いフラグが残っていないか)の再確認を推奨。
-- **LICENSE.txt はテンプレート文言のまま**(「商用ライセンス契約は別途」の記述が実際の free/trial
-  配布条件と整合しているか、リリース前に法務/ビジネス側の確認が要る)。
+- ~~LICENSE.txt はテンプレート文言のまま~~ → 解消済み: LICENSE.txt を GNU AGPL-3.0-or-later
+  の正式全文に差し替え、pyproject.toml のライセンス分類子・THIRD_PARTY_NOTICES.txt・
+  sbom.cdx.json(`tools/gen_sbom.py` 側も)・README.md のライセンス節を整合させた。
 
 ## 設計の鉄則(踏襲)
 
