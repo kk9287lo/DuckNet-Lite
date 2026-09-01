@@ -1,10 +1,10 @@
-# ChickenNet-Lite — 軽量 DDoS / WAF セキュリティゲートウェイ(free / trial 版)
+# DuckNet-Lite — 軽量 DDoS / WAF セキュリティゲートウェイ(free / trial 版)
 
 **あなたのWebサーバの手前に置くだけで、L7(アプリ層)の DDoS と侵入(WAF)を防ぎます。**
 外部依存ゼロ(Python標準ライブラリのみ)・OS非侵襲・防御専用。
 （適用範囲は下記「正直な適用範囲」を必ずご確認ください。L3/L4 は対象外です。）
 
-**ChickenNet-Lite は ChickenNet L7 Security の無償/試用エディションです。** 含まれるのは
+**DuckNet-Lite は DuckNet L7 Security の無償/試用エディションです。** 含まれるのは
 **コアの L7 WAF/DDoS リバースプロキシ・エンジンのみ** —— スコアリング/自動BAN・
 侵入シグネチャ照合を備えたリバースプロキシ型ゲートウェイと、それを操作するための最小限の
 Web 管理ダッシュボード(ON/OFF・指標・BAN管理・基本設定)、署名付き状態永続化です。
@@ -18,7 +18,7 @@ MITRE ATT&CK 対応の脅威検知コンテンツ配備、クラスタ間の分�
 ハニーポット(囮URLパス命中の即時BAN)。
 
 ## これは何か
-[攻撃] → **ChickenNet L7 Security(前衛)** → あなたのWebサーバ(WordPress / API など)
+[攻撃] → **DuckNet L7 Security(前衛)** → あなたのWebサーバ(WordPress / API など)
 
 - 前衛で **レート制限・侵入シグネチャ(SQLi/XSS/RCE/traversal/XXE/SSRF/JNDI/scanner 等)・脅威スコア・
   自動BAN** を適用。
@@ -52,7 +52,7 @@ run.bat                          # Windows (cmd) — ダブルクリックでも
 .\run.ps1 --admin 8081           # Windows (PowerShell)
 ```
 設定は `app.env`(`app.env.example` を参照。機密を含みうるため
-リポジトリにはコミットしない)。`CHICKENNET_PYTHON` で使う Python を明示できます。
+リポジトリにはコミットしない)。`DUCKNET_PYTHON` で使う Python を明示できます。
 
 全オプション(環境変数 / 設定キー)は **[docs/options.md](docs/options.md)**。
 
@@ -62,7 +62,7 @@ run.bat                          # Windows (cmd) — ダブルクリックでも
 自動再起動は **OS 公認の仕組み**(systemd `Restart=`/Windows サービス回復/launchd `KeepAlive`)に
 委ねます(アプリ自身は watchdog/親プロセス監督を持ちません=依存ゼロのままシンプルに)。
 ```bash
-export CHICKENNET_STATE_KEY=...   # 外部署名鍵で状態の改竄耐性を一段上げる(推奨)
+export DUCKNET_STATE_KEY=...   # 外部署名鍵で状態の改竄耐性を一段上げる(推奨)
 ```
 **正直な線引き**: プロセス隠蔽・taskkill 妨害・別名での隠れ起動といった *rootkit 手口は実装しません*
 (防御目的でも透明な実装が無く、製品自身が脅威になるため)。「終了されにくさ」も「クラッシュからの
@@ -70,7 +70,7 @@ export CHICKENNET_STATE_KEY=...   # 外部署名鍵で状態の改竄耐性を�
 macOS System Extension)で得ます。設定手順は **[docs/hardening.md](docs/hardening.md)**。
 
 **APT(国家支援型など)想定**: 高度な攻撃者は WAF と戦わず *迂回*(再ルーティング/直叩き)や
-下層(インフラ/BGP/DNS/ランタイム/OS)を狙います。ChickenNet 側の対抗策(**オリジントークンで
+下層(インフラ/BGP/DNS/ランタイム/OS)を狙います。DuckNet 側の対抗策(**オリジントークンで
 迂回トラフィックを backend が拒否**・**迂回の能動検知**・**グローバル接続上限**・外部鍵)と、
 WAF 外で運用者が装備すべき統制(RPKI/DNSSEC/IAM/cgroup 等)を4フェーズに対応づけた配備ガイドが
 **[docs/apt-threat-model.md](docs/apt-threat-model.md)**。
@@ -83,7 +83,7 @@ WAF 外で運用者が装備すべき統制(RPKI/DNSSEC/IAM/cgroup 等)を4フ�
 - 大規模・全コア活用は Linux で `--cluster`(SO_REUSEPORT)。Windows等は単一プロセスへ降格。
 
 ## ライセンス / 調達情報
-- ChickenNet-Lite は free / trial エディション(商用ライセンス管理機能自体を含みません)。
+- DuckNet-Lite は free / trial エディション(商用ライセンス管理機能自体を含みません)。
   利用条件は [LICENSE.txt](LICENSE.txt) を参照。上位(商用)エディションが必要な場合はベンダーへ
   お問い合わせください。
 - 第三者ソフトウェア表示: [THIRD_PARTY_NOTICES.txt](THIRD_PARTY_NOTICES.txt)

@@ -1,5 +1,5 @@
 # =============================================================================
-# ChickenNet-Lite — Docker Compose
+# DuckNet-Lite — Docker Compose
 # -----------------------------------------------------------------------------
 #   docker compose up -d                        # ゲートウェイ(前衛 + 管理画面)
 #
@@ -7,12 +7,12 @@
 # =============================================================================
 services:
   # 前衛ゲートウェイ(HTTP の L7 DDoS/WAF) + 管理ダッシュボード
-  chickennet-security:
+  ducknet-security:
     build: .
-    image: chickennet-security:1.0.0
+    image: ducknet-security:1.0.0
     restart: unless-stopped
     environment:
-      - CHICKENNET_OFFLINE=1
+      - DUCKNET_OFFLINE=1
     ports:
       - "8443:8443"            # 前衛(公開。ここに来た通信を防御してバックエンドへ)
       - "127.0.0.1:8081:8081"  # 管理画面はホストの 127.0.0.1 のみへ公開(トークン保護)

@@ -65,7 +65,7 @@ free / trial ティアから、脅威スコアの中間防御ティアだった 
   `absorb_suspend()`(OSスリープ吸収)は BAN タイマーの補正だけを残し、nonce/検証セッションの
   補正ロジックを削除。
 - **削除(`engine/services/proxy.py`)**: `_CHALLENGE_PATH`
-  (`/__chickennet_challenge__`)定数、`_handle_challenge()`、`if act == "challenge":` の
+  (`/__ducknet_challenge__`)定数、`_handle_challenge()`、`if act == "challenge":` の
   503+PoW 応答分岐、`AsyncEdgeGuard.metrics` の `challenged` カウンタ。
 - **削除(`admin.py`)**: ダッシュボードの `🚨 Under Attack` トグルと
   `/api/shield/under_attack` エンドポイント、`challenge_total` メトリクス露出、
@@ -118,7 +118,7 @@ free / trial ティアから、常駐サービス層の *自動復旧*(auto-reco
   `test_memtamper.py`(迂回検知/cfg改竄検知の直接テスト)は無関係な独立機能のため変更なし。
 - ドキュメント: README/CHANGELOG/docs/hardening.md/docs/options.md/docs/defenses.md/
   docs/apt-threat-model.md から `--supervise`/watchdog の記述を除去し、クラッシュ復旧は
-  OS 層の責務であることを明記。`NEXT_STEPS.md` を ChickenNet-Lite の現状に合わせて全面刷新
+  OS 層の責務であることを明記。`NEXT_STEPS.md` を DuckNet-Lite の現状に合わせて全面刷新
   (商用版前提の古い引き継ぎメモを置き換え)。
 - コード品質: `engine/lifeform/pipeline.py` の `inspect()` に残っていたカナリアトークン
   照合の死コード(`canary.py` は第1次縮小で既に削除済み・常に except 分岐に落ちるだけの無害な
@@ -133,7 +133,7 @@ free / trial ティアを **さらに** 絞り込み、コアの L7 WAF/DDoS リ
 
 - **削除(価値付加機能・上位エディションのみ)**:
   - **DNS フィルタ(L7検知)** — `engine/lifeform/dns.py`。`dns` サブコマンド・
-    `chickennet-dns` Docker サービス・`docs/dns.md` を削除。
+    `ducknet-dns` Docker サービス・`docs/dns.md` を削除。
   - **囮ファイルのダウンロード追跡(ビーコン)** — `engine/lifeform/datasets.py`
     (参照トークン台帳)。`/c/<token>.png` ビーコン経路・`/api/ledger` を削除。
   - **SIEM/Webhook 転送** — `engine/lifeform/forwarders.py`(Syslog/Webhook Fanout)・
@@ -155,7 +155,7 @@ free / trial ティアを **さらに** 絞り込み、コアの L7 WAF/DDoS リ
   - **ステルス運用(プロセス名偽装)** — `dataplane/profile.py` を削除。`--stealth` CLI フラグと
     `service.py`(`run()`)の cover 変数配線を除去。`proxy.py`/`edge_config.py` の
     `profile.cover_thread_name`/`cover_brand` 呼び出しは固定文字列に置換(機能自体は
-    `CHICKENNET_COVER` 環境変数を直接参照するブランド表示のみ残置=後方互換)。
+    `DUCKNET_COVER` 環境変数を直接参照するブランド表示のみ残置=後方互換)。
 - **維持(意図的)**: `--supervise`(Watchdog/Supervisor)、`--install-autostart`/
   `--uninstall-autostart`、`--cluster`(マルチコア待受)、`atomic_io`/`signed_state`
   (状態永続化の署名整合性)、`origin.py`(バックエンド・バイパス防止)、`accel.py`、`i18n.py`。
@@ -171,7 +171,7 @@ free / trial ティアを **さらに** 絞り込み、コアの L7 WAF/DDoS リ
   `test_core.py`/`test_hardening.py`/`test_saferegex.py`/`test_memtamper.py`/
   `test_signed_state.py` から該当ケースを整理。**372/372 件緑**。
 
-## [Lite] — ChickenNet-Lite(free / trial エディション)分岐
+## [Lite] — DuckNet-Lite(free / trial エディション)分岐
 
 上位(商用)エディションから、コアの L7 WAF/DDoS リバースプロキシ・ゲートウェイ + 最小限の
 管理ダッシュボード + DNS フィルタだけを残した無償/試用ティアを切り出し。**依存ゼロ**は維持。
@@ -250,11 +250,11 @@ free / trial ティアを **さらに** 絞り込み、コアの L7 WAF/DDoS リ
 - **各設定項目のホバー説明(ツールチップ)**・設定の **検索/フィルタ**・マウスホイールスクロール。
 - **システムトレイ常駐・グローバルホットキー召喚**(ステルス/通常で個別 ON/OFF)・**設定変更パスワード
   ロック(pbkdf2)**・**単一インスタンスガード**(二重起動は既存窓を前面化)。
-- **ダブルクリック起動ランチャ**: `ChickenNet.bat` / `ChickenNet.ps1`(Windows・pythonw)/
-  `ChickenNet.command`(macOS)/ `ChickenNet.sh`(Linux)。アイコンは差し替え可能な `ico/` フォルダから。
+- **ダブルクリック起動ランチャ**: `DuckNet.bat` / `DuckNet.ps1`(Windows・pythonw)/
+  `DuckNet.command`(macOS)/ `DuckNet.sh`(Linux)。アイコンは差し替え可能な `ico/` フォルダから。
 
 ### 運用 / その他
-- **ステルス強化**: GUI タイトル/ヘッダ/スプラッシュ/生成設定コメントも `CHICKENNET_COVER` に追従。
+- **ステルス強化**: GUI タイトル/ヘッダ/スプラッシュ/生成設定コメントも `DUCKNET_COVER` に追従。
 - **ビルド後の自動クリーンアップ**(`tools/clean.py`・テスト実行で自動)。
 - 環境変数 / 設定キーの一覧は **[docs/options.md](docs/options.md)**。
 

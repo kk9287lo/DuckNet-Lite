@@ -193,7 +193,7 @@ def _forwarded_proto_tls(peer_ip: str, buf: bytes, trusted) -> bool:
 
 
 # 解除リクエスト(異議申立)の受付パス。遮断中ユーザーでも到達できる(BAN判定の手前)。
-_APPEAL_PATH = "/__chickennet_appeal__"
+_APPEAL_PATH = "/__ducknet_appeal__"
 
 
 _CL_DIGITS = re.compile(rb"\A[0-9]+\Z")         # Content-Length は 1*DIGIT のみ(RFC 7230 §3.3.2)
@@ -273,12 +273,12 @@ def _framing_ambiguous(buf: bytes) -> bool:
 
 def _block_page(info: dict, submitted: bool = False, msg: str = "") -> bytes:
     """アクセス遮断ページ(商用WAF風)。数分後に解除リクエスト(異議申立)フォームを出す。
-    表示名は環境変数 CHICKENNET_COVER で差し替え可(ステルス時=製品名を露見させない)。
-    文言は CHICKENNET_LANG(ja|en)で切替(end-user 向け多言語)。"""
+    表示名は環境変数 DUCKNET_COVER で差し替え可(ステルス時=製品名を露見させない)。
+    文言は DUCKNET_LANG(ja|en)で切替(end-user 向け多言語)。"""
     import html as _html
     from ..core.i18n import t, lang
     lg = lang()
-    brand = _html.escape(os.environ.get("CHICKENNET_COVER", "ChickenNet L7 Security"))
+    brand = _html.escape(os.environ.get("DUCKNET_COVER", "DuckNet L7 Security"))
     remain = int(info.get("remain_sec", 0))
     if submitted:
         center = (f"<h2>{t('block.received.h')}</h2>"
@@ -551,13 +551,13 @@ class AsyncEdgeGuard:
         #   まま放置する『遅延読取』兵糧攻めを断つ。各 drain をこの秒数で打ち切り→両端を強制解放。
         #   SSE/大容量DLでも『一切受信しない状態がこの秒数』続くのは異常=安全に切る。env で調整可。
         try:
-            self.write_timeout = float(os.environ.get("CHICKENNET_DRAIN_TIMEOUT", write_timeout))
+            self.write_timeout = float(os.environ.get("DUCKNET_DRAIN_TIMEOUT", write_timeout))
         except (TypeError, ValueError):
             self.write_timeout = write_timeout
         self.backend_unix = backend_unix      # 同一ホストならUnixソケットでTCP越え加速(可用時)
         # ヘルスチェック用パス(opt-in)。LB/オーケストレータの死活監視を WAF/バックエンド非経由で
-        # 即 200 応答するための予約パス。既定は空=無効(env CHICKENNET_HEALTH_PATH で既定指定可)。
-        self.health_path = (health_path or os.environ.get("CHICKENNET_HEALTH_PATH", "")).strip()
+        # 即 200 応答するための予約パス。既定は空=無効(env DUCKNET_HEALTH_PATH で既定指定可)。
+        self.health_path = (health_path or os.environ.get("DUCKNET_HEALTH_PATH", "")).strip()
         # ライセンス検証はホットパスでは **メモリBooleanを返す callable** だけ(外部I/Oなし)。
         # 未設定(None)なら無効化=評価/OSS運用はそのまま。商用は gateway が LicenseManager を渡す。
         self.license_check = license_check
@@ -869,7 +869,7 @@ class AsyncEdgeGuard:
                 #   (バックエンドが検証し迂回直叩きを拒否)。鍵は env で共有。クライアント供給の
                 #   同名ヘッダは _set_request_header が除去するので偽装できない。
                 if _scfg.get("origin_cloaking_enabled"):
-                    _okey = os.environ.get("CHICKENNET_ORIGIN_KEY", "")
+                    _okey = os.environ.get("DUCKNET_ORIGIN_KEY", "")
                     if _okey:
                         from ..core.origin import origin_token
                         fwd = _set_request_header(
@@ -881,7 +881,7 @@ class AsyncEdgeGuard:
             #   未検査でバックエンドへ届く。head のみに切り詰め、client→backend パイプも張らず
             #   write_eof で『要求完了』を半クローズで通知する。これで *backend が
             #   Connection: close を尊重するか否かに依存せず* smuggle 第2要求が上流に到達しない
-            #   (#31 が「準拠サーバ前提」と明記していた残余リスクを ChickenNet 側で能動的に塞ぐ)。
+            #   (#31 が「準拠サーバ前提」と明記していた残余リスクを DuckNet 側で能動的に塞ぐ)。
             bodyless = not _request_declares_body(buf)
             if bodyless:
                 _h, _sep, _ = fwd.partition(b"\r\n\r\n")
@@ -1397,7 +1397,7 @@ class AsyncEdgeGuard:
     def start(self, timeout: float = 5.0) -> dict:
         self._raise_fd_limit()                        # #79: FD ソフト上限を引き上げ(可能なら)
         self._thread = threading.Thread(target=self._run, daemon=True,
-                                        name="chickennet-edge")
+                                        name="ducknet-edge")
         self._thread.start()
         if not self._ready.wait(timeout):
             return {"ok": False, "error": "起動タイムアウト"}
@@ -1437,7 +1437,7 @@ class AsyncEdgeGuard:
         info = self.start()
         if not info.get("ok"):
             raise RuntimeError(info.get("error"))
-        print(f"ChickenNet async edge guard: "
+        print(f"DuckNet async edge guard: "
               f"{info['listen']} -> {info['backend']}")
         try:
             while True:

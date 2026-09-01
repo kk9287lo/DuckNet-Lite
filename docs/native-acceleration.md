@@ -28,7 +28,7 @@ accel.clear_native_override("shannon_entropy")           # 即 revert（純Pytho
 - `set_native_override(name, fn)` は実行時に差し替え、`clear_native_override` で**即可逆**。
 - `shannon_entropy` / `prescan_suspicious` は override を `try/except` で呼び、**例外時は純Python**へ
   フォールバック（native のクラッシュで防御が止まらない）。
-- パッケージ済みバイナリ（`chickennet_accel.*.pyd/.so`）が `import` できる場合は自動採用。
+- パッケージ済みバイナリ（`ducknet_accel.*.pyd/.so`）が `import` できる場合は自動採用。
   これは**インストール先＝コード本体と同一信頼境界**にのみ置く（任意ビルド、同梱しない）。
 
 ## Rust(cdylib)を差し込むレシピ（rustc のある環境で）
@@ -51,7 +51,7 @@ accel.clear_native_override("shannon_entropy")           # 即 revert（純Pytho
    }
    ```
    ```bash
-   rustc -O --crate-type cdylib prescan.rs -o chickennet_accel.so   # 要 rustc
+   rustc -O --crate-type cdylib prescan.rs -o ducknet_accel.so   # 要 rustc
    ```
 
 2. **ctypes でロードし、純Python と等価か検証してから差し込む**（不一致なら採用しない）:
@@ -59,7 +59,7 @@ accel.clear_native_override("shannon_entropy")           # 即 revert（純Pytho
    ```python
    import ctypes
    from dataplane.engine.core import accel
-   lib = ctypes.CDLL("./chickennet_accel.so")
+   lib = ctypes.CDLL("./ducknet_accel.so")
    lib.shannon_entropy.argtypes = [ctypes.c_char_p, ctypes.c_size_t]
    lib.shannon_entropy.restype = ctypes.c_double
 
@@ -83,7 +83,7 @@ accel.clear_native_override("shannon_entropy")           # 即 revert（純Pytho
 「悪性パケットを NIC ドライバ層で 444 Drop」は魅力的だが、**本プロジェクトの鉄則と衝突する**：
 
 - カーネルへバイトコードを注入する＝**「OS非侵襲」の真逆**。要 root・Linux 限定・stdlib 外。
-- これは "ChickenNet(依存ゼロ・OS非侵襲の L7 前衛)" ではなく、**別レイヤ/別コンポーネント**として
+- これは "DuckNet(依存ゼロ・OS非侵襲の L7 前衛)" ではなく、**別レイヤ/別コンポーネント**として
   分離すべきもの。"Python のガワのまま Cloudflare 速度" は誇張であり、本書では約束しない。
 - L3/L4 ボリューメトリックは元来ネットワーク層(Anycast/ISP/クラウドDDoS)の領域、という
   README の正直な適用範囲に従う。eBPF はその「別レイヤ」の任意拡張として扱うこと。

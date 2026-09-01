@@ -169,12 +169,12 @@ _DEFAULTS = {
                              "x-forwarded-server", "x-forwarded-port",
                              "x-forwarded-prefix", "x-host"],
     # バックエンド・バイパス防止(evolution #77): エッジ経由を証明する時間有界トークンを転送要求へ
-    # 付与する。バックエンドが検証し、トークン無し(=ChickenNet を迂回した直叩き/再ルーティング)を
-    # 拒否する。鍵は env CHICKENNET_ORIGIN_KEY をエッジ・バックエンドで共有(VM 外保管を推奨)。opt-in。
+    # 付与する。バックエンドが検証し、トークン無し(=DuckNet を迂回した直叩き/再ルーティング)を
+    # 拒否する。鍵は env DUCKNET_ORIGIN_KEY をエッジ・バックエンドで共有(VM 外保管を推奨)。opt-in。
     "origin_cloaking_enabled": False,  # 転送要求にオリジントークンを付与(バックエンドが検証)
     "origin_header": "X-Edge-Token",   # トークンを載せるヘッダ名(中立名・バックエンドと合わせる)
     "origin_window_sec": 30,           # トークンの時間バケット幅(リプレイ窓・時計ずれ吸収)
-    # 迂回検知 / dead-man's switch(evolution #78): ChickenNet 経由のトラフィックが *直近は活発だったのに
+    # 迂回検知 / dead-man's switch(evolution #78): DuckNet 経由のトラフィックが *直近は活発だったのに
     # 突然ゼロ* になったら、再ルーティング等で迂回された疑い。busy→ゼロ の遷移のみ警報=自然な低トラフ
     # では誤検知しない。AsyncEdgeGuard の独立した定期チェックループから呼ぶ。
     "stall_detect_enabled": True,    # トラフィック急停止(迂回の疑い)を検知して警報
@@ -738,7 +738,7 @@ class NetShield:
         self._ban_bloom = BloomFilter(capacity=max(2000, _MAX_IPS // 4))
         self._secret = secrets.token_bytes(16)
         # 可変状態ファイル(BAN/署名/設定/テレメトリ)の改竄耐性(#52/#53): 保存時に HMAC 署名し
-        # 読込時に検証。鍵は再起動を跨ぐため永続(env CHICKENNET_STATE_KEY 推奨・無ければ 0600 で生成)。
+        # 読込時に検証。鍵は再起動を跨ぐため永続(env DUCKNET_STATE_KEY 推奨・無ければ 0600 で生成)。
         self._state_key = persistent_key(base)
         # 署名運用マーカー(#53): 一度でも署名保存した後は『無署名ファイルの出現』を平文すり替えの
         # 疑いとして改竄扱いする(無署名受理=移行は初回/レガシーのみ許す)。起動時点の有無を1度だけ
@@ -1070,7 +1070,7 @@ class NetShield:
 
     def apply_config_file(self, path: str) -> dict:
         """JSON 設定ファイルを読み込んで apply_config。空パス=no-op。読めない/JSON不正=エラー。
-        起動時に env CHICKENNET_CONFIG / CLI --config から呼ぶ(宣言的ブートストラップ)。"""
+        起動時に env DUCKNET_CONFIG / CLI --config から呼ぶ(宣言的ブートストラップ)。"""
         if not path:
             return {"ok": True, "applied": [], "note": "no config file"}
         d = safe_read_json(path, None)
@@ -2318,7 +2318,7 @@ class NetShield:
                              "mac": macs.get(ip, "")})
         rows.sort(key=lambda r: (r["banned"], r["score"], r["reqs_window"]), reverse=True)
         _zones = ["loopback", "private", "public", "special", "unknown"]
-        return {"center": "ChickenNet L7 Security", "nodes": rows[:n],
+        return {"center": "DuckNet L7 Security", "nodes": rows[:n],
                 "zones": {z: sum(1 for r in rows if r["zone"] == z) for z in _zones}}
 
     def apt_report(self, n: int = 15) -> dict:
@@ -2438,7 +2438,7 @@ class NetShield:
         """迂回検知 / dead-man's switch(#78)。AsyncEdgeGuard の独立した定期チェックループから
         周期的に呼ぶ。直近の区間が busy
         (>= stall_min_rate)だったのに *今区間で1件も通っていない* なら、再ルーティング等で
-        ChickenNet を迂回された疑いとして警報する。busy→ゼロ の遷移のみ=自然な低トラフィックや
+        DuckNet を迂回された疑いとして警報する。busy→ゼロ の遷移のみ=自然な低トラフィックや
         graceful な停止では鳴らない。返り値 {"stall": bool, ...}。"""
         now = _now() if now is None else now
         with self._lock:

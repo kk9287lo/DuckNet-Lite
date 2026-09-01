@@ -3,7 +3,7 @@ requires = ["setuptools>=61"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "chickennet-security"
+name = "ducknet-security"
 version = "1.3.0"
 description = "Lightweight L7 DDoS/WAF security gateway (stdlib only, zero runtime dependencies)."
 readme = "README.md"
@@ -26,7 +26,7 @@ classifiers = [
 dependencies = []
 
 [project.scripts]
-chickennet-security = "dataplane.service:main"
+ducknet-security = "dataplane.service:main"
 
 [tool.setuptools]
 packages = [

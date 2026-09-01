@@ -1,6 +1,6 @@
-# ChickenNet-Lite — 次にやること(引き継ぎメモ)
+# DuckNet-Lite — 次にやること(引き継ぎメモ)
 
-このリポジトリ(`D:\ChickenNet-Lite`)は **ChickenNet L7 Security の free / trial エディション**の
+このリポジトリ(`D:\DuckNet-Lite`)は **DuckNet L7 Security の free / trial エディション**の
 独立フォークです(防御エンジンは `dataplane/engine/` 配下に同梱、外部依存ゼロ)。上位(商用)
 エディションから5回の縮小パスを経て、コアの L7 WAF/DDoS リバースプロキシ・エンジン + 最小限の
 Web 管理ダッシュボードだけを残した構成になっています。詳細な削除履歴は
@@ -15,7 +15,7 @@ Web 管理ダッシュボードだけを残した構成になっています。�
   ハニーポット命中を「決定論的に一発BANを誘発する」ための手段として流用していたため、
   `penalize(weight=block_score)` 直呼びへ置き換えて意図を維持):
   `python tests/run_all.py` または `pytest tests/`
-  (`CHICKENNET_OFFLINE=1` / `CHICKENNET_STATE_DIR` に一時ディレクトリを指定して実行)。
+  (`DUCKNET_OFFLINE=1` / `DUCKNET_STATE_DIR` に一時ディレクトリを指定して実行)。
 - CLI: `python -m dataplane --backend HOST:PORT --listen 8443 --admin 8081` で起動。
   `--cluster`(全コア待受)・`--install-autostart`/`--uninstall-autostart`(OS 公認の場所への
   自動起動登録)は健在。**`--supervise`(親プロセス監督)は Lite-3 で削除済み** — クラッシュからの

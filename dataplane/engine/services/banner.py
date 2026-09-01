@@ -9,7 +9,7 @@ banner.py — 動的デセプション(Moving Target Defense・防御専用・�
 正直な線引き(誇張しない):
   · これは『指紋を揺らす(攪乱)』防御であって、攻撃者を攻撃したり罠ネットワークを物理生成
     したりはしない(OS非侵襲・防御専用)。決定的な精密解析は欺けない=自動列挙を外す層。
-  · 既定オフ。CHICKENNET_DECEPTION を設定したときだけ働く(正規の監視を不用意に混乱させない)。
+  · 既定オフ。DUCKNET_DECEPTION を設定したときだけ働く(正規の監視を不用意に混乱させない)。
 """
 from __future__ import annotations
 
@@ -51,8 +51,8 @@ _COPRIME = [s for s in range(1, max(2, len(_FAMILIES)))
 
 
 def is_enabled() -> bool:
-    """デセプションが有効か(既定オフ。CHICKENNET_DECEPTION で opt-in)。"""
-    return os.environ.get("CHICKENNET_DECEPTION", "").lower() not in ("", "0", "false", "no")
+    """デセプションが有効か(既定オフ。DUCKNET_DECEPTION で opt-in)。"""
+    return os.environ.get("DUCKNET_DECEPTION", "").lower() not in ("", "0", "false", "no")
 
 
 def rotating_banner(seed: str = "", window: int = 30, now: float = None) -> str:

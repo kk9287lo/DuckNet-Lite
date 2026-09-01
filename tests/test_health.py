@@ -46,12 +46,12 @@ def test_health_constructor_and_env():
     assert AsyncEdgeGuard(health_path="/healthz").health_path == "/healthz"
     assert AsyncEdgeGuard(health_path="  /hz  ").health_path == "/hz"      # strip
     assert AsyncEdgeGuard().health_path == ""                              # 既定OFF
-    os.environ["CHICKENNET_HEALTH_PATH"] = "/envhz"
+    os.environ["DUCKNET_HEALTH_PATH"] = "/envhz"
     try:
         assert AsyncEdgeGuard().health_path == "/envhz"                    # env 既定
         assert AsyncEdgeGuard(health_path="/explicit").health_path == "/explicit"  # 引数優先
     finally:
-        del os.environ["CHICKENNET_HEALTH_PATH"]
+        del os.environ["DUCKNET_HEALTH_PATH"]
 
 
 def test_health_path_answers_200_without_backend():

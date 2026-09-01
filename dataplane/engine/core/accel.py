@@ -2,16 +2,16 @@
 accel.py — 局所的ネイティブ化の継ぎ目(PyO3/Cython 対応・純Pythonフォールバック)
 ==============================================================================
 全書き換えはせず、**一番重い計算ループだけ**をネイティブ(Rust=PyO3 / C=Cython)へ切り出す
-ための継ぎ目。任意のコンパイル済み拡張 `chickennet_accel` があればその関数を使い、無ければ
+ための継ぎ目。任意のコンパイル済み拡張 `ducknet_accel` があればその関数を使い、無ければ
 **純Python のフォールバック**で動く(ハード依存なし・未ビルドでも壊れない)。
 
 使い方(痛み最小):
-  · ここで純Python実装を提供しつつ、`chickennet_accel` が import 出来れば自動で置き換える。
+  · ここで純Python実装を提供しつつ、`ducknet_accel` が import 出来れば自動で置き換える。
   · ホットループ候補: エントロピー計算 / ハッシュ / トークナイズ内側 / エミュレータ step。
   · ネイティブ拡張は GIL を解放できるので、UI(別スレッド)と並行で重計算を回せる。
 
 正直: ここでは拡張のビルド(toolchain)はできない。純Python実装が常に正しく動き、
-`chickennet_accel` をビルドして置けば自動で高速化する、という**継ぎ目**を提供する(=設計の用意)。
+`ducknet_accel` をビルドして置けば自動で高速化する、という**継ぎ目**を提供する(=設計の用意)。
 """
 from __future__ import annotations
 
@@ -23,18 +23,18 @@ from collections import Counter
 
 def _load_native():
     try:
-        import chickennet_accel       # 任意: PyO3/Cython でビルドした拡張(無くてよい)
-        return chickennet_accel
+        import ducknet_accel       # 任意: PyO3/Cython でビルドした拡張(無くてよい)
+        return ducknet_accel
     except Exception:
         pass
-    # build.py が生成した core/native/chickennet_accel.*.pyd/.so を探す
+    # build.py が生成した core/native/ducknet_accel.*.pyd/.so を探す
     nd = os.path.join(os.path.dirname(os.path.abspath(__file__)), "native")
     if os.path.isdir(nd):
         if nd not in sys.path:
             sys.path.insert(0, nd)
         try:
-            import chickennet_accel
-            return chickennet_accel
+            import ducknet_accel
+            return ducknet_accel
         except Exception:
             return None
     return None
@@ -209,11 +209,11 @@ def prescan_suspicious(data) -> int:
 
 
 def info() -> dict:
-    return {"native_module": "chickennet_accel", "native_available": _NATIVE is not None,
+    return {"native_module": "ducknet_accel", "native_available": _NATIVE is not None,
             "accelerated_fns": [n for n in ("shannon_entropy",) if has_native(n)],
             "runtime_overrides": list(_OVERRIDES),
             "hot_loop_candidates": ["shannon_entropy", "tokenizer_inner",
                                     "ast_pattern_scan", "emulator_step"],
-            "note": "純Python実装が常に動く。chickennet_accel(PyO3/Cython)があれば自動置換。さらに "
+            "note": "純Python実装が常に動く。ducknet_accel(PyO3/Cython)があれば自動置換。さらに "
                     "self_transpile の継ぎ目が cdylib/.dll を ctypes でロードして set_native_override で"
                     "実行時に差し替え可(検証済み・承認制・clearで即可逆)。"}

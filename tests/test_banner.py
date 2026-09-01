@@ -11,13 +11,13 @@ from dataplane.engine.services.proxy import _http_response
 
 
 def test_disabled_by_default():
-    os.environ.pop("CHICKENNET_DECEPTION", None)
+    os.environ.pop("DUCKNET_DECEPTION", None)
     assert deception.is_enabled() is False
     assert deception.banner_for("1.2.3.4") == ""        # 既定では Server を偽装しない
 
 
 def test_enabled_returns_plausible_rotating_banner():
-    os.environ["CHICKENNET_DECEPTION"] = "1"
+    os.environ["DUCKNET_DECEPTION"] = "1"
     try:
         assert deception.is_enabled() is True
         b = deception.banner_for("203.0.113.9")
@@ -31,7 +31,7 @@ def test_enabled_returns_plausible_rotating_banner():
         assert deception.rotating_banner("a", now=1000.0) != deception.rotating_banner("zzz", now=1000.0) \
             or True                                     # 衝突もあり得るので緩く(分散の確認は上で十分)
     finally:
-        os.environ.pop("CHICKENNET_DECEPTION", None)
+        os.environ.pop("DUCKNET_DECEPTION", None)
 
 
 def test_adjacent_windows_always_change_family():
@@ -53,7 +53,7 @@ def test_adjacent_windows_always_change_family():
 def test_companion_headers_are_consistent_with_server_family():
     # evolution #4 深掘り: 偽 Server だけでなく系統に *整合する* 随伴ヘッダを付け、嘘を内部
     # 矛盾させない(IIS なのに PHP、のような食い違いを出さない)。
-    os.environ["CHICKENNET_DECEPTION"] = "1"
+    os.environ["DUCKNET_DECEPTION"] = "1"
     try:
         fam = deception._family
         saw_companion = False
@@ -73,11 +73,11 @@ def test_companion_headers_are_consistent_with_server_family():
                 assert "X-Powered-By" not in d, (f, d)
         assert saw_companion                              # 少なくとも一部系統で随伴ヘッダが出た
     finally:
-        os.environ.pop("CHICKENNET_DECEPTION", None)
+        os.environ.pop("DUCKNET_DECEPTION", None)
 
 
 def test_companion_headers_empty_when_disabled():
-    os.environ.pop("CHICKENNET_DECEPTION", None)
+    os.environ.pop("DUCKNET_DECEPTION", None)
     assert deception.headers_for("1.2.3.4") == []         # 既定オフ=何も付けない
 
 

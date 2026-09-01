@@ -1,5 +1,5 @@
 """
-admin.py — ChickenNet L7 Security 管理ダッシュボード(Web GUI・stdlib http.server)
+admin.py — DuckNet L7 Security 管理ダッシュボード(Web GUI・stdlib http.server)
 ====================================================================================
 中小企業のWeb担当者が『管理画面で攻撃をグラフ化・ON/OFFをクリック』できる製品UI。
 外部依存ゼロ(標準ライブラリのみ)。app_firewall + net_shield を1画面で操作・監視する。
@@ -28,7 +28,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 # 管理トークンを焼く Cookie 名。HttpOnly + SameSite=Strict で配るため、XSS では読めず
 # (HttpOnly)・クロスサイトからは送られない(SameSite=Strict=CSRF 緩和)。HTTP(localhost)
 # 運用のため Secure は付けない(HTTPS 終端を挟む場合は Secure も付与すること)。
-_COOKIE_NAME = "chickennet_admin"
+_COOKIE_NAME = "ducknet_admin"
 
 from dataplane.engine.lifeform.policy import app_firewall, ZONES, ACTIONS
 from dataplane.engine.lifeform.pipeline import net_shield
@@ -46,14 +46,14 @@ def _j(obj) -> bytes:
 
 def _metrics_exposition(sh) -> str:
     """NetShield の指標を plain-text 露出形式で出す(監視系のスクレイプ用・依存ゼロ)。
-    `# HELP`/`# TYPE` + `chickennet_<name>{label="v"} <int>`。ラベル値はサニタイズ(改行/引用符除去)。"""
+    `# HELP`/`# TYPE` + `ducknet_<name>{label="v"} <int>`。ラベル値はサニタイズ(改行/引用符除去)。"""
     m = sh.metrics()
     out = []
 
     def scalar(name, val, typ, help_):
-        out.append(f"# HELP chickennet_{name} {help_}")
-        out.append(f"# TYPE chickennet_{name} {typ}")
-        out.append(f"chickennet_{name} {val}")
+        out.append(f"# HELP ducknet_{name} {help_}")
+        out.append(f"# TYPE ducknet_{name} {typ}")
+        out.append(f"ducknet_{name} {val}")
 
     for key, name, h in (("requests", "requests_total", "Requests inspected"),
                          ("allow", "allow_total", "Allowed requests"),
@@ -73,11 +73,11 @@ def _metrics_exposition(sh) -> str:
     def labeled(name, d, label, help_):
         if not isinstance(d, dict) or not d:
             return
-        out.append(f"# HELP chickennet_{name} {help_}")
-        out.append(f"# TYPE chickennet_{name} counter")
+        out.append(f"# HELP ducknet_{name} {help_}")
+        out.append(f"# TYPE ducknet_{name} counter")
         for k, v in d.items():
             lv = str(k).replace("\\", "").replace('"', "").replace("\n", "")[:64]
-            out.append(f'chickennet_{name}{{{label}="{lv}"}} {int(v)}')
+            out.append(f'ducknet_{name}{{{label}="{lv}"}} {int(v)}')
 
     labeled("sig_hits_total", m.get("sig_hits"), "signature", "Signature hits by category")
     labeled("zone_hits_total", m.get("zone_hits"), "zone", "Requests by zone")
@@ -180,11 +180,11 @@ class AdminDashboard:
         self.token = token or secrets.token_urlsafe(24)
         # 画面の表示名/アイコン。ステルス運用では汎用名(例 "System Health Monitor")に
         # 差し替えて、管理画面のタイトル/ヘッダ/Server ヘッダから製品を伏せる。明示が無ければ
-        # CHICKENNET_COVER env を尊重し(遮断ページと同じ秘匿源=適用漏れを防ぐ)、無ければ製品名。
-        self.brand = brand or os.environ.get("CHICKENNET_COVER", "ChickenNet L7 Security")
+        # DUCKNET_COVER env を尊重し(遮断ページと同じ秘匿源=適用漏れを防ぐ)、無ければ製品名。
+        self.brand = brand or os.environ.get("DUCKNET_COVER", "DuckNet L7 Security")
         self.logo = logo
         self.subtitle = subtitle
-        # 検知ログの所在(別プロセスが書く)。CHICKENNET_STATE_DIR で移設可。テストは上書き可。
+        # 検知ログの所在(別プロセスが書く)。DUCKNET_STATE_DIR で移設可。テストは上書き可。
         self._state_dir = state_dir or default_state_dir()
         self._server = None
         self._thread = None
@@ -243,7 +243,7 @@ class AdminDashboard:
         return {"enabled": enabled, "families": list(dc._FAMILIES),
                 "family_count": len(dc._FAMILIES), "sample_seed": "203.0.113.1",
                 "preview": preview,
-                "note": "既定OFF。CHICKENNET_DECEPTION で有効化(本プロセスの env を反映)。"}
+                "note": "既定OFF。DUCKNET_DECEPTION で有効化(本プロセスの env を反映)。"}
 
     def start(self) -> dict:
         handler = _make_handler(self)
@@ -960,7 +960,7 @@ const JA2EN={
  "要求":"Requests","スロットル":"Throttle","ブロック":"Block","BAN中":"Banned","漏洩":"Leaks",
  "有効":"on","無効":"off","計":"total","種別":"types","系統":"families","前":"ago",
  "インターネット(public)を一括遮断します。よろしいですか?":"Block all public (internet) traffic. Are you sure?",
- "(CHICKENNET_DECEPTION 未設定 = 偽装なし)":"(CHICKENNET_DECEPTION unset = no deception)",
+ "(DUCKNET_DECEPTION 未設定 = 偽装なし)":"(DUCKNET_DECEPTION unset = no deception)",
  "サンプル攻撃者":"Sample attacker","から見える偽装(隣接窓で必ず別系統):":"sees this deception (adjacent windows always differ):",
  "残":"remaining ","組込":"built-in","カスタム":"custom","危険除外":"unsafe-excluded",
  "(兆候なし)":"(no indicators)","本機":"This host","失敗":"failed",
@@ -1365,7 +1365,7 @@ async function refreshDeception(){
  let d;try{d=await guardedFetch("/api/deception")}catch(e){if(isAuthFail(e))markAuthError();return}
  $("decepstat").innerHTML=`<span class="badge ${d.enabled?"info":"muted"}">${tr(d.enabled?"有効":"無効")}</span>`
    +` ${tr("系統")} ${d.family_count||0}`;
- if(!d.enabled){$("deception").textContent=tr("(CHICKENNET_DECEPTION 未設定 = 偽装なし)")+"\n"+tr("系統")+": "
+ if(!d.enabled){$("deception").textContent=tr("(DUCKNET_DECEPTION 未設定 = 偽装なし)")+"\n"+tr("系統")+": "
    +(d.families||[]).join(", ");return}
  const rows=(d.preview||[]).map(p=>
    `${LANG==="en"?"win":"窓"}+${p.window}: ${(p.server||"").padEnd(24)} [${p.family}]`+(p.companions.length?"  "+p.companions.join("  "):""));
@@ -1521,7 +1521,7 @@ async function rule(a,btn){
  postT("/api/firewall/rule",{net,action:a},btn,tr("ルールを追加しました"),tr("追加に失敗")).then(refresh);
 }
 async function edge(){const t=await (await fetch("/api/edge",{headers:H})).text();
- const u=URL.createObjectURL(new Blob([t]));const a=document.createElement("a");a.href=u;a.download="chickennet_edge.conf";a.click()}
+ const u=URL.createObjectURL(new Blob([t]));const a=document.createElement("a");a.href=u;a.download="ducknet_edge.conf";a.click()}
 /* CSV/JSON エクスポート: 既に取得済みの配列をそのままファイル化するだけ(追加取得なし)。 */
 function toCSV(rows,cols){
  const q=v=>{const s=v==null?"":String(v);return /[",\n]/.test(s)?'"'+s.replace(/"/g,'""')+'"':s;};

@@ -1,4 +1,4 @@
-ChickenNet L7 Security — Commercial License (template)
+DuckNet L7 Security — Commercial License (template)
 Copyright (c) 2026.
 
 本ソフトウェアの評価利用は許諾されます。商用の再配布・SaaS提供には別途

@@ -1,4 +1,4 @@
-"""tests/run_all.py — ChickenNet L7 Security 全テスト(依存ゼロ・pytest不要)。
+"""tests/run_all.py — DuckNet L7 Security 全テスト(依存ゼロ・pytest不要)。
 
 実行:
     python tests/run_all.py        # リポジトリ直下から
@@ -15,7 +15,7 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.dirname(_HERE)
 sys.path.insert(0, _ROOT)   # dataplane / dataplane.engine を import 可能に
 sys.path.insert(0, _HERE)   # test_*.py を import 可能に
-os.environ.setdefault("CHICKENNET_OFFLINE", "1")
+os.environ.setdefault("DUCKNET_OFFLINE", "1")
 
 MODULES = [
     "test_core",                # 管理ダッシュボード制御API

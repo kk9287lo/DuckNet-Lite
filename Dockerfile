@@ -1,22 +1,22 @@
-# ChickenNet L7 Security — 軽量セキュリティゲートウェイ(stdlib のみ=依存インストール不要)
+# DuckNet L7 Security — 軽量セキュリティゲートウェイ(stdlib のみ=依存インストール不要)
 FROM python:3.12-slim
 
-LABEL org.opencontainers.image.title="ChickenNet L7 Security" \
+LABEL org.opencontainers.image.title="DuckNet L7 Security" \
       org.opencontainers.image.description="Lightweight L7 DDoS/WAF security gateway (stdlib only, zero runtime deps)" \
       org.opencontainers.image.version="1.0.0" \
-      org.opencontainers.image.licenses="LicenseRef-ChickenNet-Commercial" \
-      org.opencontainers.image.source="https://example.com/chickennet"
+      org.opencontainers.image.licenses="LicenseRef-DuckNet-Commercial" \
+      org.opencontainers.image.source="https://example.com/ducknet"
 
 WORKDIR /app
 COPY . /app
 
-# 非root実行(セキュリティ製品として最小権限)。状態(~/.chickennet)は書込可能な HOME=/data へ。
-RUN useradd -r -u 10001 chickennet \
+# 非root実行(セキュリティ製品として最小権限)。状態(~/.ducknet)は書込可能な HOME=/data へ。
+RUN useradd -r -u 10001 ducknet \
     && mkdir -p /data \
-    && chown -R chickennet /app /data
-USER chickennet
+    && chown -R ducknet /app /data
+USER ducknet
 ENV HOME=/data \
-    CHICKENNET_OFFLINE=1 \
+    DUCKNET_OFFLINE=1 \
     PYTHONUNBUFFERED=1
 
 EXPOSE 8443 8081

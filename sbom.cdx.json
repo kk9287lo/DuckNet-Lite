@@ -9,22 +9,22 @@
       "components": [
         {
           "type": "application",
-          "name": "chickennet gen_sbom",
+          "name": "ducknet gen_sbom",
           "version": "1.3.0"
         }
       ]
     },
     "component": {
       "type": "application",
-      "bom-ref": "chickennet-security@1.3.0",
-      "name": "chickennet-security",
+      "bom-ref": "ducknet-security@1.3.0",
+      "name": "ducknet-security",
       "version": "1.3.0",
-      "purl": "pkg:pypi/chickennet-security@1.3.0",
+      "purl": "pkg:pypi/ducknet-security@1.3.0",
       "description": "Lightweight L7 DDoS/WAF security gateway (stdlib only, zero runtime dependencies).",
       "licenses": [
         {
           "license": {
-            "name": "ChickenNet L7 Security Commercial License"
+            "name": "DuckNet L7 Security Commercial License"
           }
         }
       ]
@@ -54,7 +54,7 @@
   ],
   "dependencies": [
     {
-      "ref": "chickennet-security@1.3.0",
+      "ref": "ducknet-security@1.3.0",
       "dependsOn": [
         "cpython"
       ]

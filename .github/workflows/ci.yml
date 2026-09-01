@@ -25,7 +25,7 @@ jobs:
           python-version: ${{ matrix.python }}
       - name: Run test suite (stdlib only, no install needed)
         env:
-          CHICKENNET_OFFLINE: "1"
+          DUCKNET_OFFLINE: "1"
         run: python tests/run_all.py
 
   build:
@@ -56,11 +56,11 @@ jobs:
         run: python -m twine check dist/*
       - name: Smoke-install the wheel and run the console script
         env:
-          CHICKENNET_OFFLINE: "1"
+          DUCKNET_OFFLINE: "1"
         run: |
           python -m venv /tmp/v
           /tmp/v/bin/python -m pip install dist/*.whl
-          /tmp/v/bin/chickennet-security --help
+          /tmp/v/bin/ducknet-security --help
       - uses: actions/upload-artifact@v4
         with:
           name: dist

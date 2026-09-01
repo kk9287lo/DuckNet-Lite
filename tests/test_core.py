@@ -1,5 +1,5 @@
 """
-test_dataplane.py — 製品(ChickenNet L7 Security)の管理ダッシュボード + 単独バンドル検証
+test_dataplane.py — 製品(DuckNet L7 Security)の管理ダッシュボード + 単独バンドル検証
 ====================================================================================
   · 管理ダッシュボード(Web GUI)の制御API: 状態取得・トークン保護・ON/OFF・ルール・
     ハニーポット・エッジ前衛設定DL が動く。
@@ -36,20 +36,20 @@ def _admin_with_temp(tmp):
 
 
 def test_dashboard_brand_honors_cover_env():
-    # ステルス適用漏れ防止: CHICKENNET_COVER だけで(--stealth 無しでも)ダッシュボードのブランド/
+    # ステルス適用漏れ防止: DUCKNET_COVER だけで(--stealth 無しでも)ダッシュボードのブランド/
     # タイトル/Server から製品名が消える(遮断ページと同じ秘匿源)。
     import os
     import tempfile
     with tempfile.TemporaryDirectory() as tmp:
         ofw, osh = FW._FW, ND._SHIELD
-        os.environ["CHICKENNET_COVER"] = "System Health Monitor"
+        os.environ["DUCKNET_COVER"] = "System Health Monitor"
         adm, url, token = _admin_with_temp(tmp)
         try:
             _, html = _req(url + "/")
             assert b"System Health Monitor" in html
-            assert b"ChickenNet" not in html          # 製品名が露見しない
+            assert b"DuckNet" not in html          # 製品名が露見しない
         finally:
-            os.environ.pop("CHICKENNET_COVER", None)
+            os.environ.pop("DUCKNET_COVER", None)
             adm.stop()
             FW._FW, ND._SHIELD = ofw, osh
 
@@ -70,7 +70,7 @@ def test_dashboard_state_and_token():
             assert "firewall" in st and "shield" in st and "capabilities" in st
             # HTML(ダッシュボード)はtoken不要で取得できる
             code, html = _req(url + "/")
-            assert code == 200 and b"ChickenNet L7 Security" in html
+            assert code == 200 and b"DuckNet L7 Security" in html
             # 総合ビューが論理セクションに整理されている(情報設計の回帰防止)
             assert html.count(b'class="sect"') == 6
             for label in ["概況", "脅威モニタリング", "WAF / 検知設定",
@@ -90,10 +90,10 @@ def test_dashboard_state_and_token():
             assert "connect-src 'self'" in (r.headers.get("Content-Security-Policy") or "")
             # トークンは HttpOnly + SameSite=Strict Cookie で配られる
             sc = r.headers.get("Set-Cookie") or ""
-            assert "chickennet_admin=" in sc and "HttpOnly" in sc and "SameSite=Strict" in sc
+            assert "ducknet_admin=" in sc and "HttpOnly" in sc and "SameSite=Strict" in sc
             # Cookie 認証でも通る(X-Token ヘッダ無し)
             req = urllib.request.Request(url + "/api/state",
-                                         headers={"Cookie": f"chickennet_admin={token}"})
+                                         headers={"Cookie": f"ducknet_admin={token}"})
             assert urllib.request.urlopen(req, timeout=5).status == 200
         finally:
             adm.stop()
@@ -111,11 +111,11 @@ def test_dashboard_deception_status_visualization():
             # HTML にパネル
             assert b'id="deception"' in _req(url + "/")[1] and "デセプション".encode() in _req(url + "/")[1]
             # 無効(既定)
-            os.environ.pop("CHICKENNET_DECEPTION", None)
+            os.environ.pop("DUCKNET_DECEPTION", None)
             d = json.loads(_req(url + "/api/deception", token=token)[1])
             assert d["enabled"] is False and d["preview"] == [] and d["family_count"] == 8
             # 有効化 → プレビュー4窓、隣接窓は必ず別系統(MTD)
-            os.environ["CHICKENNET_DECEPTION"] = "1"
+            os.environ["DUCKNET_DECEPTION"] = "1"
             try:
                 d = json.loads(_req(url + "/api/deception", token=token)[1])
                 assert d["enabled"] is True and len(d["preview"]) == 4
@@ -125,7 +125,7 @@ def test_dashboard_deception_status_visualization():
                 from dataplane.engine.services import banner as DC
                 assert all(p["server"] in DC._SERVERS for p in d["preview"])
             finally:
-                os.environ.pop("CHICKENNET_DECEPTION", None)
+                os.environ.pop("DUCKNET_DECEPTION", None)
         finally:
             adm.stop()
             FW._FW, ND._SHIELD = ofw, osh
@@ -431,7 +431,7 @@ def test_admin_token_cookie_not_handed_to_unauth_remote():
             # 回帰: localhost からの GET / は従来どおり Cookie を受け取れる(管理UXは不変)
             r = urllib.request.urlopen(url + "/", timeout=5)
             cookies = [v for (k, v) in r.getheaders() if k.lower() == "set-cookie"]
-            assert any("chickennet_admin=" in c for c in cookies)
+            assert any("ducknet_admin=" in c for c in cookies)
         finally:
             adm.stop()
             FW._FW, ND._SHIELD = ofw, osh
@@ -450,17 +450,17 @@ def test_metrics_exposition_endpoint():
             code, body = _req(url + "/api/metrics", token=token)
             assert code == 200
             text = body.decode()
-            assert "# TYPE chickennet_requests_total counter" in text
-            assert "chickennet_requests_total " in text
-            assert "chickennet_shield_enabled 1" in text
-            assert "chickennet_paranoia_level 1" in text
+            assert "# TYPE ducknet_requests_total counter" in text
+            assert "ducknet_requests_total " in text
+            assert "ducknet_shield_enabled 1" in text
+            assert "ducknet_paranoia_level 1" in text
             # #25 サブネット集約防御の観測性(#28 で露出)
-            assert "# TYPE chickennet_subnet_flag_total counter" in text
-            assert "chickennet_hot_subnets 0" in text and "chickennet_tracked_subnets 0" in text
+            assert "# TYPE ducknet_subnet_flag_total counter" in text
+            assert "ducknet_hot_subnets 0" in text and "ducknet_tracked_subnets 0" in text
             # シグネチャヒットはラベル付きカウンタで出る
             ND._SHIELD.inspect("203.0.113.6", path="/", query="1 union select a from b")
             text2 = _req(url + "/api/metrics", token=token)[1].decode()
-            assert 'chickennet_sig_hits_total{signature="sqli"}' in text2
+            assert 'ducknet_sig_hits_total{signature="sqli"}' in text2
         finally:
             adm.stop()
             FW._FW, ND._SHIELD = ofw, osh
@@ -625,14 +625,14 @@ def test_custom_decoder_seam_for_proprietary_encoding():
 
 
 def test_server_i18n_block_page_ja_en():
-    # i18n 続行: サーバ生成の遮断ページを CHICKENNET_LANG(ja|en)で切替(end-user 向け多言語)。
+    # i18n 続行: サーバ生成の遮断ページを DUCKNET_LANG(ja|en)で切替(end-user 向け多言語)。
     import os
     from dataplane.engine.core import i18n
     from dataplane.engine.services.proxy import _block_page
     info = {"appeal_available": True, "remain_sec": 120, "appeal_after_sec": 60}
     _orig_loc = i18n._locale_lang
     try:
-        os.environ.pop("CHICKENNET_LANG", None)
+        os.environ.pop("DUCKNET_LANG", None)
         i18n._locale_lang = lambda: ""        # #84: ロケール非依存にして検証(env無し→既定 ja)
         assert i18n.lang() == "ja"
         ja = _block_page(info).decode("utf-8")
@@ -640,7 +640,7 @@ def test_server_i18n_block_page_ja_en():
         i18n._locale_lang = lambda: "en"      # 英語ロケールなら env 無しでも自動 en
         assert i18n.lang() == "en"
         i18n._locale_lang = _orig_loc
-        os.environ["CHICKENNET_LANG"] = "en"
+        os.environ["DUCKNET_LANG"] = "en"
         assert i18n.lang() == "en"
         en = _block_page(info).decode("utf-8")
         assert "lang='en'" in en and "Request unblock" in en
@@ -651,7 +651,7 @@ def test_server_i18n_block_page_ja_en():
         # 未登録 key は ja フォールバック
         assert i18n.t("nope.key", lang_="en") == "nope.key"
     finally:
-        os.environ.pop("CHICKENNET_LANG", None)
+        os.environ.pop("DUCKNET_LANG", None)
         i18n._locale_lang = _orig_loc
 
 

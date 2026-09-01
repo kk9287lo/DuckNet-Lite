@@ -22,8 +22,8 @@ def test_quote_handles_spaces():
 
 
 def test_schtasks_args_are_standard_and_named():
-    args = A.schtasks_create_args("ChickenNet", 'python -m dataplane', "onstart")
-    assert args[:5] == ["schtasks", "/create", "/tn", "ChickenNet", "/tr"]
+    args = A.schtasks_create_args("DuckNet", 'python -m dataplane', "onstart")
+    assert args[:5] == ["schtasks", "/create", "/tn", "DuckNet", "/tr"]
     assert "/sc" in args and "ONSTART" in args and "/rl" in args and "limited" in args
     # onlogon(既定)
     assert "ONLOGON" in A.schtasks_create_args("X", "c", "onlogon")
@@ -41,9 +41,9 @@ def test_install_windows_task_uses_injected_runner():
         calls["args"] = args
         return _R()
 
-    r = A.install_windows_task("ChickenNet", ["python", "-m", "dataplane", "--listen", "8443"],
+    r = A.install_windows_task("DuckNet", ["python", "-m", "dataplane", "--listen", "8443"],
                                trigger="onlogon", run=fake_run)
-    assert r["ok"] and r["method"] == "schtasks" and r["name"] == "ChickenNet"
+    assert r["ok"] and r["method"] == "schtasks" and r["name"] == "DuckNet"
     assert calls["args"][0] == "schtasks" and "/create" in calls["args"]
 
 
@@ -65,20 +65,20 @@ def test_install_windows_runkey_uses_standard_location():
         def CloseKey(self, key):
             pass
 
-    r = A.install_windows_runkey("ChickenNet", ["python", "-m", "dataplane"], winreg_mod=_FakeWR())
+    r = A.install_windows_runkey("DuckNet", ["python", "-m", "dataplane"], winreg_mod=_FakeWR())
     assert r["ok"]
     assert writes["sub"] == r"Software\Microsoft\Windows\CurrentVersion\Run"   # 標準の場所のみ
-    assert writes["name"] == "ChickenNet" and "dataplane" in writes["val"]
+    assert writes["name"] == "DuckNet" and "dataplane" in writes["val"]
 
 
 def test_systemd_unit_text_has_restart_and_hardening():
-    u = A.systemd_unit_text(["python", "-m", "dataplane", "--listen", "8443"], user="chickennet")
+    u = A.systemd_unit_text(["python", "-m", "dataplane", "--listen", "8443"], user="ducknet")
     assert "Restart=on-failure" in u and "StartLimitBurst=5" in u
-    assert "User=chickennet" in u and "ExecStart=" in u and "WantedBy=multi-user.target" in u
+    assert "User=ducknet" in u and "ExecStart=" in u and "WantedBy=multi-user.target" in u
 
 
 def test_launchd_plist_text_keepalive():
-    p = A.launchd_plist_text("com.chickennet.x", ["python", "-m", "dataplane"])
+    p = A.launchd_plist_text("com.ducknet.x", ["python", "-m", "dataplane"])
     assert "<key>KeepAlive</key>" in p and "<key>RunAtLoad</key>" in p
     assert "<string>python</string>" in p
 
@@ -101,10 +101,10 @@ def test_install_dispatch_non_windows_returns_unit(monkeypatch=None):
     orig = sys.platform
     try:
         sys.platform = "linux"
-        r = A.install(["--listen", "8443"], name="ChickenNet")
+        r = A.install(["--listen", "8443"], name="DuckNet")
         assert r["method"] == "systemd" and "Restart=on-failure" in r["unit"]
         sys.platform = "darwin"
-        r = A.install(["--listen", "8443"], name="ChickenNet")
+        r = A.install(["--listen", "8443"], name="DuckNet")
         assert r["method"] == "launchd" and "KeepAlive" in r["plist"]
     finally:
         sys.platform = orig

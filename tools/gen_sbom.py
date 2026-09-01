@@ -1,5 +1,5 @@
 """
-gen_sbom.py — ChickenNet L7 Security の SBOM(CycloneDX 1.5)を生成する。
+gen_sbom.py — DuckNet L7 Security の SBOM(CycloneDX 1.5)を生成する。
 ====================================================================================
 依存ゼロ(stdlib のみ)で再実行可能。出力: リポジトリ直下 `sbom.cdx.json`。
 B2B/エンタープライズ調達で要求される機械可読の部品表(SBOM)を提供する。
@@ -34,7 +34,7 @@ def _read_version() -> str:
 
 def build_sbom() -> dict:
     ver = _read_version()
-    app_ref = f"chickennet-security@{ver}"
+    app_ref = f"ducknet-security@{ver}"
     # 再現可能にする(同じ入力→同じ出力):
     #   · serialNumber は version から決定的に導出(uuid5)。
     #   · timestamp は SOURCE_DATE_EPOCH があればそれを使う(無ければ生成時刻)。
@@ -42,7 +42,7 @@ def build_sbom() -> dict:
     when = (datetime.datetime.fromtimestamp(int(epoch), datetime.timezone.utc)
             if epoch else datetime.datetime.now(datetime.timezone.utc))
     now = when.strftime("%Y-%m-%dT%H:%M:%SZ")
-    serial = uuid.uuid5(uuid.NAMESPACE_URL, f"chickennet-security@{ver}")
+    serial = uuid.uuid5(uuid.NAMESPACE_URL, f"ducknet-security@{ver}")
     return {
         "bomFormat": "CycloneDX",
         "specVersion": "1.5",
@@ -51,18 +51,18 @@ def build_sbom() -> dict:
         "metadata": {
             "timestamp": now,
             "tools": {"components": [
-                {"type": "application", "name": "chickennet gen_sbom",
+                {"type": "application", "name": "ducknet gen_sbom",
                  "version": ver}]},
             "component": {
                 "type": "application",
                 "bom-ref": app_ref,
-                "name": "chickennet-security",
+                "name": "ducknet-security",
                 "version": ver,
-                "purl": f"pkg:pypi/chickennet-security@{ver}",
+                "purl": f"pkg:pypi/ducknet-security@{ver}",
                 "description": ("Lightweight L7 DDoS/WAF security gateway "
                                 "(stdlib only, zero runtime dependencies)."),
                 "licenses": [{"license": {
-                    "name": "ChickenNet L7 Security Commercial License"}}],
+                    "name": "DuckNet L7 Security Commercial License"}}],
             },
         },
         # 配布物に同梱する第三者ライブラリは無い。実行環境(Python)のみ列挙。
@@ -93,7 +93,7 @@ def main() -> int:
         f.write("\n")
     print(f"SBOM 生成: {out}")
     print(f"  format=CycloneDX {sbom['specVersion']}  "
-          f"app=chickennet-security@{sbom['metadata']['component']['version']}  "
+          f"app=ducknet-security@{sbom['metadata']['component']['version']}  "
           f"components={len(sbom['components'])}")
     return 0
 

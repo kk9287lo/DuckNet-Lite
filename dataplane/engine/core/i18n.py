@@ -2,7 +2,7 @@
 i18n.py — サーバ側の最小多言語(日本語/英語)。依存ゼロ。
 ====================================================================================
 ダッシュボードはクライアント JS で日英を切替えるが、サーバが生成する文言(遮断ページ・CLI
-出力等)は env `CHICKENNET_LANG`(ja|en、既定 ja)で言語を選ぶ。文言は key→{ja,en} のカタログ。
+出力等)は env `DUCKNET_LANG`(ja|en、既定 ja)で言語を選ぶ。文言は key→{ja,en} のカタログ。
 正直: 翻訳は主要文言のみ。未登録 key は ja(無ければ key 自身)へフォールバック。
 """
 from __future__ import annotations
@@ -30,9 +30,9 @@ def _locale_lang() -> str:
 
 
 def lang() -> str:
-    """現在のサーバ言語。優先順: ① env CHICKENNET_LANG(明示・en* で英語)② OS ロケール(英語なら en)
+    """現在のサーバ言語。優先順: ① env DUCKNET_LANG(明示・en* で英語)② OS ロケール(英語なら en)
     ③ 既定 ja(製品の主言語=日本語環境に最適化、不明時も ja)。英語環境は env 無しでも自動で en。"""
-    v = os.environ.get("CHICKENNET_LANG", "").strip().lower()
+    v = os.environ.get("DUCKNET_LANG", "").strip().lower()
     if v:
         return "en" if v.startswith("en") else "ja"
     return _locale_lang() or "ja"

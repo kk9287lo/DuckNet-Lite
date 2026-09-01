@@ -1,11 +1,11 @@
 # 防御リファレンス — 機能 / 設定キー / 既定値
 
-ChickenNet L7 の防御と、それを制御する設定キー(`NetShield.cfg` / 管理API `/api/shield/config` /
+DuckNet L7 の防御と、それを制御する設定キー(`NetShield.cfg` / 管理API `/api/shield/config` /
 宣言的設定 JSON で変更可)。**既定ON** は配備直後から効く低誤検知のもの。**opt-in** は配備依存・
 誤検知リスクがあるため有効化が必要なもの。
 
 > 設定例(管理API): `POST /api/shield/config {"sec_headers_enabled": true}`
-> または宣言的設定ファイル(`--config config.json` / `CHICKENNET_CONFIG`)。
+> または宣言的設定ファイル(`--config config.json` / `DUCKNET_CONFIG`)。
 
 ## リクエスト検査
 
@@ -57,7 +57,7 @@ ChickenNet L7 の防御と、それを制御する設定キー(`NetShield.cfg` /
 ## 自己防衛 / 改竄耐性
 
 [docs/hardening.md](hardening.md) を参照(状態 HMAC 署名・自動起動登録・OS 公認の
-クラッシュ自動再起動・ハードニング)。関連環境変数: `CHICKENNET_STATE_KEY`(外部署名鍵)。
+クラッシュ自動再起動・ハードニング)。関連環境変数: `DUCKNET_STATE_KEY`(外部署名鍵)。
 
 ## 段階導入の勧め
 1. 既定ON のまま **監査**(`mode=audit`)で運用し誤検知を観察。

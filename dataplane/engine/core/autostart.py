@@ -1,7 +1,7 @@
 """
 autostart.py — 起動時自動起動の登録(透明・OS 公認の場所のみ・標準ライブラリ)
 ====================================================================================
-ブート/ログオン時に ChickenNet を自動起動する設定を *透明な* 仕組みで登録する。
+ブート/ログオン時に DuckNet を自動起動する設定を *透明な* 仕組みで登録する。
 
   · Windows … タスクスケジューラ(schtasks・明示名)/ 標準 Run キー
     (HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run)。
@@ -107,8 +107,8 @@ def install_windows_runkey(name, command, *, winreg_mod=None) -> dict:
 
 
 # ── Linux: systemd / macOS: launchd(ユニット文の生成=純粋) ───────────────
-def systemd_unit_text(command, *, user: str = "chickennet",
-                      description: str = "ChickenNet L7 Security") -> str:
+def systemd_unit_text(command, *, user: str = "ducknet",
+                      description: str = "DuckNet L7 Security") -> str:
     exec_start = _quote(command)
     return (
         "[Unit]\n"
@@ -136,7 +136,7 @@ def launchd_plist_text(label, command) -> str:
         "</dict></plist>\n")
 
 
-def install(args, *, method: str = "auto", name: str = "ChickenNet",
+def install(args, *, method: str = "auto", name: str = "DuckNet",
             trigger: str = "onlogon") -> dict:
     """プラットフォームに応じて自動起動を登録/案内する。Windows は実登録(schtasks/runkey)、
     Linux/macOS は unit/plist テキストと配置先を返す(#56 docs/hardening.md に沿って有効化)。"""
@@ -154,7 +154,7 @@ def install(args, *, method: str = "auto", name: str = "ChickenNet",
                 "enable": f"systemctl daemon-reload && systemctl enable --now {name.lower()}",
                 "note": "ユニットを書き出して systemctl enable で有効化(docs/hardening.md §2)"}
     if plat == "darwin":
-        label = f"com.chickennet.{name.lower()}"
+        label = f"com.ducknet.{name.lower()}"
         return {"ok": True, "method": "launchd", "action": "manual",
                 "plist_path": f"/Library/LaunchDaemons/{label}.plist",
                 "plist": launchd_plist_text(label, command),
@@ -163,7 +163,7 @@ def install(args, *, method: str = "auto", name: str = "ChickenNet",
     return {"ok": False, "error": f"unsupported platform: {plat}"}
 
 
-def uninstall(*, method: str = "auto", name: str = "ChickenNet") -> dict:
+def uninstall(*, method: str = "auto", name: str = "DuckNet") -> dict:
     plat = sys.platform
     if plat.startswith("win"):
         if method == "runkey":

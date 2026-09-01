@@ -69,7 +69,7 @@ def test_origin_token_injected_end_to_end():
     from dataplane.engine.lifeform.pipeline import net_shield
     sh = net_shield()
     saved = {k: sh.cfg.get(k) for k in ("origin_cloaking_enabled", "origin_header")}
-    os.environ["CHICKENNET_ORIGIN_KEY"] = "shared-edge-key"
+    os.environ["DUCKNET_ORIGIN_KEY"] = "shared-edge-key"
     sh.cfg["origin_cloaking_enabled"] = True
     sh.cfg["origin_header"] = "X-Edge-Token"
     try:
@@ -101,4 +101,4 @@ def test_origin_token_injected_end_to_end():
             g.stop()
     finally:
         sh.cfg.update(saved)
-        os.environ.pop("CHICKENNET_ORIGIN_KEY", None)
+        os.environ.pop("DUCKNET_ORIGIN_KEY", None)

@@ -16,7 +16,7 @@ blocklist.json を書き換えて自分を unban したり、rules.json を空�
 
 鍵は再起動を跨ぐ必要があるため永続化する(env 推奨、無ければ state_dir に 0600 で生成保存)。
 正直な信頼境界: 鍵が状態ファイルと同じディスクにある場合、root 攻撃者は鍵も読めて再署名し得る
-=完全な保護には外部鍵(env/HSM/別権限)が要る。env CHICKENNET_STATE_KEY 指定でその水準へ上げられる。
+=完全な保護には外部鍵(env/HSM/別権限)が要る。env DUCKNET_STATE_KEY 指定でその水準へ上げられる。
 """
 from __future__ import annotations
 
@@ -39,7 +39,7 @@ _MEM_HW: dict = {}
 _O_BIN = getattr(os, "O_BINARY", 0)
 
 
-def persistent_key(state_dir: str, env_var: str = "CHICKENNET_STATE_KEY",
+def persistent_key(state_dir: str, env_var: str = "DUCKNET_STATE_KEY",
                    filename: str = ".statekey") -> bytes:
     """状態署名用の永続鍵。env_var があればそれを使う(最も安全=外部鍵)。無ければ
     state_dir/filename を 0600 で生成保存して再利用する(再起動を跨いで検証できるように)。

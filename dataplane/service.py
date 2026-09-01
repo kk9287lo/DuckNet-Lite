@@ -1,5 +1,5 @@
 """
-service.py — ChickenNet L7 Security スタンドアロン・サービス本体(CLI/起動エントリ)
+service.py — DuckNet L7 Security スタンドアロン・サービス本体(CLI/起動エントリ)
 ====================================================================================
 『あなたのWebサーバの手前にポン置きするだけで DDoS / WAF 防御が完了する』軽量プロキシ。
 外部依存ゼロ(標準ライブラリのみ)・OS非侵襲・防御専用。
@@ -109,9 +109,9 @@ def run(backend: str = "127.0.0.1:8080", listen: int = 8443,
         app_firewall().enable()
         net_shield().enable()
 
-    # 宣言的設定ブートストラップ(env CHICKENNET_CONFIG / --config): 運用者の JSON を起動時に適用。
+    # 宣言的設定ブートストラップ(env DUCKNET_CONFIG / --config): 運用者の JSON を起動時に適用。
     # k8s ConfigMap 等の immutable infra 向け(永続 state より後＝宣言ファイルが権威)。
-    _cfg_path = config_path or _os.environ.get("CHICKENNET_CONFIG", "")
+    _cfg_path = config_path or _os.environ.get("DUCKNET_CONFIG", "")
     if _cfg_path:
         _res = net_shield().apply_config_file(_cfg_path)
         if _res.get("ok"):
@@ -122,7 +122,7 @@ def run(backend: str = "127.0.0.1:8080", listen: int = 8443,
     admin = AdminDashboard(host=admin_host, port=admin_port, token=token)
     a = admin.start()
     print("=" * 64)
-    print(" ChickenNet L7 Security — セキュリティゲートウェイ 起動")
+    print(" DuckNet L7 Security — セキュリティゲートウェイ 起動")
     print("=" * 64)
     print(f" 管理ダッシュボード : {a['url']}")
     print(f" 管理トークン       : {a['token']}")
@@ -152,7 +152,7 @@ def run(backend: str = "127.0.0.1:8080", listen: int = 8443,
     # WAF 状態(BAN/累犯回数)も flush=再起動越しのエスカレーション記憶を取りこぼさない。
     _block_until_shutdown(lambda: guard.stop(grace=drain_grace), admin.stop,
                           net_shield().flush_state)
-    print("\nChickenNet L7 Security を停止しました。")
+    print("\nDuckNet L7 Security を停止しました。")
 
 
 def _strip_autostart_flags(raw) -> list:
@@ -183,8 +183,8 @@ def _strip_autostart_flags(raw) -> list:
 def main(argv=None) -> int:
     _force_utf8_stdio()
     ap = argparse.ArgumentParser(
-        prog="chickennet-security",
-        description="ChickenNet L7 Security — 軽量 DDoS/WAF セキュリティゲートウェイ(L7・依存ゼロ)")
+        prog="ducknet-security",
+        description="DuckNet L7 Security — 軽量 DDoS/WAF セキュリティゲートウェイ(L7・依存ゼロ)")
     ap.add_argument("--backend", default="127.0.0.1:8080",
                     help="守る対象(あなたのWebサーバ) HOST:PORT")
     ap.add_argument("--listen", type=int, default=8443, help="前衛ガードの待受ポート")
@@ -199,15 +199,15 @@ def main(argv=None) -> int:
                     help="起動時に防御を自動ONにしない")
     ap.add_argument("--health-path", default="", metavar="PATH",
                     help="死活監視用パス(例 /healthz)。一致リクエストは WAF/バックエンド非経由で"
-                         "即200を返す。LB/オーケストレータ用。既定OFF(env CHICKENNET_HEALTH_PATH 可)")
+                         "即200を返す。LB/オーケストレータ用。既定OFF(env DUCKNET_HEALTH_PATH 可)")
     import os as _os
     ap.add_argument("--drain-grace", type=float, metavar="SEC",
-                    default=float(_os.environ.get("CHICKENNET_DRAIN_GRACE", "5") or 0),
+                    default=float(_os.environ.get("DUCKNET_DRAIN_GRACE", "5") or 0),
                     help="停止(SIGTERM/SIGINT)時に進行中リクエストを捌く最大秒数。"
-                         "0=即時停止。既定5(env CHICKENNET_DRAIN_GRACE 可)")
+                         "0=即時停止。既定5(env DUCKNET_DRAIN_GRACE 可)")
     ap.add_argument("--config", default="", metavar="PATH",
                     help="起動時に適用する宣言的設定 JSON(WAFルール等)。k8s ConfigMap 等の"
-                         "immutable infra 向け=永続 state より後に適用(env CHICKENNET_CONFIG 可)")
+                         "immutable infra 向け=永続 state より後に適用(env DUCKNET_CONFIG 可)")
     ap.add_argument("--install-autostart", nargs="?", const="onlogon", default="",
                     metavar="TRIGGER", choices=["", "onlogon", "onstart", "runkey"],
                     help="起動時自動起動を *透明な公認の場所* に登録: Windows=タスクスケジューラ"
@@ -215,8 +215,8 @@ def main(argv=None) -> int:
                          "mac=launchd。Autoruns/Task Scheduler/systemctl で可視。隠し永続化はしない。")
     ap.add_argument("--uninstall-autostart", action="store_true",
                     help="--install-autostart で登録した自動起動を解除する。")
-    ap.add_argument("--autostart-name", default="ChickenNet", metavar="NAME",
-                    help="自動起動エントリの表示名(既定 ChickenNet)。")
+    ap.add_argument("--autostart-name", default="DuckNet", metavar="NAME",
+                    help="自動起動エントリの表示名(既定 DuckNet)。")
     a = ap.parse_args(argv)
     # 自動起動の登録/解除(#58): 透明な公認の場所のみ。登録したら即終了(常駐はしない)。
     if a.uninstall_autostart:

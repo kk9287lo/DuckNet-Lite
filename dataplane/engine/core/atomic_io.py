@@ -26,10 +26,10 @@ _MAX_READ_BYTES = 64 * 1024 * 1024   # 状態JSONの読込上限(#111: 書込権
 
 
 def default_state_dir() -> str:
-    """状態ファイルの既定の置き場。環境変数 CHICKENNET_STATE_DIR で上書きできる
+    """状態ファイルの既定の置き場。環境変数 DUCKNET_STATE_DIR で上書きできる
     (ステルス運用で『どこに何を書くか』を秘匿/移設するための一点)。既定は ~/.cache/dataplane
     (ありふれたアプリのキャッシュ置き場に偽装=ブランド名を露出しない)。"""
-    return (os.environ.get("CHICKENNET_STATE_DIR")
+    return (os.environ.get("DUCKNET_STATE_DIR")
             or os.path.join(os.path.expanduser("~"), ".cache", "dataplane"))
 
 

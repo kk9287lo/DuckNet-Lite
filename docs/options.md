@@ -1,6 +1,6 @@
 # オプション一覧(環境変数 / 設定キー)— v1.2.0
 
-ChickenNet の挙動は **CLI 引数**・**環境変数**・**設定キー(cfg)** で制御します。設定キーは管理
+DuckNet の挙動は **CLI 引数**・**環境変数**・**設定キー(cfg)** で制御します。設定キーは管理
 ダッシュボード / 宣言的ブートストラップ(JSON)から変更でき、`NetShield._DEFAULTS`
 が唯一の真実です。防御の詳細・既定値(ON / opt-in)は [defenses.md](defenses.md) を参照。
 
@@ -8,12 +8,12 @@ ChickenNet の挙動は **CLI 引数**・**環境変数**・**設定キー(cfg)*
 
 | 変数 | 既定 | 説明 |
 | --- | --- | --- |
-| `CHICKENNET_LANG` | (自動) | サーバ生成文言の言語 `ja`/`en`。未設定なら OS ロケールに追随(英語環境は自動 en、それ以外 ja)。 |
-| `CHICKENNET_STATE_DIR` | OS 既定 | 状態ファイル(BAN/設定/署名/テレメトリ)の保存先。 |
-| `CHICKENNET_STATE_KEY` | (生成) | 状態ファイル署名の HMAC 鍵。**外部鍵推奨**(未設定時は state_dir に 0600 で生成=同ディスク root には弱い)。 |
-| `CHICKENNET_OFFLINE` | (空) | 外部接続を一切しない(テスト/隔離環境)。 |
-| `CHICKENNET_DRAIN_TIMEOUT` | `60` | 応答転送の書込み(drain)デッドライン秒(#9 slow-read/zero-window 対策)。 |
-| `CHICKENNET_HEALTH_PATH` | (空) | LB 死活監視用に即 200 を返す予約パス(WAF/バックエンド非経由)。 |
+| `DUCKNET_LANG` | (自動) | サーバ生成文言の言語 `ja`/`en`。未設定なら OS ロケールに追随(英語環境は自動 en、それ以外 ja)。 |
+| `DUCKNET_STATE_DIR` | OS 既定 | 状態ファイル(BAN/設定/署名/テレメトリ)の保存先。 |
+| `DUCKNET_STATE_KEY` | (生成) | 状態ファイル署名の HMAC 鍵。**外部鍵推奨**(未設定時は state_dir に 0600 で生成=同ディスク root には弱い)。 |
+| `DUCKNET_OFFLINE` | (空) | 外部接続を一切しない(テスト/隔離環境)。 |
+| `DUCKNET_DRAIN_TIMEOUT` | `60` | 応答転送の書込み(drain)デッドライン秒(#9 slow-read/zero-window 対策)。 |
+| `DUCKNET_HEALTH_PATH` | (空) | LB 死活監視用に即 200 を返す予約パス(WAF/バックエンド非経由)。 |
 
 ## 主な設定キー(cfg)
 

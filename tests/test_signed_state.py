@@ -16,11 +16,11 @@ from dataplane.engine.core.signed_state import (
 
 def test_persistent_key_env_and_generated():
     with tempfile.TemporaryDirectory() as d:
-        os.environ["CHICKENNET_STATE_KEY"] = "envkey"
+        os.environ["DUCKNET_STATE_KEY"] = "envkey"
         try:
             assert persistent_key(d) == b"envkey"
         finally:
-            del os.environ["CHICKENNET_STATE_KEY"]
+            del os.environ["DUCKNET_STATE_KEY"]
         k1 = persistent_key(d)                       # 生成+永続
         k2 = persistent_key(d)                       # 同ディレクトリ=同じ鍵(再起動跨ぎ検証可)
         assert k1 == k2 and len(k1) == 32
