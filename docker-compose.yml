@@ -7,9 +7,9 @@
 # =============================================================================
 services:
   # 前衛ゲートウェイ(HTTP の L7 DDoS/WAF) + 管理ダッシュボード
-  ducknet-security:
+  ducknet-lite:
     build: .
-    image: ducknet-security:1.0.0
+    image: ducknet-lite:1.3.0
     restart: unless-stopped
     environment:
       - DUCKNET_OFFLINE=1

@@ -1,10 +1,10 @@
 {
   "bomFormat": "CycloneDX",
   "specVersion": "1.5",
-  "serialNumber": "urn:uuid:68a00ddf-37da-5100-99f4-7c0c6245d375",
+  "serialNumber": "urn:uuid:336ac3b2-eed3-59a6-8a98-22bd333e29e9",
   "version": 1,
   "metadata": {
-    "timestamp": "2026-09-01T23:04:35Z",
+    "timestamp": "2026-09-02T23:16:59Z",
     "tools": {
       "components": [
         {
@@ -16,11 +16,11 @@
     },
     "component": {
       "type": "application",
-      "bom-ref": "ducknet-security@1.3.0",
-      "name": "ducknet-security",
+      "bom-ref": "ducknet-lite@1.3.0",
+      "name": "ducknet-lite",
       "version": "1.3.0",
-      "purl": "pkg:pypi/ducknet-security@1.3.0",
-      "description": "Lightweight L7 DDoS/WAF security gateway (stdlib only, zero runtime dependencies).",
+      "purl": "pkg:pypi/ducknet-lite@1.3.0",
+      "description": "Lightweight L7 DDoS/WAF security gateway — free AGPL edition (core WAF/DDoS, feature-limited; stdlib only, zero runtime dependencies).",
       "licenses": [
         {
           "license": {
@@ -54,7 +54,7 @@
   ],
   "dependencies": [
     {
-      "ref": "ducknet-security@1.3.0",
+      "ref": "ducknet-lite@1.3.0",
       "dependsOn": [
         "cpython"
       ]

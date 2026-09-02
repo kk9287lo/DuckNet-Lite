@@ -190,7 +190,7 @@ def main(argv=None) -> int:
         from .gui.__main__ import main as _tray_main
         return _tray_main(args[1:])
     ap = argparse.ArgumentParser(
-        prog="ducknet-security",
+        prog="ducknet-lite",
         description="DuckNet L7 Security — 軽量 DDoS/WAF セキュリティゲートウェイ(L7・依存ゼロ)")
     ap.add_argument("--backend", default="127.0.0.1:8080",
                     help="守る対象(あなたのWebサーバ) HOST:PORT")

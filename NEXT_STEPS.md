@@ -1,6 +1,6 @@
 # DuckNet-Lite — 次にやること(引き継ぎメモ)
 
-このリポジトリ(`D:\DuckNet-Lite`)は **DuckNet L7 Security の free / trial エディション**の
+このリポジトリ(`D:\DuckNet-Lite`)は **DuckNet L7 Security の無償(AGPL)エディション**の
 独立フォークです(防御エンジンは `dataplane/engine/` 配下に同梱、外部依存ゼロ)。上位(商用)
 エディションから5回の縮小パスを経て、コアの L7 WAF/DDoS リバースプロキシ・エンジン + 最小限の
 Web 管理ダッシュボードだけを残した構成になっています。詳細な削除履歴は
@@ -67,8 +67,9 @@ Web 管理ダッシュボードだけを残した構成になっています。�
 
 ## 未検証 / 次にやること(正直な但し書き)
 
-- **実際の PyPI / Docker Hub 公開は未実施**(このフォーク向けの公開パイプラインが要るかどうかも
-  未決定=上位エディションと別ブランドで出すのか、free/trial 明記のまま同名で出すのか要判断)。
+- **実際の PyPI / Docker Hub 公開は未実施**(公開パイプラインの要否は未決定)。配布名は
+  フル版(`ducknet-security`)と衝突しないよう **`ducknet-lite`** へ確定済み(pyproject の name / console script /
+  docker image / SBOM に反映)。モジュール名は両版とも `dataplane` のままで、`python -m dataplane` の起動手順は不変。
 - **この作業ツリーの git コミット**: 3回分の縮小差分が未コミット(ユーザーがレビュー後に自分で
   コミットする方針。エージェントは実行しない)。
 - **Docker の実ビルド確認は未実施**(この環境に docker 無し)。`docker build .` での動作確認と、

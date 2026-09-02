@@ -34,7 +34,7 @@ def _read_version() -> str:
 
 def build_sbom() -> dict:
     ver = _read_version()
-    app_ref = f"ducknet-security@{ver}"
+    app_ref = f"ducknet-lite@{ver}"
     # 再現可能にする(同じ入力→同じ出力):
     #   · serialNumber は version から決定的に導出(uuid5)。
     #   · timestamp は SOURCE_DATE_EPOCH があればそれを使う(無ければ生成時刻)。
@@ -42,7 +42,7 @@ def build_sbom() -> dict:
     when = (datetime.datetime.fromtimestamp(int(epoch), datetime.timezone.utc)
             if epoch else datetime.datetime.now(datetime.timezone.utc))
     now = when.strftime("%Y-%m-%dT%H:%M:%SZ")
-    serial = uuid.uuid5(uuid.NAMESPACE_URL, f"ducknet-security@{ver}")
+    serial = uuid.uuid5(uuid.NAMESPACE_URL, f"ducknet-lite@{ver}")
     return {
         "bomFormat": "CycloneDX",
         "specVersion": "1.5",
@@ -56,11 +56,12 @@ def build_sbom() -> dict:
             "component": {
                 "type": "application",
                 "bom-ref": app_ref,
-                "name": "ducknet-security",
+                "name": "ducknet-lite",
                 "version": ver,
-                "purl": f"pkg:pypi/ducknet-security@{ver}",
-                "description": ("Lightweight L7 DDoS/WAF security gateway "
-                                "(stdlib only, zero runtime dependencies)."),
+                "purl": f"pkg:pypi/ducknet-lite@{ver}",
+                "description": ("Lightweight L7 DDoS/WAF security gateway — free AGPL "
+                                "edition (core WAF/DDoS, feature-limited; stdlib only, "
+                                "zero runtime dependencies)."),
                 "licenses": [{"license": {"id": "AGPL-3.0-or-later"}}],
             },
         },
@@ -92,7 +93,7 @@ def main() -> int:
         f.write("\n")
     print(f"SBOM 生成: {out}")
     print(f"  format=CycloneDX {sbom['specVersion']}  "
-          f"app=ducknet-security@{sbom['metadata']['component']['version']}  "
+          f"app=ducknet-lite@{sbom['metadata']['component']['version']}  "
           f"components={len(sbom['components'])}")
     return 0
 

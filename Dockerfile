@@ -1,9 +1,9 @@
 # DuckNet L7 Security — 軽量セキュリティゲートウェイ(stdlib のみ=依存インストール不要)
 FROM python:3.12-slim
 
-LABEL org.opencontainers.image.title="DuckNet L7 Security" \
-      org.opencontainers.image.description="Lightweight L7 DDoS/WAF security gateway (stdlib only, zero runtime deps)" \
-      org.opencontainers.image.version="1.0.0" \
+LABEL org.opencontainers.image.title="DuckNet-Lite" \
+      org.opencontainers.image.description="Lightweight L7 DDoS/WAF security gateway — free AGPL edition (core WAF/DDoS, feature-limited; stdlib only, zero runtime deps)" \
+      org.opencontainers.image.version="1.3.0" \
       org.opencontainers.image.licenses="AGPL-3.0-or-later" \
       org.opencontainers.image.source="https://example.com/ducknet"
 
