@@ -850,7 +850,7 @@ th.sortable .sortarrow{display:inline-block;width:9px;font-size:9px;color:var(--
           <li><b>ボットとの選別:</b> 動的PoWチャレンジで、正規ユーザーを通しながら自動化された攻撃だけを絞り込みます(Liteは拒否/BANの二値判定のみ)。GeoIP・許可リスト(allowlist)・ステルス運用によるアクセス制御も加わります。</li>
           <li><b>侵入後の検知:</b> LDAP/SMB/Kerberosデコイ、囮ファイル、カナリアトークン、ハニーポットで、境界を突破された後の不審な動きも捕捉します。DNSフィルタはC2通信やトンネリングを見つけます。</li>
           <li><b>運用への統合:</b> 検知結果をSIEMやSlackへリアルタイム転送(Webhook/Syslog)。脅威インテリジェンス(IoC)照合とMITRE ATT&CK対応のルールで、既知の攻撃手口を継続的にカバーします。</li>
-          <li><b>複数拠点・大規模環境:</b> ノード間でBAN情報を同期する分散ゴシップにより、組織全体で一貫した防御になります。</li>
+          <li><b>複数拠点・大規模環境:</b> LDAP 列挙検知プロキシと、ノード間でBAN情報を同期する分散ゴシップにより、組織全体で一貫した防御になります(商用ライセンス管理つき)。</li>
         </ul>
       </div>
     </div>
@@ -1122,8 +1122,8 @@ const JA2EN={
  "検知結果をSIEMやSlackへリアルタイム転送(Webhook/Syslog)。脅威インテリジェンス(IoC)照合とMITRE ATT&CK対応のルールで、既知の攻撃手口を継続的にカバーします。":
   "Detections forward to a SIEM or Slack in real time (Webhook/Syslog), and threat-intel (IoC) matching plus MITRE ATT&CK-mapped rules keep coverage current against known techniques.",
  "複数拠点・大規模環境:":"Multi-site and larger deployments:",
- "ノード間でBAN情報を同期する分散ゴシップにより、組織全体で一貫した防御になります。":
-  "Ban state syncs across nodes via gossip, so enforcement stays consistent across the whole organization.",
+ "LDAP 列挙検知プロキシと、ノード間でBAN情報を同期する分散ゴシップにより、組織全体で一貫した防御になります(商用ライセンス管理つき)。":
+  "An LDAP enumeration-detection proxy and gossip-based ban-state sync across nodes keep enforcement consistent across the whole organization (with commercial license management).",
  "ファイアウォール":"Firewall","DDoS / 侵入防御":"DDoS / Intrusion","🌍 グローバル遮断":"🌍 Global block",
  "解除":"Release","接続中":"Connected","接続不可":"Disconnected","認証エラー・再読込":"Auth error — reload",
  "概況":"Overview","脅威モニタリング":"Threat monitoring","WAF / 検知設定":"WAF / detection",
