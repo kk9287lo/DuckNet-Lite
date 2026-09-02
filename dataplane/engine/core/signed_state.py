@@ -37,6 +37,28 @@ _MEM_HW: dict = {}
 # Windows は os.open() に O_BINARY を渡さないと既定でテキストモード(0x0A→0x0D0x0A変換)になり、
 # 生のバイト列(鍵)を破損させる。POSIX には無い属性なので getattr で安全に0フォールバック。
 _O_BIN = getattr(os, "O_BINARY", 0)
+_O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)   # POSIX: 最終要素が symlink なら open 失敗。Win は無し。
+
+
+def _read_key_file(key_path: str):
+    """鍵ファイルを *symlink 追従せず・通常ファイルのみ* 読む(#symlink-key)。返り値 bytes/None。
+    共有 state_dir で攻撃者が .statekey を既知内容ファイルへの symlink にすり替え、その内容を
+    HMAC 鍵として読ませ、鍵既知 → 署名済み状態(BAN/設定/署名)を偽造する攻撃を封じる。
+    0600 が実効的でない Windows では O_NOFOLLOW が無いため lstat の symlink 判定で補う。"""
+    import stat as _stat
+    try:
+        st = os.lstat(key_path)
+        if _stat.S_ISLNK(st.st_mode):
+            return None                       # symlink は拒否(リダイレクト無効化)
+        fd = os.open(key_path, os.O_RDONLY | _O_BIN | _O_NOFOLLOW)
+        try:
+            if not _stat.S_ISREG(os.fstat(fd).st_mode):
+                return None                   # 通常ファイル以外(FIFO/デバイス/ディレクトリ等)は拒否
+            return os.read(fd, 1 << 16)
+        finally:
+            os.close(fd)
+    except Exception:
+        return None
 
 
 def persistent_key(state_dir: str, env_var: str = "DUCKNET_STATE_KEY",
@@ -51,14 +73,9 @@ def persistent_key(state_dir: str, env_var: str = "DUCKNET_STATE_KEY",
     if env:
         return env.encode("utf-8")
     key_path = os.path.join(state_dir, filename)
-    try:
-        if os.path.exists(key_path):
-            with open(key_path, "rb") as f:
-                k = f.read()
-            if k:
-                return k
-    except Exception:
-        pass
+    k0 = _read_key_file(key_path)             # symlink 非追従・通常ファイルのみ(#symlink-key)
+    if k0:
+        return k0
     import secrets as _s
     k = _s.token_bytes(32)
     try:
@@ -69,13 +86,15 @@ def persistent_key(state_dir: str, env_var: str = "DUCKNET_STATE_KEY",
         finally:
             os.close(fd)
     except FileExistsError:
-        try:                                  # 他プロセスと初回生成が競合=相手の鍵を読む
-            with open(key_path, "rb") as f:
-                k2 = f.read()
+        # 他プロセスと初回生成が競合=相手の鍵を読む。O_EXCL 成功〜書き込み完了までの
+        # 短い窓に当たると空/未完了で読める可能性があるため、諦める前に数回リトライする
+        # (ここで諦めて未永続化の自前鍵 k を返すと、次回起動時にディスクの鍵と食い違い、
+        # 自分が署名した状態を自分で検証できなくなる)。
+        for _attempt in range(5):
+            k2 = _read_key_file(key_path)
             if k2:
                 return k2
-        except Exception:
-            pass
+            time.sleep(0.01 * (_attempt + 1))
     except Exception:
         pass
     return k
@@ -132,10 +151,15 @@ def _next_version(path: str) -> int:
 
 
 def write_signed_json(path: str, obj, key: bytes, *, indent: int = 2) -> bool:
-    """obj を署名エンベロープ(単調バージョン付き=ロールバック耐性)で原子的に書き込む。"""
+    """obj を署名エンベロープ(単調バージョン付き=ロールバック耐性)で原子的に書き込む。
+    _sv:3 で **purpose(ファイル basename)を署名対象に束縛** する(#3): 全状態ファイルが同一鍵で
+    署名されるため、旧 _sv:2(purpose 無し)では usage.json の正署名エンベロープを blocklist.json
+    へ *移植* すると有効判定され、無警告で BAN 全消し/署名無効化ができた。purpose を署名に含め
+    読込時に basename と照合することで、あるファイルの署名を別ファイルとして通せなくする。"""
     ver = _next_version(path)
-    env = {"_sv": 2, "_ver": ver,
-           "_sig": sign_payload({"_ver": ver, "_payload": obj}, key),  # ver も署名対象
+    purpose = os.path.basename(path)
+    env = {"_sv": 3, "_ver": ver, "_purpose": purpose,
+           "_sig": sign_payload({"_ver": ver, "_purpose": purpose, "_payload": obj}, key),
            "_payload": obj}
     ok = atomic_write_json(path, env, indent=indent)
     if ok:                                       # 高水位を前進(メモリ + サイドカー)
@@ -157,6 +181,26 @@ def read_signed_json(path: str, key: bytes, default=None, *, check_rollback: boo
             _sv = int(raw.get("_sv", 1) or 1)
         except (TypeError, ValueError):
             return ("tampered", default)     # _sv が非数値=エンベロープ破損→フェイルセーフ(#111)
+        if _sv >= 3:
+            # purpose 束縛版(#3): basename が一致し、かつ {_ver,_purpose,_payload} の署名が正しいこと。
+            purpose = os.path.basename(path)
+            if raw.get("_purpose") != purpose:
+                return ("tampered", default)     # 別ファイルからの署名エンベロープ移植=拒否
+            ver = raw.get("_ver", 0)
+            if not verify_payload({"_ver": ver, "_purpose": purpose,
+                                   "_payload": raw["_payload"]}, raw["_sig"], key):
+                return ("tampered", default)     # 署名不一致(ver/purpose/payload 改竄)
+            try:
+                v = int(ver)
+            except (TypeError, ValueError):
+                v = 0
+            if check_rollback:
+                hw = max(_read_file_hw(path, key), _MEM_HW.get(path, 0))
+                if v < hw:
+                    return ("rolled_back", default)
+                _MEM_HW[path] = max(hw, v)
+                _write_file_hw(path, _MEM_HW[path], key)
+            return ("ok", raw["_payload"])
         if _sv >= 2 and "_ver" in raw:
             ver = raw.get("_ver", 0)
             if not verify_payload({"_ver": ver, "_payload": raw["_payload"]},
