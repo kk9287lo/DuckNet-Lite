@@ -174,10 +174,15 @@ class AdminDashboard:
     def __init__(self, host: str = "127.0.0.1", port: int = 8081, token: str = "",
                  state_dir: str = "",
                  brand: str = "", logo: str = "🦅",
-                 subtitle: str = "L7 防御 — 管理ダッシュボード"):
+                 subtitle: str = "L7 防御 — 管理ダッシュボード",
+                 edge_guard=None):
         self.host = host
         self.port = port
         self.token = token or secrets.token_urlsafe(24)
+        # 前衛ガード(AsyncEdgeGuard)への参照(任意)。渡されれば接続受理/バックエンド
+        # 不達等の生指標(self.metrics)を state() 経由でダッシュボードへ可視化する。
+        # 未指定(単体テスト等)なら空 dict で degrade=既存呼び出し元は変更不要。
+        self.edge_guard = edge_guard
         # 画面の表示名/アイコン。ステルス運用では汎用名(例 "System Health Monitor")に
         # 差し替えて、管理画面のタイトル/ヘッダ/Server ヘッダから製品を伏せる。明示が無ければ
         # DUCKNET_COVER env を尊重し(遮断ページと同じ秘匿源=適用漏れを防ぐ)、無ければ製品名。
@@ -217,14 +222,43 @@ class AdminDashboard:
         return {"entries": tail_jsonl(self._audit_path, n)}
 
     # ── 状態取得 ──
+    @staticmethod
+    def _safe_dict(fn, *a, **kw) -> dict:
+        """1データソースの取得を他から独立して保護する。辞書を返す想定のソース向け:
+        失敗してもそのキーだけ {"error": ...} に degrade し、/api/state 全体を
+        巻き込まない(1箇所のバグで管理画面が丸ごと落ちるのを防ぐ)。"""
+        try:
+            return fn(*a, **kw)
+        except Exception as e:
+            return {"error": str(e)}
+
+    @staticmethod
+    def _safe_list(fn, *a, **kw) -> list:
+        """一覧を返す想定のソース向け: 失敗時は空リストへ degrade する。ダッシュボードJS
+        側は `(s.xxx||[]).map(...)` 前提なので、型を空リストに揃えて後続パネルの
+        描画まで巻き込む例外(存在しないキーへの .map 呼び出し等)を避ける。"""
+        try:
+            return fn(*a, **kw)
+        except Exception:
+            return []
+
     def state(self) -> dict:
         fw = app_firewall()
         sh = net_shield()
         from dataplane.engine.services.proxy import AsyncEdgeGuard
-        return {"firewall": fw.status(), "shield": sh.status(),
-                "shield_metrics": sh.metrics(), "top": sh.top_talkers(12),
-                "events": sh.events(40), "zones": ZONES, "actions": ACTIONS,
-                "capabilities": AsyncEdgeGuard.platform_capabilities()}
+        # 以下のサブ状態はそれぞれ独立に取得する: 1つが例外を投げても、その
+        # キーだけが degrade し、他のパネルは正常なデータで描画され続ける。
+        return {"firewall": self._safe_dict(fw.status),
+                "shield": self._safe_dict(sh.status),
+                "shield_metrics": self._safe_dict(sh.metrics),
+                "top": self._safe_list(sh.top_talkers, 12),
+                "events": self._safe_list(sh.events, 40),
+                "zones": ZONES, "actions": ACTIONS,
+                "capabilities": self._safe_dict(AsyncEdgeGuard.platform_capabilities),
+                # 前衛ガード(接続受理/バックエンド不達等)の生指標。edge_guard 未配線
+                # (単体テスト・旧呼び出し元)なら空 dict=既存の見た目を壊さない。
+                "edge_metrics": (dict(self.edge_guard.metrics) if self.edge_guard
+                                 else {})}
 
     def deception_status(self) -> dict:
         """動的デセプション(MTD)の状態。env 駆動・状態レスのため本プロセスの env を反映し、
@@ -376,6 +410,15 @@ def _make_handler(app: AdminDashboard):
             if not self._auth():
                 self._send(401, _j({"ok": False, "error": "token required"}))
                 return
+            try:
+                self._dispatch_get(path)
+            except Exception as e:
+                # do_POST と同じ思想: 個々の GET ルート(state() 等、複数のサブ状態を
+                # 無防備に連結)のどこか1箇所が例外を投げても、ベースHTTPサーバの既定
+                # 処理(無言で接続を切る)に落とさず、ダッシュボード全体を道連れにしない。
+                self._send(500, _j({"ok": False, "error": str(e)}))
+
+        def _dispatch_get(self, path):
             sh = net_shield()
             if path == "/api/state":
                 self._send(200, _j(app.state()))
@@ -958,6 +1001,7 @@ const JA2EN={
  "SSTI(テンプレート注入 {{…}})":"SSTI (template injection {{…}})","内部SSRF(localhost/内部IP)":"Internal SSRF (localhost/internal IP)",
  "オープンリダイレクト(=//)":"Open redirect (=//)",
  "要求":"Requests","スロットル":"Throttle","ブロック":"Block","BAN中":"Banned","漏洩":"Leaks",
+ "バックエンド不通":"Backend unreachable",
  "有効":"on","無効":"off","計":"total","種別":"types","系統":"families","前":"ago",
  "インターネット(public)を一括遮断します。よろしいですか?":"Block all public (internet) traffic. Are you sure?",
  "(DUCKNET_DECEPTION 未設定 = 偽装なし)":"(DUCKNET_DECEPTION unset = no deception)",
@@ -1108,7 +1152,7 @@ function confirmDialog(message){
 /* 初回ロードのスケルトン: /api/state 到着前は『0』ではなく『未取得』と分かる表示にする。 */
 function showSkeleton(){
  const bar=w=>`<span class="skel-bar" style="width:${w}"></span>`;
- $("cards").innerHTML=Array.from({length:6}).map(()=>
+ $("cards").innerHTML=Array.from({length:7}).map(()=>
   `<div class="kpi skel"><div class="kn">${bar("44%")}</div><div class="kl">${bar("72%")}</div></div>`).join("");
  $("top").textContent="…";$("apt").textContent="…";
  $("events").innerHTML=`<div class="frow skel"><span class="time">${bar("40px")}</span><span class="desc">${bar("60%")}</span></div>`.repeat(4);
@@ -1121,9 +1165,10 @@ async function refresh(){
  $("conn").className="pill ok";$("connt").textContent=tr("接続中");
  $("fw").checked=s.firewall.enabled;$("sh").checked=s.shield.cfg.enabled;
  const m=s.shield_metrics;
+ const em=s.edge_metrics||{};
  $("cards").innerHTML=[["要求",m.requests,"i-blue"],["許可",m.allow,"i-green"],["スロットル",m.throttle,"i-amber"],
    ["ブロック",m.block,"i-red"],["BAN中",m.active_bans,"i-red"],
-   ["漏洩",m.dlp_leak,"i-red"]]
+   ["漏洩",m.dlp_leak,"i-red"],["バックエンド不通",em.backend_unreachable||0,"i-red"]]
    .map(([l,n,a])=>`<div class="kpi ${a}"><div class="kn">${nf(n)}</div><div class="kl">${esc(tr(l))}</div></div>`).join("");
  // 出口DLP: 設定の反映 + 漏洩イベントの抽出表示
  // dlp_enabled はサブフラグに過ぎず、実際の稼働は本体(dc.enabled)とのAND(pipeline.py dlp_active()と同一条件) —

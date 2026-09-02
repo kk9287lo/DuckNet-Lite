@@ -570,7 +570,7 @@ class AsyncEdgeGuard:
         self._conn_per_ip: dict = {}  # ip -> 同時接続数(limit_conn 用・ループスレッドのみ=ロック不要)
         self._conn_rate: dict = {}    # ip -> [窓開始, 件数](接続レート=RST/churn フラッド対策・#10)
         self._pool = _BufferPool()
-        self.metrics = {"accepted": 0, "dropped": 0, "proxied": 0}
+        self.metrics = {"accepted": 0, "dropped": 0, "proxied": 0, "backend_unreachable": 0}
 
     @staticmethod
     def platform_capabilities() -> dict:
@@ -841,6 +841,18 @@ class AsyncEdgeGuard:
         try:
             bre, bwr = await self._open_backend()
         except Exception:
+            # バックエンド不達: 従来は無言TCP切断で運用者に何も見えなかった(accepted 以外の
+            # 指標が動かず=停止に気付けない)。正規クライアントには標準的な 502 を返し、
+            # 指標にも構造的に残す(このLite版は txnlog を持たないため metrics のみ)。
+            self.metrics["backend_unreachable"] = (
+                self.metrics.get("backend_unreachable", 0) + 1)
+            writer.write(_http_response("502 Bad Gateway", _jsonify(
+                {"ok": False, "error": "backend unreachable"}),
+                extra=deception.headers_for(ip)))
+            try:
+                await writer.drain()
+            except Exception:
+                pass
             return self._close(writer)
         self.metrics["proxied"] += 1
         start = time.time()

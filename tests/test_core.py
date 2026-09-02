@@ -1083,6 +1083,86 @@ def test_dashboard_oversized_body_is_capped():
             FW._FW, ND._SHIELD = ofw, osh
 
 
+def test_backend_unreachable_returns_502_and_metric():
+    # バックエンド不達は従来『無言TCP切断』で運用者に何も見えなかった(accepted 以外の
+    # 指標が動かない=停止に気付けない)。今は標準的な 502 を返し、
+    # metrics["backend_unreachable"] を増分することを回帰から守る(このLite版は
+    # txnlog を持たないため、上流(DuckNet本体)のテストと違いそちらの検証は無し)。
+    import asyncio
+    from dataplane.engine.services.proxy import AsyncEdgeGuard
+
+    class _R:
+        def __init__(self, data): self._q = [data]
+        async def read(self, n=4096): return self._q.pop(0) if self._q else b""
+
+    class _W:
+        def __init__(self): self.buf, self.closed = b"", False
+        def write(self, b): self.buf += b
+        async def drain(self): pass
+        def close(self): self.closed = True
+        def get_extra_info(self, k, default=None):
+            return ("203.0.113.77", 5555) if k == "peername" else default
+
+    g = AsyncEdgeGuard(backend_host="127.0.0.1", backend_port=1)  # 届かないport
+    w = _W()
+    asyncio.run(g._handle(_R(b"GET /x HTTP/1.1\r\nHost: h\r\n\r\n"), w))
+    assert b"502 Bad Gateway" in w.buf.split(b"\r\n", 1)[0]
+    assert w.closed
+    assert g.metrics["backend_unreachable"] == 1
+
+
+def test_dashboard_get_broken_source_degrades_one_key_not_whole_state():
+    # state() は複数のサブ状態を独立に取得する。1つ(例: top_talkers)が例外を投げても、
+    # そのキーだけ degrade し、/api/state 全体は 200 のまま・他のキー(firewall/
+    # shield_metrics 等)は正常に返る(=他パネルは無事)。
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        ofw, osh = FW._FW, ND._SHIELD
+        adm, url, token = _admin_with_temp(tmp)
+        try:
+            def _boom(*a, **kw):
+                raise RuntimeError("boom-top-talkers")
+            orig = ND._SHIELD.top_talkers
+            ND._SHIELD.top_talkers = _boom
+            try:
+                code, body = _req(url + "/api/state", token=token)
+                assert code == 200                          # 全体は落ちない
+                st = json.loads(body)
+                assert st["top"] == []                       # 壊れたキーだけ空へdegrade
+                assert "shield_metrics" in st and "error" not in st["shield_metrics"]
+                assert "firewall" in st and "error" not in st["firewall"]
+            finally:
+                ND._SHIELD.top_talkers = orig
+        finally:
+            adm.stop()
+            FW._FW, ND._SHIELD = ofw, osh
+
+
+def test_dashboard_get_route_exception_returns_clean_error_not_broken_connection():
+    # do_GET には do_POST と同等の包括的例外ガードが無かった。state() 以外の GET
+    # ルートで丸ごと例外が起きても、ベースHTTPサーバの既定処理(無言で接続を落とす)に
+    # 委ねず、500 + {"ok": false, "error": ...} を返す(このLite版に detections は
+    # 無いため deception_status を対象にする)。
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        ofw, osh = FW._FW, ND._SHIELD
+        adm, url, token = _admin_with_temp(tmp)
+        try:
+            def _boom(*a, **kw):
+                raise RuntimeError("boom-deception")
+            adm.deception_status = _boom
+            code, body = _req(url + "/api/deception", token=token)
+            assert code == 500
+            r = json.loads(body)
+            assert r["ok"] is False and "boom-deception" in r["error"]
+            # 壊れていない他のルートは引き続き正常(ダッシュボード全体は道連れにならない)
+            code2, _ = _req(url + "/api/state", token=token)
+            assert code2 == 200
+        finally:
+            adm.stop()
+            FW._FW, ND._SHIELD = ofw, osh
+
+
 def test_b1_rce_and_or_pipe_separator_bypass_is_caught():
     # ライブ監査で実証された RCE バイパス: rce シグネチャは従来 ';' のみを区切りとして認識し、
     # '&&'/'||' 連結や nc/bash 以外へのパイプ(curl/wget/sh/python)は素通りしていた。

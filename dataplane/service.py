@@ -119,7 +119,13 @@ def run(backend: str = "127.0.0.1:8080", listen: int = 8443,
         else:
             print(f" 宣言的設定         : [警告] {_res.get('error')}")
 
-    admin = AdminDashboard(host=admin_host, port=admin_port, token=token)
+    # guard オブジェクトは admin より先に *生成のみ*(start() はまだ呼ばない=起動順は
+    # 従来どおり admin が先)。こうすると AdminDashboard に edge_guard 参照を渡せて、
+    # ダッシュボードが接続受理/バックエンド不達などの生指標(guard.metrics)を可視化できる。
+    guard = AsyncEdgeGuard(backend_host=bhost or "127.0.0.1", backend_port=bport,
+                           listen_host=host, listen_port=listen,
+                           health_path=health_path)
+    admin = AdminDashboard(host=admin_host, port=admin_port, token=token, edge_guard=guard)
     a = admin.start()
     print("=" * 64)
     print(" DuckNet L7 Security — セキュリティゲートウェイ 起動")
@@ -134,9 +140,6 @@ def run(backend: str = "127.0.0.1:8080", listen: int = 8443,
     print(f" 防御中(前衛)       : 0.0.0.0:{listen}  →  バックエンド {bhost}:{bport}")
     print("=" * 64)
 
-    guard = AsyncEdgeGuard(backend_host=bhost or "127.0.0.1", backend_port=bport,
-                           listen_host=host, listen_port=listen,
-                           health_path=health_path)
     if cluster:
         res = guard.serve_cluster()
         if res.get("mode") == "single":
