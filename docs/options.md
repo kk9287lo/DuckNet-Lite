@@ -1,8 +1,8 @@
-# オプション一覧(環境変数 / 設定キー)— v1.2.0
+# オプション一覧(環境変数 / 設定キー)— v1.3.0
 
-DuckNet の挙動は **CLI 引数**・**環境変数**・**設定キー(cfg)** で制御します。設定キーは管理
-ダッシュボード / 宣言的ブートストラップ(JSON)から変更でき、`NetShield._DEFAULTS`
-が唯一の真実です。防御の詳細・既定値(ON / opt-in)は [defenses.md](defenses.md) を参照。
+DuckNet の挙動は CLI 引数・環境変数・設定キー(cfg)で制御します。設定キーは管理ダッシュボード /
+宣言的ブートストラップ(JSON)から変更でき、`NetShield._DEFAULTS` が唯一の真実です。防御の詳細・既定値
+(ON / opt-in)は [defenses.md](defenses.md) を参照してください。
 
 ## 環境変数
 
@@ -10,7 +10,7 @@ DuckNet の挙動は **CLI 引数**・**環境変数**・**設定キー(cfg)** �
 | --- | --- | --- |
 | `DUCKNET_LANG` | (自動) | サーバ生成文言の言語 `ja`/`en`。未設定なら OS ロケールに追随(英語環境は自動 en、それ以外 ja)。 |
 | `DUCKNET_STATE_DIR` | OS 既定 | 状態ファイル(BAN/設定/署名/テレメトリ)の保存先。 |
-| `DUCKNET_STATE_KEY` | (生成) | 状態ファイル署名の HMAC 鍵。**外部鍵推奨**(未設定時は state_dir に 0600 で生成=同ディスク root には弱い)。 |
+| `DUCKNET_STATE_KEY` | (生成) | 状態ファイル署名の HMAC 鍵。外部鍵を推奨(未設定時は state_dir に 0600 で生成するため、同ディスクの root には弱い)。 |
 | `DUCKNET_OFFLINE` | (空) | 外部接続を一切しない(テスト/隔離環境)。 |
 | `DUCKNET_DRAIN_TIMEOUT` | `60` | 応答転送の書込み(drain)デッドライン秒(#9 slow-read/zero-window 対策)。 |
 | `DUCKNET_HEALTH_PATH` | (空) | LB 死活監視用に即 200 を返す予約パス(WAF/バックエンド非経由)。 |
@@ -24,11 +24,11 @@ DuckNet の挙動は **CLI 引数**・**環境変数**・**設定キー(cfg)** �
 | `deny_score` / `block_score` | `40` / `100` | 単発拒否(BANなし) / 遮断+自動BAN の脅威スコア閾値。 |
 | `ban_ttl_sec` | `300` | 自動BAN の継続秒(累犯は `ban_escalation`/`ban_escalation_cap` で延長)。 |
 | `body_scan_enabled` / `body_scan_max_bytes` | `True` / `65536` | 要求ボディのシグネチャ走査と上限バイト。 |
-| `body_sig_weight_factor` | `0.7` | **本文由来シグネチャのスコア係数**(誤BAN低減。1.0=従来)。 |
+| `body_sig_weight_factor` | `0.7` | 本文由来シグネチャのスコア係数(誤 BAN 低減。1.0=従来)。 |
 | `body_max_sec` | `60` | ボディ受信の総許容秒(slow POST 対策)。 |
 | `flood_threshold` / `window_sec` | `150` / `10` | フラッド閾(窓内要求数)と窓秒。 |
 | `max_conn_per_ip` / `max_total_conn` | `0` / `20000` | IP毎 / 全体の同時接続上限(枯渇/slowloris 増幅対策)。 |
-| `conn_rate_per_ip` | `0` | IP毎の**接続レート**上限(毎秒)。接続→即RST を高速反復する churn フラッドを head 解析前に安価に shed。0=無効(NAT 巻添え回避)。ロックダウンで自動有効。 |
+| `conn_rate_per_ip` | `0` | IP 毎の接続レート上限(毎秒)。接続→即 RST を高速反復する churn フラッドを、head 解析前に安価に shed する。0=無効(NAT の巻き添え回避)。ロックダウンで自動有効。 |
 | `subnet_defense` | `False` | サブネット(/24・/64)集約防御(opt-in)。 |
 | `jwt_inspect_enabled` | `True` | JWT(`alg:none`/許可外 alg)遮断。 |
 | `cookie_harden_enabled` / `cors_harden_enabled` | `True` / `True` | Set-Cookie 補完 / CORS 無害化。 |

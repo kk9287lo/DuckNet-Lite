@@ -23,7 +23,7 @@ _BRAND = os.environ.get("DUCKNET_COVER", "").strip() or "DuckNet-Lite"
 
 _ABOUT_TEXT = (
     "{brand}\n\n"
-    "軽量 L7 WAF / DDoS セキュリティゲートウェイ(無償/試用エディション)。\n"
+    "軽量 L7 WAF / DDoS セキュリティゲートウェイ(無償エディション・AGPL)。\n"
     "外部依存ゼロ(Python 標準ライブラリのみ)・OS 非侵襲・防御専用。\n\n"
     "コアの L7 WAF/DDoS リバースプロキシと Web 管理ダッシュボードを提供します。\n"
     "詳細は README.md / docs、ダッシュボード右上の ❓ ヘルプを参照してください。"
