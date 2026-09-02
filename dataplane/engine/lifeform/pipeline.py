@@ -366,7 +366,28 @@ _DEDUP_CORPUS = [
 ]
 _MAX_SCAN = 8192            # シグネチャ走査の入力上限(ReDoS/CPU枯渇の面積を有界化)
 _PRE_CUT = _MAX_SCAN * 2    # 正規化前の粗い上限
-_MAX_SCAN_FIELDS = 64       # 独立走査するフィールド数の上限(path?query+UA + 各ヘッダ値・CPU有界)
+_O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)   # POSIX: 最終要素が symlink なら open 失敗。Win は無し。
+
+
+def _open_state_write(path: str, mode: str):
+    """state_dir 直下の *固定パス* へ symlink を経由せず追記/切詰で開く(#symlink-arbitrary-write)。
+    mode='a'(追記)/'w'(切詰)。共有 state_dir で攻撃者が usage_log.jsonl や .state_signed を
+    任意ファイルへの symlink に仕込み、追記でログ注入/ディスク枯渇、切詰で任意ファイル truncate を
+    起こす攻撃を封じる。予め symlink を除去(追従しない)し、POSIX では O_NOFOLLOW でも最終要素の
+    追従を拒否する(0600 が効かない Windows は islink 判定で補う)。テキスト file を返す。"""
+    try:
+        if os.path.islink(path):
+            os.unlink(path)                    # 仕込まれた symlink を除去(追従せず新規通常ファイルを作る)
+    except OSError:
+        pass
+    flags = os.O_WRONLY | os.O_CREAT | _O_NOFOLLOW
+    flags |= os.O_APPEND if mode == "a" else os.O_TRUNC
+    fd = os.open(path, flags, 0o600)
+    return os.fdopen(fd, mode, encoding="utf-8")
+_MAX_SCAN_FIELDS = 96       # 独立走査するフィールド数の上限(path?query+UA + Host + 各ヘッダ値
+                            # (最大64個別+結合末尾)・CPU有界)。_scan_header_values の 64+1 と
+                            # Host/primary を全て走査面に収めるため 64→96(head は 16KB 上限ゆえ
+                            # フィールド数は元々有界=CPU影響は軽微)。
 
 
 def _now() -> float:
@@ -499,6 +520,55 @@ def registered_scan_decoders() -> list:
     return sorted(_SCAN_DECODERS)
 
 
+def _strip_sql_comments(s: str) -> str:
+    """SQL インラインコメントを *線形時間* で除去する(旧: 有界 lazy 正規表現)。
+    2パス構成は旧実装と完全一致: (1) MySQL 版付き /*! [digits] 中身 */ は囲みだけ剥がして
+    中身を残す(DB が実行するため)。(2) 一般 /* ... */ は中身ごと除去。いずれも最寄りの */
+    までを str.find で取る=バックトラック無し。旧 `.{0,8192}?` の上限を撤廃したので、8192 超の
+    巨大コメントも確実に除去できる(旧は上限超過で未除去=実証済バイパスだった)。未終端 /* は
+    従来どおり literal 保持。バックトラック皆無ゆえ /* 連打による CPU 枯渇DoSを起こさない。"""
+    if "/*" not in s:
+        return s
+    # パス1: 版付きコメント /*! ... */(中身を残す)
+    out = []
+    i, n = 0, len(s)
+    while i < n:
+        j = s.find("/*!", i)
+        if j < 0:
+            out.append(s[i:])
+            break
+        out.append(s[i:j])
+        end = s.find("*/", j + 3)
+        if end < 0:
+            out.append(s[j:])
+            break
+        k, d = j + 3, 0
+        while k < end and d < 6 and s[k].isdigit():   # 旧 \d{1,6} 相当(先頭最大6桁を消費)
+            k += 1
+            d += 1
+        out.append(" " + s[k:end] + " ")
+        i = end + 2
+    s = "".join(out)
+    if "/*" not in s:
+        return s
+    # パス2: 一般コメント /* ... */(中身ごと除去)
+    out = []
+    i, n = 0, len(s)
+    while i < n:
+        j = s.find("/*", i)
+        if j < 0:
+            out.append(s[i:])
+            break
+        out.append(s[i:j])
+        end = s.find("*/", j + 2)
+        if end < 0:
+            out.append(s[j:])
+            break
+        out.append(" ")
+        i = end + 2
+    return "".join(out)
+
+
 def _normalize_for_scan(s: str) -> str:
     """シグネチャ走査前の正規化。難読化(多重エンコード/インラインコメント/空白増し/Unicode)を
     減らし、入力長を有界化して ReDoS と CPU 枯渇を抑える。完全な無害化ではない。"""
@@ -515,56 +585,65 @@ def _normalize_for_scan(s: str) -> str:
                     s = out[:_PRE_CUT]         # 出力も上限化(暴走デコーダで肥大させない)
             except Exception:
                 pass                          # 壊れたデコーダで防御を止めない(素通りより安全側)
-    try:
-        from urllib.parse import unquote_plus
-        # 多重%エンコードを最大5回戻す(WAF定石は2回だが、三重以上のエンコード(例: ".."の
-        # 三重エンコード %25252e%25252e)は2回では実体の "." まで戻らずtraversal等が素通りする
-        # =実証済バイパス。5回は上限のみで、実際は『変化が無くなった時点』で即break=素通り側
-        # (既に完全復号済みの通常トラフィック=大多数)は従来どおり1〜2回で抜ける・低速化しない。
-        for _ in range(5):
-            dec = unquote_plus(s)
-            if dec == s:
-                break
-            s = dec
-    except Exception:
-        pass
-    try:                                     # ;終端のHTMLエンティティのみ復号(&lt;→<, &#60;→<,
-        from html import unescape             #   &#x3c;→<)=実体エンコードXSS/SQLi回避を無効化。
-        s = re.sub(                           # ';' 必須ゆえ &gt=10 等の REST フィルタ引数は復号せず
-            r"&(?:#x[0-9a-fA-F]{1,6}|#[0-9]{1,7}|[a-zA-Z][a-zA-Z0-9]{1,31});",
-            lambda m: unescape(m.group(0)), s)   # 誤検知しない(legacy のセミコロン無し実体は除外)
-    except Exception:
-        pass
-    # Unicode 回避対策(ヒエログリフ/絵文字罠): \uXXXX/\xXX エスケープ復号 → NFKC 正規化
-    # (全角 ＜ｓｃｒｉｐｔ＞ 等の互換文字を ASCII へ畳む)→ 不可視/書式制御文字(ゼロ幅・ソフト
-    # ハイフン・BOM 等)除去。見た目だけ違う回避(un​ion / <script)を実体へ戻す。
-    def _unesc(m):
-        try:
-            return chr(int(m.group(m.lastindex), 16))
-        except Exception:
-            return m.group(0)
-    s = re.sub(r"\\u([0-9a-fA-F]{4})|\\x([0-9a-fA-F]{2})|\\U([0-9a-fA-F]{8})", _unesc, s)
-    if not s.isascii():                          # ASCII はそのまま(高速パス)。非ASCIIのみ重処理。
-        try:
-            s = unicodedata.normalize("NFKC", s)
-        except Exception:
-            pass
-        # 書式文字(Cf=ゼロ幅/ソフトハイフン/方向制御 等)と \t\r\n 以外の制御文字を除去。
-        s = "".join(c for c in s if not (
-            unicodedata.category(c) == "Cf"
-            or (c < " " and c not in "\t\r\n")))
+    # 復号の外側 fixpoint(有界3周): entity/NFKC 復号が *後段で* 新たに生む %エスケープを
+    # URL 復号し損ねる死角を塞ぐ(例 &#37;3cscript → %3cscript が復号されず素通り)。各ステップは
+    # ガード付きで no-op 時は安価=既に復号済みの通常トラフィックは実質1周で抜ける(低速化しない)。
+    for _decode_round in range(3):
+        _before = s
+        if "%" in s or "+" in s:      # unquote_plus は "+"→空白 も行うため "%" 単独では判定不足
+            try:
+                from urllib.parse import unquote_plus
+                # 多重%エンコードを最大5回戻す(三重以上 %25252e%25252e は2回では実体 "." まで
+                # 戻らず traversal 等が素通り=実証済バイパス)。変化が無くなり次第 break。
+                for _ in range(5):
+                    dec = unquote_plus(s)
+                    if dec == s:
+                        break
+                    s = dec
+            except Exception:
+                pass
+        if "&" in s:
+            try:                                 # ;終端のHTMLエンティティのみ復号(&lt;→<, &#60;→<,
+                from html import unescape         #   &#x3c;→<)=実体エンコードXSS/SQLi回避を無効化。
+                s = re.sub(                       # ';' 必須ゆえ &gt=10 等の REST フィルタ引数は復号せず
+                    r"&(?:#x[0-9a-fA-F]{1,6}|#[0-9]{1,7}|[a-zA-Z][a-zA-Z0-9]{1,31});",
+                    lambda m: unescape(m.group(0)), s)   # 誤検知しない(legacy のセミコロン無し実体は除外)
+            except Exception:
+                pass
+        # Unicode 回避対策(ヒエログリフ/絵文字罠): \uXXXX/\xXX エスケープ復号 → NFKC 正規化
+        # (全角 ＜ｓｃｒｉｐｔ＞ 等の互換文字を ASCII へ畳む)→ 不可視/書式制御文字(ゼロ幅・ソフト
+        # ハイフン・BOM 等)除去。見た目だけ違う回避(un​ion / <script)を実体へ戻す。
+        if "\\" in s:
+            def _unesc(m):
+                try:
+                    return chr(int(m.group(m.lastindex), 16))
+                except Exception:
+                    return m.group(0)
+            s = re.sub(r"\\u([0-9a-fA-F]{4})|\\x([0-9a-fA-F]{2})|\\U([0-9a-fA-F]{8})", _unesc, s)
+        if not s.isascii():                          # ASCII はそのまま(高速パス)。非ASCIIのみ重処理。
+            try:
+                s = unicodedata.normalize("NFKC", s)
+            except Exception:
+                pass
+            # 書式文字(Cf=ゼロ幅/ソフトハイフン/方向制御 等)と \t\r\n 以外の制御文字を除去。
+            s = "".join(c for c in s if not (
+                unicodedata.category(c) == "Cf"
+                or (c < " " and c not in "\t\r\n")))
+        if s == _before:                             # 安定=これ以上復号で変化しない → 早期終了
+            break
     # Log4j ルックアップ難読化を畳む: 既知のルックアップ名(${lower:j} 等)と :- デフォルト形
     # (${::-j} / ${env:X:-j})だけを中身へ置換。これで ${${lower:j}ndi:ldap://…} の入れ子回避が
     # jndi: として露出する。jndi 本体(${jndi:...} は名が一致せず :- も無い)は保存される=
     # 過剰畳みしない。入れ子を解くため数回繰り返す(有界)。深い多重入れ子は対象外。
-    for _ in range(4):
-        dec = re.sub(r"\$\{[^${}]*?:-([A-Za-z0-9.]{1,32})\}", r"\1", s)       # :- デフォルト形
-        dec = re.sub(r"(?i)\$\{(?:lower|upper|env|sys|java|main|date|ctx|"
-                     r"base64|marker|spring|web|k8s|docker|jvmrunargs|sd)\b:?"
-                     r"([A-Za-z0-9.]{1,32})\}", r"\1", dec)                    # 既知ルックアップ名
-        if dec == s:
-            break
-        s = dec
+    if "${" in s:
+        for _ in range(4):
+            dec = re.sub(r"\$\{[^${}]*?:-([A-Za-z0-9.]{1,32})\}", r"\1", s)       # :- デフォルト形
+            dec = re.sub(r"(?i)\$\{(?:lower|upper|env|sys|java|main|date|ctx|"
+                         r"base64|marker|spring|web|k8s|docker|jvmrunargs|sd)\b:?"
+                         r"([A-Za-z0-9.]{1,32})\}", r"\1", dec)                    # 既知ルックアップ名
+            if dec == s:
+                break
+            s = dec
     s = s.replace("\x00", "")                # NULバイト除去
     # MySQL 版付きコメント /*!...*/・/*!50000...*/ は DB が *中身を実行する*。一般コメントと
     # 同様に中身ごと消すと UNION 等が検出から消える(sqlmap versionedkeywords 回避)。よって
@@ -573,19 +652,28 @@ def _normalize_for_scan(s: str) -> str:
     # 実DBで有効な"UNION SELECT")。DOTALL が無いと '.' が実改行にマッチせず、コメントとして
     # 認識されずに /* */ が生の文字として残る=UNION と SELECT の間の空白畳み込みが働かず
     # \bunion\b[\s(;]*\bselect\b 等が素通りする(実証済バイパス)。
-    # 有界を 200→_MAX_SCAN に拡大: 200文字超のパディング(コメント本体を巨大化させる)で
-    # lazy quantifier の有界マッチが不成立になり、同様にコメントが未除去のまま残って
-    # キーワード隣接判定を破れる実証済バイパス。_MAX_SCAN は本関数末尾の全体上限と同じ値
-    # なので、それ以上に広げても走査面積は増えない(安全な上限のまま)。
-    s = re.sub(r"(?s)/\*!(?:\d{1,6})?(.{0,%d}?)\*/" % _MAX_SCAN, r" \1 ", s)
-    s = re.sub(r"(?s)/\*.{0,%d}?\*/" % _MAX_SCAN, " ", s)   # 一般 SQLインラインコメント /**/ 除去(有界lazy)
+    # コメント除去は線形スキャナ [[_strip_sql_comments]] に委譲(旧: 有界 lazy 正規表現)。
+    # 旧実装は /* 連打(未終端)に対し各アンカーが最大 _MAX_SCAN 文字を前方走査し、単一
+    # イベントループを ~120ms/req 占有する CPU 枯渇DoSだった。線形版は同一の除去結果
+    # (版付きは中身保持・一般は中身除去)を保ちつつバックトラック無し。
+    s = _strip_sql_comments(s)
     # 注入された改行(%0a/%0d)を区切り ; に正規化。path/query/UA に正規の生改行は無いため、
     # CR/LF はコマンド/文の区切りとみなせる(サーバ側で実際そう解釈される)。これで ; ベースの
     # 既存検知(RCE ;cat / stacked SQL ;select)が改行注入にも効く。空白畳みより *前* に行う。
-    s = re.sub(r"[\r\n]+", ";", s)
+    if "\r" in s or "\n" in s:
+        s = re.sub(r"[\r\n]+", ";", s)
     s = re.sub(r"\s+", " ", s)               # 空白畳み込み(回避抑制+走査面積減)
-    s = re.sub(r"\s*(<=|>=|<>|!=|=|<|>)\s*", r"\1", s)  # 比較演算子前後の空白除去(1 < 2 → 1<2)
-    s = re.sub(r"([;|])\s+", r"\1", s)       # ;/| 直後の空白除去(; cat → ;cat)
+    if ":" in s:
+        # スキーム直前の空白を除去(javascript : → javascript:)。ブラウザは URL 内の tab/CR/LF を
+        # *除去* してからスキームを解釈するため、javascript%09: は javascript: として実行される。
+        # 本正規化は tab を空白へ畳むだけなので javascript : となり xss 署名/prescan(literal
+        # "javascript")の双方を回避できた(#normalization)。tab を全除去すると union\tselect が
+        # unionselect となり \bunion\b 境界が壊れSQL検知を落とすため、コロン隣接の空白のみ削る。
+        s = re.sub(r"\s+:", ":", s)
+    if "<" in s or ">" in s or "=" in s:
+        s = re.sub(r"\s*(<=|>=|<>|!=|=|<|>)\s*", r"\1", s)  # 比較演算子前後の空白除去(1 < 2 → 1<2)
+    if ";" in s or "|" in s:
+        s = re.sub(r"([;|])\s+", r"\1", s)   # ;/| 直後の空白除去(; cat → ;cat)
     return s[:_MAX_SCAN].lower()
 
 
@@ -824,7 +912,7 @@ class NetShield:
         平文すり替えとして改竄扱いする(#53)。失敗は無害に握る(マーカーは検知を強める保険)。"""
         try:
             if not os.path.exists(self._state_marker):
-                with open(self._state_marker, "w", encoding="utf-8") as f:
+                with _open_state_write(self._state_marker, "w") as f:
                     f.write(str(int(_now())))
         except Exception:
             pass
@@ -1362,7 +1450,7 @@ class NetShield:
                     u["hosts"] = top
             # 見返せるログ(1接続=1行のjsonl・末尾回転)
             try:
-                with open(self._usage_log_path, "a", encoding="utf-8") as f:
+                with _open_state_write(self._usage_log_path, "a") as f:
                     f.write(json.dumps({"ts": round(_now(), 1), "ip": ip, "host": host,
                                         "method": method, "path": (path or "")[:120],
                                         "out": int(out_bytes), "in": int(in_bytes),
@@ -1389,7 +1477,7 @@ class NetShield:
                 return
             with open(self._usage_log_path, encoding="utf-8", errors="replace") as f:
                 lines = f.readlines()
-            with open(self._usage_log_path, "w", encoding="utf-8") as f:
+            with _open_state_write(self._usage_log_path, "w") as f:
                 f.writelines(lines[-keep:])
         except Exception:
             pass
@@ -1440,7 +1528,7 @@ class NetShield:
             write_signed_json(self._usage_path, {"usage": {}, "saved": _now()},
                               self._state_key)
             try:
-                open(self._usage_log_path, "w").close()
+                _open_state_write(self._usage_log_path, "w").close()
             except Exception:
                 pass
         return {"ok": True, "cleared": True}
@@ -1517,6 +1605,15 @@ class NetShield:
         _targets = [f"{path}?{query} {user_agent}"]
         if host:
             _targets.append(host)            # Host も走査面に(Host経由のLog4Shell/SQLi死角を塞ぐ・#41)
+        # path/query/UA を *各々独立フィールド* として走査面へ(#39 拡張)。主走査面
+        # (path?query UA の連結)は末尾で _MAX_SCAN 切り詰めされるため、path を 8192 まで
+        # 膨らませるだけで後続の query/UA が走査面外へ押し出され、その中の Log4Shell/SQLi/XSS
+        # が全一般署名を回避できた(実証済バイパス。UA は最後尾ゆえ最も容易)。各フィールドを
+        # 個別に持てば、どれか1つを padding しても他は自分の budget で必ず一般署名走査される
+        # (scanner_ua/sensitive_path は下のフィールド限定走査が別途担当)。
+        for _f in (path, query, user_agent):
+            if _f:
+                _targets.append(_f)
         _targets.extend(h for h in (headers or "").split("\n") if h)
         blob = _normalize_for_scan(_targets[0])    # 主走査面(reason/後続参照の後方互換用)
         sig_hit, sig_weight = self._scan_signatures(blob)

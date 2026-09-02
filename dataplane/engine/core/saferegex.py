@@ -29,6 +29,89 @@ MAX_PATTERN_LEN = 1000          # パターン文字列の長さ上限(過大な
 _NESTED_QUANT = re.compile(r"\((?:[^()\\]|\\.)*[*+](?:[^()\\]|\\.)*\)\s*[*+{]")
 # 量化された後方に無限量化が続く ){n,}+ 形
 _BOUND_THEN_STAR = re.compile(r"\)\s*\{\d+,\}\s*[*+]")
+# 交代(|)を含むグループへの量化: (a|aa)+ 等。ネスト量化子とは別の形の指数的バックトラック
+# (曖昧な交代+反復)で、上の2つでは検出できない。中の "|" の有無だけを見る安全側のヒューリスティック。
+_ALTERNATION_QUANT = re.compile(
+    r"\((?:[^()\\]|\\.)*\|(?:[^()\\]|\\.)*\)\s*(?:[*+]|\{\d+,)")
+
+
+def _body_has_unbounded_or_alt(body: str) -> bool:
+    """グループ本体に、非有界量化子(* + {n,})または交代 | が(文字クラス/エスケープ外に)
+    含まれるか。上の平坦な正規表現が『ネストを跨げない』盲点を補う深さ非依存スキャン用。"""
+    i, n = 0, len(body)
+    in_class = False
+    while i < n:
+        c = body[i]
+        if c == "\\":
+            i += 2
+            continue
+        if in_class:
+            if c == "]":
+                in_class = False
+            i += 1
+            continue
+        if c == "[":
+            in_class = True
+            i += 1
+            continue
+        if c in "*+|":
+            return True
+        if c == "{":
+            j = body.find("}", i)
+            if j != -1:
+                inner = body[i + 1:j]
+                if "," in inner and inner.split(",", 1)[1].strip() == "":
+                    return True  # {n,} = 上限なし
+                i = j + 1
+                continue
+        i += 1
+    return False
+
+
+def _has_nested_evil_quant(pattern: str) -> bool:
+    """非有界量化(* + {n,})されたグループの本体に、さらに非有界量化子か交代が『任意の深さ』で
+    含まれるか。(a+)+ / ((a+))+ / (a{2,})+ / ((a|a))+ 等の指数的バックトラックを、ネストを跨いで
+    検出する(平坦な _NESTED_QUANT/_ALTERNATION_QUANT はネスト内の量化子を見逃す)。"""
+    i, n = 0, len(pattern)
+    in_class = False
+    stack = []
+    while i < n:
+        c = pattern[i]
+        if c == "\\":
+            i += 2
+            continue
+        if in_class:
+            if c == "]":
+                in_class = False
+            i += 1
+            continue
+        if c == "[":
+            in_class = True
+            i += 1
+            continue
+        if c == "(":
+            stack.append(i)
+            i += 1
+            continue
+        if c == ")":
+            if stack:
+                start = stack.pop()
+                q = i + 1
+                outer_unbounded = False
+                if q < n and pattern[q] in "*+":
+                    outer_unbounded = True
+                elif q < n and pattern[q] == "{":
+                    j = pattern.find("}", q)
+                    if j != -1:
+                        inner = pattern[q + 1:j]
+                        if "," in inner and inner.split(",", 1)[1].strip() == "":
+                            outer_unbounded = True
+                if outer_unbounded and _body_has_unbounded_or_alt(pattern[start + 1:i]):
+                    return True
+            i += 1
+            continue
+        i += 1
+    return False
 
 
 def lint(pattern: str) -> str:
@@ -37,8 +120,10 @@ def lint(pattern: str) -> str:
         return "パターンが空"
     if len(pattern) > MAX_PATTERN_LEN:
         return f"パターンが長すぎ(<= {MAX_PATTERN_LEN})"
-    if _NESTED_QUANT.search(pattern) or _BOUND_THEN_STAR.search(pattern):
-        return "ネスト量化子の疑い(ReDoS 危険)"
+    if (_NESTED_QUANT.search(pattern) or _BOUND_THEN_STAR.search(pattern)
+            or _ALTERNATION_QUANT.search(pattern)
+            or _has_nested_evil_quant(pattern)):
+        return "ネスト量化子/交代の反復の疑い(ReDoS 危険)"
     try:
         re.compile(pattern)
     except re.error as e:
