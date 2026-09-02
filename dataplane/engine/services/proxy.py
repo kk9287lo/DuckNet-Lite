@@ -168,8 +168,12 @@ def _set_forwarded_for(buf: bytes, client_ip: str) -> bytes:
     lines = head.split(b"\r\n")
     kept = lines[:1]
     for ln in lines[1:]:
-        low = ln.lower()
-        if low.startswith(b"x-forwarded-for:") or low.startswith(b"x-real-ip:"):
+        # ヘッダ名を『:』手前で切って正規化してから照合(#D13)。旧 startswith(b"x-forwarded-for:")
+        # は完全一致ゆえ "X-Forwarded-For : evil"(コロン前空白)が strip をすり抜け、エッジ付与の
+        # XFF と並んで backend へ届いた。RFC7239 Forwarded も同時に破棄する(信頼 proxy 経路でも
+        # クライアント申告を残さない)。他ヘッダハンドラ(_header_value 等)と同じ split 方式に統一。
+        k = ln.split(b":", 1)[0].strip().lower()
+        if k in (b"x-forwarded-for", b"x-real-ip", b"forwarded"):
             continue                                  # クライアント申告は破棄(偽装無効化)
         kept.append(ln)
     kept.append(b"X-Forwarded-For: " + cb)
@@ -960,13 +964,41 @@ class AsyncEdgeGuard:
                 if extra:
                     bwr.write(extra)                  # buf を超えて読んだ本文先頭も転送
                 await bwr.drain()
-                # #64: client→backend(要求ボディ)に総受信デッドラインを課す(slow-body 対策)。
-                #   応答方向(backend→client)は縛らない(長時間ストリーム/SSE を壊さない)。
-                res = await asyncio.gather(
-                    self._pipe(reader, bwr, ip=ip, deadline=self._body_deadline()),
-                    self._pipe(bre, writer, scan=True, ip=ip, tls=tls, req_host=host))
-                inbound += res[0] + len(extra)
-                outbound += res[1]
+                # #D3: 宣言された本文長ぶんだけを backend へ渡し、それ以降(パイプライン化された
+                #   後続要求)を流さない=#46(bodyless)の半クローズ保証を body 有り要求へ拡張し、
+                #   backend の Connection:close 尊重に依存した smuggling を封じる。走査で本文を
+                #   読み切っている(cap 以下=大多数)なら即 write_eof し client→backend パイプを
+                #   張らない(後続要求は reader に残したまま=転送されず接続 close で破棄)。
+                body_in_buf = buf.partition(b"\r\n\r\n")[2]
+                prefix_len = len(body_in_buf) + len(extra)
+                _te = _header_value(buf, b"transfer-encoding").lower()
+                _clh = _header_value(buf, b"content-length")
+                _cl = int(_clh) if _clh.isdigit() else None
+                if "chunked" in _te:
+                    body_done = (body_in_buf + extra).endswith(b"0\r\n\r\n")
+                    remaining = None
+                elif _cl is not None:
+                    body_done = prefix_len >= _cl
+                    remaining = max(0, _cl - prefix_len)
+                else:
+                    body_done, remaining = True, 0
+                if body_done:
+                    try:
+                        if bwr.can_write_eof():
+                            bwr.write_eof()          # 本文完了=以降 client→backend を流さない
+                    except Exception:
+                        pass
+                    outbound += await self._pipe(bre, writer, scan=True, ip=ip,
+                                                 tls=tls, req_host=host)
+                    inbound += len(extra)
+                else:
+                    # 本文が cap 超で未読=宣言長ぶんだけ有界転送(#64 の総受信デッドライン尊重)。
+                    res = await asyncio.gather(
+                        self._pipe_body_bounded(reader, bwr, remaining, "chunked" in _te,
+                                                self._body_deadline()),
+                        self._pipe(bre, writer, scan=True, ip=ip, tls=tls, req_host=host))
+                    inbound += len(extra) + res[0]
+                    outbound += res[1]
         except Exception:
             pass
         finally:
@@ -1057,13 +1089,91 @@ class AsyncEdgeGuard:
             return None
         return None
 
+    @staticmethod
+    def _dechunk_bounded(data: bytes, max_out: int):
+        """Transfer-Encoding: chunked の本文を *走査用に* 有界復号する(#D5)。返り値=復号バイト、
+        サイズ行が不正(非hex)なら None(=破損→呼び出し側で fail closed)。
+        走査面のみ復号し、backend へは raw のまま転送する(#61 と同じ方針)。旧実装はチャンク
+        符号化のまま走査していたため、境界分割(3\\r\\nUNI\\r\\n9\\r\\nON SELECT)で UNION SELECT が
+        非連続になり body-scan(SQLi/XSS/RCE/upload/GraphQL)を確定的に回避できた。
+        prefix が cap で途中打ち切りされた場合は『読めた分だけ』採用する(不完全≠破損=誤検知回避)。"""
+        out = bytearray()
+        i, n = 0, len(data)
+        while i < n and len(out) < max_out:
+            j = data.find(b"\r\n", i)
+            if j < 0:
+                break                              # サイズ行が途中(prefix 打ち切り)=ここまで
+            size_line = data[i:j].split(b";", 1)[0].strip()   # chunk-ext(;...)は捨てる
+            if not size_line:
+                break
+            try:
+                size = int(size_line, 16)
+            except ValueError:
+                return None                        # 不正なサイズ行=破損 → fail closed
+            if size == 0:
+                break                              # 終端チャンク(0\r\n\r\n)
+            start = j + 2
+            end = start + size
+            if end > n:
+                out += data[start:n]               # 最終チャンクが途中で切れている=読めた分
+                break
+            out += data[start:end]
+            i = end + 2                            # チャンク末尾 CRLF を飛ばす
+        return bytes(out[:max_out])
+
+    async def _pipe_body_bounded(self, reader, bwr, remaining, chunked, deadline):
+        """宣言された本文長ぶんだけ client→backend へ転送し、それ以降(パイプライン化された後続
+        要求)は流さない(#D3)。remaining=残り本文バイト数(Content-Length 時)。chunked=終端
+        0\\r\\n\\r\\n まで転送。総受信デッドライン(#64 body_max_sec)も尊重する。返り値=転送バイト数。
+        本文完了後に write_eof=半クローズ(#46 の bodyless 保証を body 有り要求へ拡張)。"""
+        total = 0
+        loop = asyncio.get_event_loop()
+        tail = b""
+        try:
+            while True:
+                if chunked:
+                    want = 65536
+                else:
+                    if remaining <= 0:
+                        break
+                    want = min(65536, remaining)
+                rem_t = self.head_timeout if deadline is None else (deadline - loop.time())
+                if rem_t <= 0:
+                    break                              # 総受信デッドライン超過=打ち切り(→半クローズ)
+                try:
+                    chunk = await asyncio.wait_for(reader.read(want),
+                                                   min(self.head_timeout, rem_t))
+                except Exception:
+                    break
+                if not chunk:
+                    break
+                bwr.write(chunk)
+                await bwr.drain()
+                total += len(chunk)
+                if chunked:
+                    tail = (tail + chunk)[-8:]
+                    if tail.endswith(b"0\r\n\r\n"):
+                        break
+                else:
+                    remaining -= len(chunk)
+                    if remaining <= 0:
+                        break
+        finally:
+            try:
+                if bwr.can_write_eof():
+                    bwr.write_eof()
+            except Exception:
+                pass
+        return total
+
     async def _scan_request_body(self, buf, reader, ip, path=""):
         """要求ボディの先頭を有界に読んで署名走査する(#61)。返り値 (extra, blocked):
           · extra … buf を *超えて* 読んだ本文先頭バイト(クリーン時に backend へ転送する分)。
           · blocked … 悪性(block)と判定=本文を上流へ流さず接続を切るべきか。
         body_scan 無効なら即 (b"", False)=従来のストリーミングと同一(extra を読まない)。
-        正直な限界: 走査は先頭 cap バイトのみ(巨大本文を全バッファしない)。チャンク本文は raw の
-        まま走査(復号しない=近似)。本文を極端に小出しする回避は slowloris 同様の残余(per-read timeout)。"""
+        正直な限界: 走査は先頭 cap バイトのみ(巨大本文を全バッファしない)。chunked 本文は走査面
+        では有界復号してから走査する(#D5。backend へは raw 転送)。本文を極端に小出しする回避は
+        slowloris 同様の残余(per-read timeout)。"""
         try:
             from ..lifeform.pipeline import net_shield
             sh = net_shield()
@@ -1115,6 +1225,15 @@ class AsyncEdgeGuard:
         blocked = False
         try:
             pb = bytes(prefix)
+            # #D5: chunked 本文は *復号後* を走査する(境界分割による body-scan 回避封じ)。
+            #   Content-Encoding 解凍より前に行う(ワイヤ上は chunk 枠の内側に gzip 等が入る)。
+            #   原本(extra)は backend へ raw のまま転送。破損チャンクは fail closed。
+            if sh.cfg.get("body_decode_enabled", True) \
+                    and "chunked" in _header_value(buf, b"transfer-encoding").lower():
+                dec = self._dechunk_bounded(pb, cap)
+                if dec is None:
+                    return bytes(extra), True      # 破損チャンクストリーム=フェイルクローズ(#111)
+                pb = dec
             # #74: Content-Encoding で圧縮された本文は解凍後を走査する(gzip 化 payload の回避封じ)。
             #   解凍は有界(max_length)=zip bomb 耐性。原本(pb)は backend へそのまま転送する。
             if sh.cfg.get("body_decode_enabled", True):
@@ -1186,11 +1305,21 @@ class AsyncEdgeGuard:
         dst.close() を起こし、相方 pipe の EOF を誘発して両端(クライアント/バックエンド)を解放する。"""
         if data:
             dst.write(data)
+        _cap = getattr(dst, "_dn_stall_cap", 0.0)   # #D2: 応答方向のみ >0(_pipe が装填)
+        _t0 = asyncio.get_event_loop().time() if _cap else 0.0
         try:
             await asyncio.wait_for(dst.drain(), self.write_timeout)
         except asyncio.TimeoutError:
             self._on_slow_read(ip)
             raise                                 # _pipe へ伝播=ストリーム中断→両端カスケード切断
+        if _cap:
+            # drain を待った累積時間が上限超=slow-read 兵糧攻め(小出し受信で無期限保持)とみなし切断。
+            # 高速 client / idle SSE は drain 待ち≒0 ゆえ加算されず誤切断しない(#D2)。
+            acc = getattr(dst, "_dn_stall", 0.0) + (asyncio.get_event_loop().time() - _t0)
+            dst._dn_stall = acc
+            if acc > _cap:
+                self._on_slow_read(ip)
+                raise asyncio.TimeoutError()       # 累積 drain 待ち超過=zero-window 同様にカスケード切断
 
     def _on_slow_read(self, ip):
         """応答の受信を止めたまま放置する遅延読取(TCP zero-window 兵糧攻め・#9)の検知。
@@ -1224,6 +1353,13 @@ class AsyncEdgeGuard:
                 harden_redir = bool(s.cfg.get("open_redirect_enabled"))
                 if add_sec or harden_ck or harden_cors or harden_redir:   # いずれかで head 処理起動
                     sec_cfg = s.cfg
+                # #D2: 応答方向(scan=True=backend→client)にのみ slow-read 累積 drain 待ち上限を装填。
+                #   >0 のときだけ _send が累積計上して超過で切断する(0=従来どおり無制限=SSE 非破壊)。
+                try:
+                    dst._dn_stall_cap = float(s.cfg.get("resp_stall_sec", 0) or 0)
+                    dst._dn_stall = 0.0
+                except Exception:
+                    pass
             except Exception:
                 sh, sec_cfg = None, None
         head_done = sec_cfg is None               # 無効なら head 処理を飛ばし従来とバイト完全同一
