@@ -189,7 +189,13 @@ def _forwarded_proto_tls(peer_ip: str, buf: bytes, trusted) -> bool:
     from ..lifeform.netutil import ip_in_any
     if not ip_in_any(peer_ip, trusted):
         return False
-    return b"x-forwarded-proto: https" in buf.lower()
+    # 実際の X-Forwarded-Proto ヘッダ *値* を解析する(head 内・ヘッダ名先頭一致)。
+    # 旧実装は buf 全体の substring 照合で、body や別ヘッダ値に文字列 "x-forwarded-proto: https"
+    # を仕込むだけで tls=True を偽装でき、信頼 proxy が正しく http をセットしても require_tls を
+    # 回避できた(#forwarded-trust)。_real_client_ip の XFF 解析と同じく _header_value を使う。
+    # プロキシ連鎖("https, http")では先頭=元クライアントのプロトコルを採る。
+    xfp = _header_value(buf, b"x-forwarded-proto").split(",", 1)[0].strip().lower()
+    return xfp == "https"
 
 
 # 解除リクエスト(異議申立)の受付パス。遮断中ユーザーでも到達できる(BAN判定の手前)。
@@ -379,22 +385,33 @@ def _header_names(buf: bytes, max_headers: int = 64) -> list:
         return []
 
 
-def _scan_header_values(buf: bytes, per: int = 2048, max_headers: int = 64) -> str:
+def _scan_header_values(buf: bytes, per: int = 8192, max_headers: int = 64) -> str:
     """攻撃者制御のヘッダ値(Referer/X-Forwarded-For/Cookie/独自ヘッダ等)を WAF の走査面へ。
     Log4Shell/SQLi 等は UA 以外のあらゆるヘッダから来る。構造系/高頻度・低リスク(Accept* 等)は除外。
     各値を *個別に* 上限化(per)し改行で区切って返す=inspect 側がヘッダ毎に独立走査でき(#39)、
     早いヘッダのパディングで後のヘッダ値が走査面から押し出されるのを防ぐ。本数も上限化(走査面積有界)。
-    値に生改行は無い(framing 検査が裸LF/CRを既に拒否)ため改行は曖昧でない区切りになる。"""
+    値に生改行は無い(framing 検査が裸LF/CRを既に拒否)ため改行は曖昧でない区切りになる。
+    per は engine の 1 フィールド上限 _MAX_SCAN(8192)に合わせる: 旧 2048 は head バッファ
+    (16384)や backend へ転送される実サイズより小さく、値の 2048〜転送サイズ間が *転送されるのに
+    未走査* になる窓だった(単一ヘッダ padding で Log4Shell/SQLi を素通しできた)。
+    max_headers を超える分は捨てず 1 つの結合末尾フィールドとして必ず走査面へ含める: 先頭を
+    ダミーヘッダで埋めて後続の悪性ヘッダを本数上限の外へ押し出す回避(#field-count)を封じる。"""
     try:
         head = buf.split(b"\r\n\r\n", 1)[0]
         vals = []
+        tail = []
         for ln in head.split(b"\r\n")[1:]:
             k, sep, v = ln.partition(b":")
             if not sep or k.strip().lower() in _SCAN_SKIP_HDR:
                 continue
-            vals.append(v.strip()[:per])
-            if len(vals) >= max_headers:
-                break
+            v = v.strip()[:per]
+            if len(vals) < max_headers:
+                vals.append(v)
+            else:
+                tail.append(v)
+        if tail:
+            # 上限超ヘッダを 1 フィールドに結合して必ず走査(転送される全ヘッダ内容を走査面に残す)
+            vals.append(b" ".join(tail)[:per])
         return b"\n".join(vals).decode("latin1", "replace")
     except Exception:
         return ""
@@ -780,7 +797,12 @@ class AsyncEdgeGuard:
             _p = path.split("?")[0]
             # 解除リクエスト(異議申立)経路はBAN判定の手前=遮断中のユーザーでも到達できる。
             if _p == _APPEAL_PATH:
-                return await self._handle_appeal(ip, path, sh, writer)
+                try:
+                    return await self._handle_appeal(ip, path, sh, writer)
+                except Exception:
+                    # _handle は try/finally のみ(except無し)で、ここで漏らすと接続が
+                    # 誰にも close されないまま残る(#111 の副作用で新たに生じた握り漏れ)。
+                    return self._close(writer)
             # 0) 既知BANの瞬殺プリスキャン(ブルーム・ロックなしほぼO(1))。重い inspect
             #    (ロック/正規表現/state)へ行く手前で、執拗な再攻撃Botをビット演算で即落とす。
             #    失敗時はフェイルオープン=下の inspect() がロック下で BAN 状態を再判定する。
@@ -837,6 +859,11 @@ class AsyncEdgeGuard:
                     except Exception:
                         pass
                 return self._close(writer)        # Fail Fast=スレッド非消費
+            if act != "allow":
+                # 既知アクション(block/throttle/allow)以外へ来た=判定不能。
+                # フェイルクローズ(#111): 未知アクションを backend 素通し(=許可)にしない。
+                self.metrics["dropped"] += 1
+                return self._close(writer)
         # 3) allow → バックエンドへ非同期パイプ(綺麗なアクセスだけ本体に通す)
         try:
             bre, bwr = await self._open_backend()
@@ -866,8 +893,23 @@ class AsyncEdgeGuard:
             except Exception:
                 _fcc = True                           # 取得失敗時も安全側(close)
             fwd = _force_conn_close(buf) if _fcc else buf   # #31: 既定で Connection: close
-            if _tp:                                   # #35: 信頼proxy構成では実クライアントIPを転送
-                fwd = _set_forwarded_for(fwd, ip)     #      (バックエンドが偽装不能な客IPを得る)
+            # クライアント供給の実IP/プロトコル系ヘッダの扱い(#spoof + #35):
+            #   信頼proxy経由 → 解決済み実クライアントIPで X-Forwarded-For/X-Real-IP を上書き。
+            #   直結/非信頼   → 真の TCP peer で XFF/X-Real-IP を上書きし、偽装され得る
+            #     X-Forwarded-Proto / Forwarded は除去する。旧実装は trusted_proxies 未設定の
+            #     既定でこれらを *無改変* に backend へ流し、直結の攻撃者が XFF/X-Real-IP で内部IP
+            #     偽装(IP allowlist/レート回避・ログ汚染)、XFP: https で TLS 偽装(HTTP→HTTPS
+            #     リダイレクト無効化・平文経由の Secure Cookie 送出)を backend に信じ込ませ得た。
+            try:
+                from ..lifeform.netutil import ip_in_any as _ipin
+                _trusted_peer = bool(_tp) and _ipin(peer_ip, _tp)
+            except Exception:
+                _trusted_peer = False
+            if _trusted_peer:
+                fwd = _set_forwarded_for(fwd, ip)     # backendが偽装不能な実クライアントIPを得る
+            else:
+                fwd = _strip_request_headers(fwd, (b"x-forwarded-proto", b"forwarded"))
+                fwd = _set_forwarded_for(fwd, peer_ip)   # 真の peer で XFF/X-Real-IP を上書き
             # #75: 信頼 proxy 経由でないクライアント供給のキャッシュ汚染ヘッダ(X-Forwarded-Host 等)を
             #   除去。バックエンドが反映してのキャッシュ汚染/パスワードリセット・ポイズニングを防ぐ。
             try:
@@ -1025,11 +1067,16 @@ class AsyncEdgeGuard:
         try:
             from ..lifeform.pipeline import net_shield
             sh = net_shield()
-            if not sh.cfg.get("body_scan_enabled"):
-                return b"", False
+            body_scan_enabled = sh.cfg.get("body_scan_enabled")
+        except Exception:
+            return b"", True   # フェイルクローズ: net_shield 到達不能を「スキャンなし」にしない(#111)。
+                                # 下の走査例外ハンドラと同じ方針(素通しは本文検査の丸ごとバイパスになる)。
+        if not body_scan_enabled:
+            return b"", False
+        try:
             cap = int(sh.cfg.get("body_scan_max_bytes", 65536))
         except Exception:
-            return b"", False
+            cap = 65536
         body_in_buf = buf.partition(b"\r\n\r\n")[2]
         # Content-Length を尊重して読み取りを *正確に* 上限化する。これが無いと本文完了後も
         # cap まで read() がブロック=全 POST に head_timeout 分の遅延が乗る(性能バグ)。
