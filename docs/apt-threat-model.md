@@ -80,6 +80,49 @@ export DUCKNET_ORIGIN_KEY="$(vault read -field=k secret/ducknet/origin)"
 (`state_tamper` イベント)。in-memory の cfg すり替えも MAC で検知し、ディスクの署名済み状態から
 自動復元する(`memory_tamper`)。ダッシュボード `GET /api/shield/tamper` で要約+直近イベントを確認する。
 
+## 6. ホスト侵害後の横展開抑止(DuckNet を中継地点/C2 として使わせない)
+
+前提の踏み直し: 1〜5節はすべて「DuckNet を迂回される」防御。ここでは逆の想定——**DuckNet 自身が
+動くホストが乗っ取られた場合**、そのホストが内部ネットワークへの横展開の中継基地として悪用される
+のを防ぐ。DuckNet は通信を検査・復号する特権的な位置(TLS 終端・backend への信頼された経路)に
+あり、周囲のファイアウォール/セキュリティグループは *この用途のために* 穴を開けている。ホストを
+握った攻撃者にとって、その「既に開いている穴」を通って外へ出る方が、自前の通信経路を新設するより
+検知されにくい。
+
+- **エッジ・アウトバウンドの許可リスト化(最重要)**: DuckNet ホストの outbound を、実際に必要な
+  宛先だけに **ファイアウォール/SG レベルで** 限定する。監査済みの事実として、DuckNet 自身の
+  コードは backend アドレスを起動時の `--backend` 固定値としてのみ保持し、管理API経由でも宣言的
+  設定ファイル(`apply_config`/`--config`)経由でも **実行時に変更する経路は存在しない**
+  (`NetShield.apply_config` が触るのは検知設定 `self.cfg` のみで、`AsyncEdgeGuard` の
+  backend アドレスとは無関係)。つまり *正規の動作として* DuckNet が到達する必要があるのは
+  backend の1箇所だけであり(このLiteエディションには SIEM/Webhook 転送は含まれない)、この
+  事実を使ってホストの outbound をそれ以外は default-deny にできる:
+```
+# 例: iptables(概念)。backend 以外への新規 outbound を拒否
+iptables -A OUTPUT -d <backend_ip> -p tcp --dport <backend_port> -j ACCEPT
+iptables -A OUTPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
+iptables -A OUTPUT -j DROP
+```
+  クラウドなら SG/NSG の Egress ルールで同じことを実現するほうが、ホスト内改竄に対して堅牢
+  (iptables ルール自体もホスト侵害で書き換えられ得るため)。
+- **ホストの最小権限**: 専用の非特権サービスアカウントで起動する。ベアメタル/VM 配備では、
+  DuckNet 専用の低権限ユーザーで動かし、sudo/管理者権限を持たせない。
+- **他システムの認証情報をこのホストに置かない**: DuckNet は防御専用であり、他の内部システムへの
+  SSH鍵・クラウド IAM 認証情報・別サービスの API キー等を **このホストにキャッシュ/保管する理由が
+  そもそも無い**。監視エージェント等の他ツールを同居させているなら、それらが実際の横展開の踏み台
+  になり得ないか個別に精査すること(DuckNet 自体はこの種の認証情報を一切扱わない)。
+- **鍵の即時ローテーション**: ホスト侵害が疑われたら、`DUCKNET_ORIGIN_KEY`/`DUCKNET_STATE_KEY`
+  (4節)を **直ちにローテーション**する。これらはホスト侵害後も持ち出されて悪用され得る
+  「唯一の持続的資産」であり、プロセスの再起動・再デプロイだけでは無効化されない。
+- **ネットワークセグメンテーション**: DuckNet ホストは、他の内部ホストへ到達できる必要が基本的に
+  無い。専用のセグメント/VLAN に置き、たとえ乗っ取られても隣接ホストへ直接到達できないよう構成
+  する(踏み台としての価値そのものを構造的に下げる)。
+
+> 正直な範囲: これらはすべて **ホスト/ネットワーク層の統制**であり、DuckNet 自身のコードで
+> 強制することはできない(OS のファイアウォール設定を書き換えるのは「OS 非侵襲」という設計方針
+> そのものに反する)。DuckNet 側で監査済みの事実(backend が実行時に変更不能)を踏まえ、
+> その事実に対応するネットワーク許可リストを外側で組むのが、この節の唯一の実効策である。
+
 ---
 
 ## 配備チェックリスト(APT 想定)
@@ -90,6 +133,9 @@ export DUCKNET_ORIGIN_KEY="$(vault read -field=k secret/ducknet/origin)"
 - [ ] **鍵**: `DUCKNET_*_KEY` を VM 外(KMS/Vault)に。ディスクに置かない。
 - [ ] **OS**: systemd ハードニング + `LimitNOFILE`/`MemoryMax`/`TasksMax`、`chattr +i`/読取専用マウント(docs/hardening.md)。
 - [ ] **検知**: ダッシュボード(`/api/shield/events` / `/api/shield/tamper`)を定期監視。`stall_detect_enabled`・改竄イベントを確認。
+- [ ] **横展開抑止**: DuckNet ホストの outbound を backend のみにファイアウォール/SG で制限。
+  専用低権限アカウントで起動、他システムの認証情報を同居させない。侵害疑い時は
+  `DUCKNET_*_KEY` を即座にローテーション。
 - [ ] **最新化**: CPython・OS を最新に。seccomp/AppArmor で syscall を絞る。
 
 ## 関連
