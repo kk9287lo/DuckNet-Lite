@@ -113,9 +113,13 @@ def _audit_entry(path: str, b: dict, r: dict, pre_cfg: dict, pre_fw: dict):
                 {"net": net, "action": b.get("action", "deny")}, None)
     if path == "/api/firewall/resolve":
         approve = bool(b.get("approve"))
+        remember = bool(b.get("remember"))
         ip = r.get("ip", "")
-        return (f"pending connection {ip or b.get('id', '')} {'approved' if approve else 'denied'}",
-                None, {"id": b.get("id", ""), "approve": approve, "ip": ip}, None)
+        suffix = "(記憶=常時許可)" if approve and remember else "(一時)" if approve else ""
+        return (f"pending connection {ip or b.get('id', '')} "
+                f"{'approved' if approve else 'denied'}{suffix}",
+                None, {"id": b.get("id", ""), "approve": approve,
+                       "remember": remember, "ip": ip}, None)
     if path == "/api/shield/toggle":
         on = bool(b.get("on"))
         return (f"shield {'enabled' if on else 'disabled'}", pre_cfg.get("enabled"), on,
@@ -552,7 +556,10 @@ def _make_handler(app: AdminDashboard):
                 elif path == "/api/firewall/resolve":
                     # ゾーン policy が "prompt" の未知接続(保留)を承認(allow)/拒否(deny)する。
                     # これが無いと prompt は deny と等価な行き止まりになる(#2)。
-                    remember = bool(b.get("remember", True))
+                    # remember 未指定は既定 False=この接続だけの一時許可/拒否(#D6/#111: 「承認」
+                    # 1クリックで恒久 allow ルールが黙って acl.json に積まれるのを避ける。恒久化は
+                    # 明示チェックボックス経由)。Full 版へ移植済みの挙動を Lite にも反映。
+                    remember = bool(b.get("remember"))
                     r = (fw.approve(b.get("id", ""), remember=remember)
                          if b.get("approve")
                          else fw.deny_pending(b.get("id", ""), remember=remember))
@@ -1134,7 +1141,7 @@ const JA2EN={
  "3 · 積極":"3 · aggressive","4 · 最大(高FP許容)":"4 · maximum (high FP ok)",
  "解除リクエスト(異議申立)":"Unban requests (appeals)",
  "承認待ち接続(ファイアウォール)":"Pending connections (firewall)","zone policy=prompt の未知接続":"Unknown connections under zone policy=prompt",
- "承認待ちなし":"No pending connections",
+ "承認待ちなし":"No pending connections","常時許可として記憶":"Remember as always-allow",
  "デセプション(MTD)":"Deception (MTD)",
  "低速持続 · 規則的ビーコン · 累積":"Low-and-slow · beacon · cumulative",
  "外部(public)推移 · 内訳":"External (public) trend · breakdown","既定OFF · 誤検知許容な環境のみ点灯":"Off by default · enable where FPs OK",
@@ -1421,7 +1428,8 @@ async function refresh(){
  $("fwpending").querySelector("tbody").innerHTML=pend.map(p=>
    `<tr><td class="num">${esc(p.ip)}</td><td><span class="badge info">${esc(p.zone)}</span></td>
    <td class="num">${tm(p.ts)}</td>
-   <td><button onclick="resolvePending('${esc(p.id)}',true,this)">${tr("承認")}</button>
+   <td><label class="meta" style="font-weight:normal;cursor:pointer"><input type="checkbox" id="rem_${esc(p.id)}"> ${tr("常時許可として記憶")}</label>
+   <button onclick="resolvePending('${esc(p.id)}',true,this)">${tr("承認")}</button>
    <button class="red" onclick="resolvePending('${esc(p.id)}',false,this)">${tr("却下")}</button></td></tr>`).join("")
    ||'<tr><td colspan="4" class="empty">'+tr("承認待ちなし — ゾーンポリシーが「承認待ち」のゾーンで新規接続があるとここに表示されます")+'</td></tr>';
 }
@@ -1728,7 +1736,9 @@ async function resolveAppeal(ip,ok,btn){
 }
 async function resolvePending(id,ok,btn){
  if(!ok&&!(await confirmDialog(tr("この接続を拒否しますか?"))))return;
- postT("/api/firewall/resolve",{id,approve:ok},btn,ok?tr("接続を承認しました"):tr("接続を拒否しました"),tr("処理に失敗")).then(refresh);
+ const remCk=ok?document.getElementById("rem_"+id):null;
+ const remember=!!(remCk&&remCk.checked);
+ postT("/api/firewall/resolve",{id,approve:ok,remember},btn,ok?tr("接続を承認しました"):tr("接続を拒否しました"),tr("処理に失敗")).then(refresh);
 }
 function unban(ip,btn){postT("/api/shield/unban",{ip},btn,tr("BANを解除しました"),tr("解除に失敗")).then(refresh)}
 async function ban(btn){
