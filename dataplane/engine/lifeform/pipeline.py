@@ -233,6 +233,11 @@ _DEFAULTS = {
     # 無かった。client→backend 方向のみに効く(応答=backend→client の長時間ストリームは縛らない)。
     "body_timeout_enabled": True,  # 要求ボディの総受信時間に上限(slow-body 接続枯渇対策)
     "body_max_sec": 60,            # ボディ受信の総許容秒(超過=切断+slow_body 加点)。大容量UL は上げる
+    # 応答方向 slow-read 兵糧攻め対策(#D2): 応答転送中に client 側 drain(受信)を待った *累積* 時間の
+    # 上限秒。0=無効(既定=SSE/長時間ストリーム/低速回線の大容量DL を壊さない)。>0 にすると、
+    # client がわざと小出しに受信して接続/backend ソケットを無期限保持する攻撃を切断できる。
+    # 高速 client や無通信の idle SSE は drain 待ちがほぼ 0 なので誤切断しない(累積のみ加算)。
+    "resp_stall_sec": 0.0,
     # Set-Cookie ハードニング(evolution #65): 応答 Set-Cookie に欠けた保護属性を補完する。
     # バックエンドが付け忘れても WAF 側で Cookie を硬くする(セキュリティヘッダ注入#12 と同型)。
     "cookie_harden_enabled": True, # 応答 Set-Cookie に SameSite/Secure(TLS時)を補完
@@ -622,9 +627,12 @@ def _normalize_for_scan(s: str) -> str:
             s = re.sub(r"\\u([0-9a-fA-F]{4})|\\x([0-9a-fA-F]{2})|\\U([0-9a-fA-F]{8})", _unesc, s)
         if not s.isascii():                          # ASCII はそのまま(高速パス)。非ASCIIのみ重処理。
             try:
-                s = unicodedata.normalize("NFKC", s)
+                # NFKC は 1 文字を最大 ~18 文字へ展開する(例 U+FDFA)。エスケープ復号で ASCII から
+                # 高コードポイントを再生成した入力だと、per-char Cf フィルタと後段 regex が過大長を
+                # 走査し event-loop を占有する(#D1)。展開直後に _PRE_CUT へ再切詰して有界化する。
+                s = unicodedata.normalize("NFKC", s)[:_PRE_CUT]
             except Exception:
-                pass
+                s = s[:_PRE_CUT]
             # 書式文字(Cf=ゼロ幅/ソフトハイフン/方向制御 等)と \t\r\n 以外の制御文字を除去。
             s = "".join(c for c in s if not (
                 unicodedata.category(c) == "Cf"
@@ -2266,16 +2274,24 @@ class NetShield:
         return self._maybe_release(ip)
 
     def _maybe_release(self, ip: str) -> dict:
-        r = self._restrictions.get(ip)
-        if r and r["user_ok"] and r["admin_ok"]:
-            r["status"] = "released"
+        # 共有 _restrictions の読取+status 書込はロック下で行う(#D12: submit_report/admin_confirm は
+        # 各自の with 内で他フィールドを書くが、_maybe_release は従来ロック外で status を書き、
+        # list_restrictions 等の並行読取と競合していた)。unban/_event は I/O を伴うのでロック外へ。
+        with self._lock:
+            r = self._restrictions.get(ip)
+            released = bool(r and r["user_ok"] and r["admin_ok"])
+            if released:
+                r["status"] = "released"
+            status = r["status"] if r else "?"
+            need_user = not (r and r["user_ok"])
+            need_admin = not (r and r["admin_ok"])
+        if released:
             self.unban(ip)
             self._event(ip, "restriction_released", {})
             return {"ok": True, "released": True, "status": "released",
                     "note": "双方合意により解除されました。"}
-        return {"ok": True, "released": False, "status": r["status"] if r else "?",
-                "need": {"user_report": not (r and r["user_ok"]),
-                         "admin_confirm": not (r and r["admin_ok"])}}
+        return {"ok": True, "released": False, "status": status,
+                "need": {"user_report": need_user, "admin_confirm": need_admin}}
 
     def list_restrictions(self) -> list:
         with self._lock:
@@ -2343,16 +2359,21 @@ class NetShield:
 
     def resolve_appeal(self, ip: str, approve: bool, note: str = "") -> dict:
         """管理者が解除リクエストを承認(=BAN解除)/却下する。"""
-        ap = self._appeals.get(ip)
-        if not ap:
-            return {"ok": False, "error": f"申立が無い: {ip}"}
-        ap["status"] = "approved" if approve else "denied"
-        ap["resolved_ts"] = _now()
-        ap["note"] = note
+        # 共有 _appeals の読取+変更をロック下で行う(#D12: 従来 resolve_appeal は無ロックで
+        # status/resolved_ts/note を書き、list_appeals/analysis の並行読取と競合していた)。
+        # unban/_event は I/O を伴うのでロック外へ。status はロック内で確定させて後段で使う。
+        with self._lock:
+            ap = self._appeals.get(ip)
+            if not ap:
+                return {"ok": False, "error": f"申立が無い: {ip}"}
+            status = "approved" if approve else "denied"
+            ap["status"] = status
+            ap["resolved_ts"] = _now()
+            ap["note"] = note
         if approve:
             self.unban(ip)
-        self._event(ip, "appeal_" + ap["status"], {})
-        return {"ok": True, "ip": ip, "status": ap["status"]}
+        self._event(ip, "appeal_" + status, {})
+        return {"ok": True, "ip": ip, "status": status}
 
     # ── リアルタイム時系列(グラフ用) / プロ詳細分析 ──
     def sample_series(self) -> None:
