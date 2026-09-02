@@ -257,8 +257,8 @@ class AdminDashboard:
                 "capabilities": self._safe_dict(AsyncEdgeGuard.platform_capabilities),
                 # 前衛ガード(接続受理/バックエンド不達等)の生指標。edge_guard 未配線
                 # (単体テスト・旧呼び出し元)なら空 dict=既存の見た目を壊さない。
-                "edge_metrics": (dict(self.edge_guard.metrics) if self.edge_guard
-                                 else {})}
+                "edge_metrics": (self._safe_dict(lambda: dict(self.edge_guard.metrics))
+                                 if self.edge_guard else {})}
 
     def deception_status(self) -> dict:
         """動的デセプション(MTD)の状態。env 駆動・状態レスのため本プロセスの env を反映し、
@@ -333,24 +333,30 @@ def _make_handler(app: AdminDashboard):
 
         def _send(self, code, body, ctype="application/json; charset=utf-8",
                   set_cookie=None):
-            data = body if isinstance(body, bytes) else body.encode("utf-8")
-            self.send_response(code)
-            self.send_header("Content-Type", ctype)
-            self.send_header("Content-Length", str(len(data)))
-            if set_cookie:
-                self.send_header("Set-Cookie", set_cookie)
-            # セキュリティヘッダ(深層防御): クリックジャッキング/MIME詮索/外部読込/参照漏れの抑止。
-            # 本体は依存ゼロの単一HTML(全インライン)なので script/style は 'unsafe-inline' を許可、
-            # 通信先は同一オリジンのみ(connect-src 'self')に縛る。
-            self.send_header("X-Content-Type-Options", "nosniff")
-            self.send_header("X-Frame-Options", "DENY")
-            self.send_header("Referrer-Policy", "no-referrer")
-            self.send_header("Content-Security-Policy",
-                             "default-src 'self'; script-src 'self' 'unsafe-inline'; "
-                             "style-src 'self' 'unsafe-inline'; img-src 'self' data:; "
-                             "connect-src 'self'; frame-ancestors 'none'; base-uri 'none'")
-            self.end_headers()
+            # 全体を1つの try で囲む: send_response/send_header/end_headers 自体も
+            # (クライアント切断後の broken pipe 等で)例外を投げ得る。ここで漏らすと、
+            # 呼び出し元の「例外→_send(500,...) でフォールバック応答」という型の処理
+            # (do_GET/do_POST の外側ハンドラ)が、既に壊れた接続へ二重に _send を試みて
+            # 二重に例外を出すことになる。_send は常に無害に失敗できる=決して例外を
+            # 外へ漏らさない、という契約にする。
             try:
+                data = body if isinstance(body, bytes) else body.encode("utf-8")
+                self.send_response(code)
+                self.send_header("Content-Type", ctype)
+                self.send_header("Content-Length", str(len(data)))
+                if set_cookie:
+                    self.send_header("Set-Cookie", set_cookie)
+                # セキュリティヘッダ(深層防御): クリックジャッキング/MIME詮索/外部読込/参照漏れの抑止。
+                # 本体は依存ゼロの単一HTML(全インライン)なので script/style は 'unsafe-inline' を許可、
+                # 通信先は同一オリジンのみ(connect-src 'self')に縛る。
+                self.send_header("X-Content-Type-Options", "nosniff")
+                self.send_header("X-Frame-Options", "DENY")
+                self.send_header("Referrer-Policy", "no-referrer")
+                self.send_header("Content-Security-Policy",
+                                 "default-src 'self'; script-src 'self' 'unsafe-inline'; "
+                                 "style-src 'self' 'unsafe-inline'; img-src 'self' data:; "
+                                 "connect-src 'self'; frame-ancestors 'none'; base-uri 'none'")
+                self.end_headers()
                 self.wfile.write(data)
             except Exception:
                 pass
@@ -372,6 +378,56 @@ def _make_handler(app: AdminDashboard):
             except Exception:
                 return {}
 
+        def _hostname_allowed(self, hostname) -> bool:
+            """hostname(port/[]除去済み・小文字)が管理面の正規ホストとして許可されるか。
+            DNSリバインディング対策の核心: 攻撃者ページは *ドメイン名*(evil.com)でしか
+            ゲートウェイの loopback へ到達させられない(rebind 後も URL のホストは evil.com)。
+            そこで **IPリテラル or localhost or 自身の bind host or 運用者許可リスト** のみ許可し、
+            それ以外のホスト名は拒否する=rebinding(Host: evil.com)と、管理面を外部ドメインで
+            前段公開する構成(全 peer が loopback に見えトークンが誰にでも渡る)を同時に塞ぐ。"""
+            if not hostname:
+                return True     # Host 無し(HTTP/1.0/生クライアント)は rebinding 経路になり得ない
+            if hostname in ("localhost", str(app.host).lower()):
+                return True
+            try:
+                import ipaddress
+                ipaddress.ip_address(hostname)   # IPリテラル(loopback/LAN/直IP アクセス)は許可
+                return True
+            except ValueError:
+                pass
+            allowed = os.environ.get("DUCKNET_ADMIN_ALLOWED_HOSTS", "")
+            allow = {h.strip().lower() for h in allowed.split(",") if h.strip()}
+            return hostname in allow
+
+        @staticmethod
+        def _host_of(raw: str) -> str:
+            """Host/Origin 由来の権威値から hostname 部(port/[]除去・小文字)を取り出す。"""
+            raw = (raw or "").strip().lower()
+            if not raw:
+                return ""
+            if raw.startswith("//"):
+                raw = raw[2:]
+            if "://" in raw:                     # Origin: scheme://host:port
+                raw = raw.split("://", 1)[1]
+            raw = raw.split("/", 1)[0]
+            if raw.startswith("["):              # [ipv6]:port
+                end = raw.find("]")
+                return raw[1:end] if end != -1 else raw
+            return raw.rsplit(":", 1)[0] if raw.count(":") == 1 else raw
+
+        def _host_ok(self) -> bool:
+            """Host ヘッダの検証(全リクエスト・認証やトークン配布より手前)。"""
+            return self._hostname_allowed(self._host_of(self.headers.get("Host")))
+
+        def _origin_ok(self) -> bool:
+            """状態変更 POST の Origin/Referer 同一オリジン検査(CSRF/rebinding の多層防御)。
+            Origin(無ければ Referer)が提示されていて、その host が許可外なら拒否する。
+            プログラム的クライアント(Origin/Referer 無し)はトークン必須で別途守られる。"""
+            src = self.headers.get("Origin") or self.headers.get("Referer") or ""
+            if not src:
+                return True
+            return self._hostname_allowed(self._host_of(src))
+
         @staticmethod
         def _may_set_token_cookie(peer_ip, authed, query_token, real_token) -> bool:
             """`/` 訪問時にトークン Cookie を配ってよいか。**無認証の第三者へは配らない**
@@ -387,6 +443,11 @@ def _make_handler(app: AdminDashboard):
                 str(real_token).encode("utf-8", "ignore"))
 
         def do_GET(self):
+            # Host 検証は `/`(トークンCookie配布)より手前。rebinding/前段公開でトークンを
+            # 無認証の第三者へ渡さない(#auth)。421=Misdirected Request。
+            if not self._host_ok():
+                self._send(421, _j({"ok": False, "error": "host not allowed"}))
+                return
             path = self.path.split("?")[0]
             if path in ("/", "/index.html"):
                 html = (_HTML.replace("__BRAND__", app.brand)
@@ -461,6 +522,13 @@ def _make_handler(app: AdminDashboard):
                 self._send(404, _j({"ok": False, "error": "not found"}))
 
         def do_POST(self):
+            # Host + Origin 検証を認証より手前に置く(rebinding/CSRF の多層防御)。
+            if not self._host_ok():
+                self._send(421, _j({"ok": False, "error": "host not allowed"}))
+                return
+            if not self._origin_ok():
+                self._send(403, _j({"ok": False, "error": "bad origin"}))
+                return
             if not self._auth():
                 self._send(401, _j({"ok": False, "error": "token required"}))
                 return
@@ -694,7 +762,20 @@ canvas,svg{display:block;width:100%}
  justify-content:center;z-index:250;padding:16px}
 .modal{background:var(--panel);border:1px solid var(--line);border-radius:var(--r);box-shadow:var(--shadow);
  padding:20px;max-width:420px;width:100%}
+.modal.wide{max-width:640px}
 .modal-msg{font-size:var(--fs-md);color:var(--fg);margin-bottom:16px;line-height:1.5;white-space:pre-line}
+.modal-body{max-height:min(60vh,520px);overflow-y:auto;margin-bottom:16px;font-size:var(--fs-sm)}
+.modal-body h3{margin:16px 0 8px;font-size:var(--fs-md)}
+.modal-body h3:first-child{margin-top:0}
+.modal-body ol,.modal-body ul{margin:0 0 4px;padding-left:20px;line-height:1.7}
+.modal-body p{margin:0 0 4px;color:var(--dim)}
+.modal-body .upsell{margin-top:16px;padding:12px 14px;border-radius:var(--r2);
+ background:color-mix(in srgb,var(--amber) 10%,transparent);
+ border:1px solid color-mix(in srgb,var(--amber) 30%,var(--line))}
+.modal-body .upsell h3{margin-top:0}
+.modal-body .upsell ul{margin-bottom:0}
+.modal-body .upsell li{margin-bottom:6px}
+.modal-body .upsell li b{color:var(--fg)}
 .modal-actions{display:flex;justify-content:flex-end;gap:8px}
 /* 初回ロードのスケルトン: 『本当にゼロ』ではなく『まだ届いていない』と分かるように */
 .skel-bar{display:inline-block;height:.85em;min-width:24px;border-radius:4px;vertical-align:middle;
@@ -732,10 +813,48 @@ th.sortable .sortarrow{display:inline-block;width:9px;font-size:9px;color:var(--
     </div>
   </div>
 </div>
+<div class="modal-overlay" id="helpOverlay" style="display:none">
+  <div class="modal wide">
+    <h2 style="margin:0 0 12px">__BRAND__</h2>
+    <div class="modal-body" id="helpBody">
+      <h3>使い方</h3>
+      <pre class="code" style="margin:0 0 10px">python -m dataplane --backend 127.0.0.1:8080 --listen 8443 --admin 8081</pre>
+      <ol>
+        <li>起動すると --listen 宛の通信を検査し、問題なければ --backend(あなたのWebサーバ)へ転送します。</li>
+        <li>本ダッシュボードは --admin ポートで待受け、起動時にコンソールへ表示されるトークンで認証します。</li>
+        <li>上部の「ファイアウォール」「DDoS / 侵入防御」トグルで防御レイヤーをON/OFFできます。</li>
+        <li>「攻撃イベント」「BAN中のIP」でリアルタイム監視。手動でのBAN/解除も可能です。</li>
+        <li>「WAF / 検知設定」パネルでしきい値・機能ごとのON/OFFを調整できます(保存は即時反映)。</li>
+      </ol>
+      <h3>できること(Lite版)</h3>
+      <ul>
+        <li>WAF: SQLi・XSS・RCE・パストラバーサル・XXE・SSRF・JNDI・スキャナー等のシグネチャ照合、カスタムシグネチャ追加</li>
+        <li>L7 DDoS防御: レート制限・脅威スコアリング・自動BAN(拒否スコア/BANスコアの2段階)</li>
+        <li>双方向の検査: リクエストボディ(POST/JSON/GraphQL・gzip解凍を含む)+ 応答のDLP・セキュリティヘッダ付与</li>
+        <li>認証・濫用対策: JWT検査・クレデンシャル単位のレート制限</li>
+        <li>状態の整合性: BAN/設定のHMAC署名による改竄耐性</li>
+      </ul>
+      <p>より詳しい説明は README.md および docs/ 配下のドキュメントを参照してください。</p>
+      <div class="upsell">
+        <h3>フル版でできること</h3>
+        <p>Lite は WAF / DDoS 対策の中核機能を無償で提供します。次のような領域は上位版(フル版)で加わります。</p>
+        <ul>
+          <li><b>可用性:</b> ファイルの改竄を自己完全性監視で検知・自動修復し、プロセスが落ちても watchdog が自動再起動します。無人運用でも稼働を維持できます。</li>
+          <li><b>ボットとの選別:</b> 動的PoWチャレンジで、正規ユーザーを通しながら自動化された攻撃だけを絞り込みます(Liteは拒否/BANの二値判定のみ)。GeoIP・許可リスト(allowlist)・ステルス運用によるアクセス制御も加わります。</li>
+          <li><b>侵入後の検知:</b> LDAP/SMB/Kerberosデコイ、囮ファイル、カナリアトークン、ハニーポットで、境界を突破された後の不審な動きも捕捉します。DNSフィルタはC2通信やトンネリングを見つけます。</li>
+          <li><b>運用への統合:</b> 検知結果をSIEMやSlackへリアルタイム転送(Webhook/Syslog)。脅威インテリジェンス(IoC)照合とMITRE ATT&CK対応のルールで、既知の攻撃手口を継続的にカバーします。</li>
+          <li><b>複数拠点・大規模環境:</b> ノード間でBAN情報を同期する分散ゴシップにより、組織全体で一貫した防御になります。</li>
+        </ul>
+      </div>
+    </div>
+    <div class="modal-actions"><button class="ghost" id="helpClose">閉じる</button></div>
+  </div>
+</div>
 <div class="bar">
   <div class="brand"><span class="logo">__LOGO__</span><div>__BRAND__<small>__SUBTITLE__</small></div></div>
   <div class="spacer"></div>
   <span class="pill" id="conn"><span class="dot"></span><span id="connt">接続中</span></span>
+  <button class="iconbtn" id="help" title="使い方 / できること" aria-label="ヘルプ">❓</button>
   <button class="iconbtn" id="lang" title="Language / 言語" aria-label="Language">EN</button>
   <button class="iconbtn" id="theme" title="テーマ切替" aria-label="テーマ切替">☀️</button>
 </div>
@@ -957,6 +1076,47 @@ function sev(s){s=(s||"").toLowerCase();
  if(["recon","info"].includes(s))return"info";return"muted";}
 /* 言語(i18n): 既定は日本語=サーバHTMLそのまま。EN はクライアントで適用。 */
 const JA2EN={
+ "使い方":"Usage","できること(Lite版)":"What it can do (Lite)","フル版でできること":"What the full edition adds",
+ "閉じる":"Close",
+ "起動すると --listen 宛の通信を検査し、問題なければ --backend(あなたのWebサーバ)へ転送します。":
+  "Once started, traffic to --listen is inspected and, if clean, forwarded to --backend (your web server).",
+ "本ダッシュボードは --admin ポートで待受け、起動時にコンソールへ表示されるトークンで認証します。":
+  "This dashboard listens on --admin and authenticates with the token printed to the console at startup.",
+ "上部の「ファイアウォール」「DDoS / 侵入防御」トグルで防御レイヤーをON/OFFできます。":
+  "Use the \"Firewall\" / \"DDoS / Intrusion\" toggles above to turn each defense layer on/off.",
+ "「攻撃イベント」「BAN中のIP」でリアルタイム監視。手動でのBAN/解除も可能です。":
+  "Monitor live via \"Attack events\" / \"Banned IPs\"; manual ban/unban is also available.",
+ "「WAF / 検知設定」パネルでしきい値・機能ごとのON/OFFを調整できます(保存は即時反映)。":
+  "Tune thresholds and per-feature on/off in the \"WAF / detection\" panel (changes apply immediately).",
+ "WAF: SQLi・XSS・RCE・パストラバーサル・XXE・SSRF・JNDI・スキャナー等のシグネチャ照合、カスタムシグネチャ追加":
+  "WAF: signature matching for SQLi, XSS, RCE, path traversal, XXE, SSRF, JNDI, scanners, etc., plus custom signatures",
+ "L7 DDoS防御: レート制限・脅威スコアリング・自動BAN(拒否スコア/BANスコアの2段階)":
+  "L7 DDoS defense: rate limiting, threat scoring, auto-ban (2-tier: deny score / ban score)",
+ "双方向の検査: リクエストボディ(POST/JSON/GraphQL・gzip解凍を含む)+ 応答のDLP・セキュリティヘッダ付与":
+  "Bidirectional inspection: request body (POST/JSON/GraphQL, incl. gzip decompression) + response DLP and security headers",
+ "認証・濫用対策: JWT検査・クレデンシャル単位のレート制限":
+  "Auth & abuse controls: JWT inspection, per-credential rate limiting",
+ "状態の整合性: BAN/設定のHMAC署名による改竄耐性":
+  "State integrity: HMAC-signed ban/config state resists tampering",
+ "より詳しい説明は README.md および docs/ 配下のドキュメントを参照してください。":
+  "See README.md and the docs under docs/ for more detail.",
+ "Lite は WAF / DDoS 対策の中核機能を無償で提供します。次のような領域は上位版(フル版)で加わります。":
+  "Lite provides the core WAF / DDoS defenses at no cost. The full edition adds the following.",
+ "可用性:":"Availability:",
+ "ファイルの改竄を自己完全性監視で検知・自動修復し、プロセスが落ちても watchdog が自動再起動します。無人運用でも稼働を維持できます。":
+  "Self-integrity monitoring detects and repairs file tampering, and a watchdog restarts the process if it goes down — it keeps running with nobody watching.",
+ "ボットとの選別:":"Telling bots from people:",
+ "動的PoWチャレンジで、正規ユーザーを通しながら自動化された攻撃だけを絞り込みます(Liteは拒否/BANの二値判定のみ)。GeoIP・許可リスト(allowlist)・ステルス運用によるアクセス制御も加わります。":
+  "A dynamic proof-of-work challenge lets real users through while filtering out automated traffic (Lite only makes a binary deny/ban call). GeoIP, an allowlist, and stealth operation round out access control.",
+ "侵入後の検知:":"Detecting what happens after a breach:",
+ "LDAP/SMB/Kerberosデコイ、囮ファイル、カナリアトークン、ハニーポットで、境界を突破された後の不審な動きも捕捉します。DNSフィルタはC2通信やトンネリングを見つけます。":
+  "LDAP/SMB/Kerberos decoys, decoy files, canary tokens, and a honeypot catch suspicious activity once someone is already past the perimeter. A DNS filter picks up C2 traffic and tunneling.",
+ "運用への統合:":"Fitting into existing operations:",
+ "検知結果をSIEMやSlackへリアルタイム転送(Webhook/Syslog)。脅威インテリジェンス(IoC)照合とMITRE ATT&CK対応のルールで、既知の攻撃手口を継続的にカバーします。":
+  "Detections forward to a SIEM or Slack in real time (Webhook/Syslog), and threat-intel (IoC) matching plus MITRE ATT&CK-mapped rules keep coverage current against known techniques.",
+ "複数拠点・大規模環境:":"Multi-site and larger deployments:",
+ "ノード間でBAN情報を同期する分散ゴシップにより、組織全体で一貫した防御になります。":
+  "Ban state syncs across nodes via gossip, so enforcement stays consistent across the whole organization.",
  "ファイアウォール":"Firewall","DDoS / 侵入防御":"DDoS / Intrusion","🌍 グローバル遮断":"🌍 Global block",
  "解除":"Release","接続中":"Connected","接続不可":"Disconnected","認証エラー・再読込":"Auth error — reload",
  "概況":"Overview","脅威モニタリング":"Threat monitoring","WAF / 検知設定":"WAF / detection",
@@ -1061,13 +1221,21 @@ let LANG="ja";try{LANG=localStorage.getItem("fn-lang")||"ja"}catch(e){}
 function tr(s){if(LANG!=="en"||s==null)return s;const k=String(s).trim();return JA2EN[k]!==undefined?JA2EN[k]:s;}
 function applyStatic(){
  document.documentElement.lang=LANG;
- document.querySelectorAll(".phead h2,.phead .meta:not([id]),.pbody .meta:not([id]),button:not(.iconbtn),#dlpact option,#paranoia option").forEach(el=>{
+ document.querySelectorAll(".phead h2,.phead .meta:not([id]),.pbody .meta:not([id]),button:not(.iconbtn),#dlpact option,#paranoia option,#helpBody h3,#helpBody li,#helpBody p").forEach(el=>{
   if(el.children.length)return;
   if(el.dataset.o===undefined)el.dataset.o=el.textContent.trim();
   el.textContent=LANG==="en"?(JA2EN[el.dataset.o]||el.dataset.o):el.dataset.o;});
  const labels=[...document.querySelectorAll(".controls label.sw")];
  ["dlp","sech","throttle","subnetdef","forceclose"].forEach(id=>{const e=$(id)&&$(id).closest("label");if(e)labels.push(e);});
  labels.forEach(el=>{const tn=el.lastChild;if(!tn||tn.nodeType!==3)return;
+  if(el.dataset.o===undefined)el.dataset.o=tn.nodeValue.trim();
+  tn.nodeValue=" "+(LANG==="en"?(JA2EN[el.dataset.o]||el.dataset.o):el.dataset.o);});
+ // アップセル項目(<b>見出し:</b> 本文)。子要素を持つため上の汎用ループはスキップする=個別に訳す。
+ document.querySelectorAll(".upsell li").forEach(el=>{
+  const b=el.querySelector("b");if(!b)return;
+  if(b.dataset.o===undefined)b.dataset.o=b.textContent.trim();
+  b.textContent=LANG==="en"?(JA2EN[b.dataset.o]||b.dataset.o):b.dataset.o;
+  const tn=el.lastChild;if(!tn||tn.nodeType!==3)return;
   if(el.dataset.o===undefined)el.dataset.o=tn.nodeValue.trim();
   tn.nodeValue=" "+(LANG==="en"?(JA2EN[el.dataset.o]||el.dataset.o):el.dataset.o);});
  document.querySelectorAll(".sect").forEach(el=>{const tn=el.lastChild;if(!tn||tn.nodeType!==3)return;
@@ -1082,7 +1250,9 @@ function applyStatic(){
   el.placeholder=LANG==="en"?(JA2EN[el.dataset.o]||el.dataset.o):el.dataset.o;});
 }
 function setLang(l){LANG=l;try{localStorage.setItem("fn-lang",l)}catch(e){}
- $("lang").textContent=l==="en"?"日本語":"EN";applyStatic();
+ $("lang").textContent=l==="en"?"日本語":"EN";
+ $("help").title=l==="en"?"Usage / capabilities":"使い方 / できること";
+ $("help").setAttribute("aria-label",l==="en"?"Help":"ヘルプ");applyStatic();
  try{refresh()}catch(e){}try{refreshPro()}catch(e){}}
 $("lang").onclick=()=>setLang(LANG==="en"?"ja":"en");
 /* テーマ */
@@ -1092,7 +1262,13 @@ function setTheme(t){document.documentElement.dataset.theme=t;try{localStorage.s
 (function(){let t;try{t=localStorage.getItem("fn-theme")}catch(e){}
  if(!t)t=matchMedia("(prefers-color-scheme: light)").matches?"light":"dark";setTheme(t);})();
 $("theme").onclick=()=>setTheme(document.documentElement.dataset.theme==="light"?"dark":"light");
-$("lang").textContent=LANG==="en"?"日本語":"EN";applyStatic();
+/* ヘルプ(使い方/できること) */
+$("help").onclick=()=>{$("helpOverlay").style.display="flex";applyStatic();};
+$("helpClose").onclick=()=>{$("helpOverlay").style.display="none";};
+$("helpOverlay").onclick=e=>{if(e.target===$("helpOverlay"))$("helpOverlay").style.display="none";};
+$("lang").textContent=LANG==="en"?"日本語":"EN";
+$("help").title=LANG==="en"?"Usage / capabilities":"使い方 / できること";
+$("help").setAttribute("aria-label",LANG==="en"?"Help":"ヘルプ");applyStatic();
 async function post(p,b){return (await fetch(p,{method:"POST",headers:H,body:JSON.stringify(b)})).json()}
 // 認証エラー(401 / {ok:false})はネットワーク断とは別物として扱う: cookie失効・トークン不一致等
 // (例: サーバ再起動でトークンが再生成された)で接続断ではなくデータが"正常"に見えてしまうのを防ぐ。
