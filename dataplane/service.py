@@ -185,6 +185,10 @@ def _strip_autostart_flags(raw) -> list:
 
 def main(argv=None) -> int:
     _force_utf8_stdio()
+    args = list(sys.argv[1:] if argv is None else argv)
+    if args and args[0] == "tray":                # システムトレイ常駐(トレイのみ・Windows)
+        from .gui.__main__ import main as _tray_main
+        return _tray_main(args[1:])
     ap = argparse.ArgumentParser(
         prog="ducknet-security",
         description="DuckNet L7 Security — 軽量 DDoS/WAF セキュリティゲートウェイ(L7・依存ゼロ)")
