@@ -6,15 +6,22 @@ __main__.py — DuckNet-Lite: システムトレイ常駐(トレイのみ・依�
   · ダッシュボードを開く … 既定ブラウザで管理ダッシュボード(DUCKNET_ADMIN_URL)を開く
   · About              … 製品/版の情報(Win32 MessageBox)
   · 無料版でできること   … このエディションで使える機能一覧(上位版との差は README/❓ヘルプ参照)
-  · 終了               … トレイを外してプロセス終了
+  · 終了               … 本launcher が起動した本体を停止し、トレイを外してプロセス終了
+起動時、本体(ゲートウェイ)が未起動なら子プロセスとして一緒に立ち上げる(既に稼働中なら起動しない)。
+backend/listen は env DUCKNET_BACKEND / DUCKNET_LISTEN で上書き可(既定 127.0.0.1:8080 / 8443)。
 上位版のようなコントロールパネルは持たない(Lite=最小構成)。Windows 専用(他 OS はトレイ非対応の旨を表示)。
 """
 from __future__ import annotations
 
 import os
+import secrets
+import socket
+import subprocess
 import sys
 import threading
+import time
 import webbrowser
+from urllib.parse import urlparse
 
 from . import tray, ASSET_ICO
 
@@ -73,11 +80,83 @@ def _msgbox(text: str, title: str) -> None:
         pass
 
 
+# ── 本体(ゲートウェイ)の自動起動 ──────────────────────────────────────
+def _admin_addr(base_url: str):
+    """管理APIの (host, port) を DUCKNET_ADMIN_URL から解く。"""
+    u = urlparse(base_url if "://" in base_url else "http://" + base_url)
+    return (u.hostname or "127.0.0.1", int(u.port or 8081))
+
+
+def _gateway_up(host: str, port: int, timeout: float = 0.5) -> bool:
+    """本体(前衛+管理API)が既にそのポートで待受けているか。"""
+    try:
+        with socket.create_connection((host, port), timeout):
+            return True
+    except OSError:
+        return False
+
+
+def _spawn_gateway(admin_port: int, token: str):
+    """本体(ゲートウェイ)を子プロセスで起動する。コンソール窓は出さない。ローカル(127.0.0.1)
+    からブラウザで開けば自動でトークン Cookie が発行される。失敗時は None。"""
+    backend = os.environ.get("DUCKNET_BACKEND", "127.0.0.1:8080")
+    listen = os.environ.get("DUCKNET_LISTEN", "8443")
+    cmd = [sys.executable, "-m", "dataplane",
+           "--backend", backend, "--listen", str(listen),
+           "--admin", str(admin_port), "--admin-host", "127.0.0.1",
+           "--token", token]
+    kw = {"stdin": subprocess.DEVNULL,
+          "stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
+    if sys.platform.startswith("win"):
+        kw["creationflags"] = 0x08000000 | 0x00000200   # CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP
+    else:
+        kw["start_new_session"] = True
+    try:
+        return subprocess.Popen(cmd, **kw)
+    except Exception:
+        return None
+
+
+def _ensure_gateway(base_url: str, token: str):
+    """本体が起動していなければ起動する。戻り値 (token, child)。child は本launcher が起動した
+    子プロセス(既に稼働中なら None=触らない)。起動時は管理APIが上がるまで最大 ~6 秒待つ。"""
+    host, port = _admin_addr(base_url)
+    if _gateway_up(host, port):
+        return token, None
+    tok = token or secrets.token_urlsafe(24)
+    child = _spawn_gateway(port, tok)
+    if child is not None:
+        for _ in range(30):
+            if _gateway_up(host, port):
+                break
+            time.sleep(0.2)
+    return tok, child
+
+
+def _stop_child(child):
+    """本launcher が起動した子プロセス(本体)を穏当に停止する。None/停止済みは無視。"""
+    if child is None:
+        return
+    try:
+        if child.poll() is None:
+            child.terminate()
+            try:
+                child.wait(timeout=3)
+            except Exception:
+                child.kill()
+    except Exception:
+        pass
+
+
 def main(argv=None) -> int:
     if not tray.available():
         print("トレイ常駐は Windows 専用です(他 OS では非対応)。"
               "Lite は CLI + Web ダッシュボードで運用してください。", file=sys.stderr)
         return 0
+
+    # 本体(ゲートウェイ)も一緒に起動: 管理APIが未待受なら子プロセスで起動する
+    # (既に稼働中なら起動しない)。gw は終了時に停止する。
+    _tok, gw = _ensure_gateway(_ADMIN_URL, os.environ.get("DUCKNET_ADMIN_TOKEN", ""))
 
     stop = threading.Event()
 
@@ -108,11 +187,14 @@ def main(argv=None) -> int:
     ti = tray.TrayIcon(_asset_path(ASSET_ICO), _BRAND, items, _on_action)
     if not ti.start():
         print("トレイの起動に失敗しました。", file=sys.stderr)
+        _stop_child(gw)
         return 1
     try:
         stop.wait()                      # 終了が選ばれるまでメインスレッドを生かす
     except KeyboardInterrupt:
         ti.stop()
+    finally:
+        _stop_child(gw)                  # 本launcher が起動した本体を停止(既存稼働は触らない)
     return 0
 
 
