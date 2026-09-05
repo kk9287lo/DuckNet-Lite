@@ -308,6 +308,8 @@ _DEFAULTS = {
     "cadence_min_samples": 8,    # 判定に要する最小サンプル数
     "cadence_cv_threshold": 0.15,  # 変動係数(これ未満=規則正しすぎ=機械)
     "cadence_max_mean_interval": 3.0,  # 平均間隔がこれ超なら対象外(遅い正規ポーラを誤検知しない)
+    "cadence_min_mean_interval": 0.05, # これ未満=バースト(µs〜ms)はビーコンでなく flood/レート制限の
+                                       # 領分=対象外。高分解能クロックでの tight-loop 誤検知も防ぐ。
     # 高FPシグネチャの個別ON/OFF(既定OFF)。{name: True} で有効化。誤検知が許容な環境だけ点ける。
     "optional_sigs": {},
     # 検知の段階的厳格度(evolution #16): 1=保守(誤検知最小)〜4=最大(高FP許容)。set_paranoia が
@@ -1209,6 +1211,9 @@ class NetShield:
     def _decayed_score(self, st: dict) -> float:
         hl = max(1.0, float(self.cfg["score_halflife_sec"]))
         dt = max(0.0, _now() - st["score_ts"])    # 時刻巻き戻し(NTP補正等)で decay が *反転して
+        if dt < 0.05:                             # 高分解能クロックでの境界割れ防止: _add_score 直後の
+            return st["score"]                    #   読み戻しで、微小 dt の減衰により score が閾値を
+                                                  #   わずかに下回り BAN が不発になる(Linux 等)のを防ぐ。
         return st["score"] * (0.5 ** (dt / hl))   #   スコア膨張→誤BAN* するのを防ぐ(#44・単調減衰保証)
 
     def _add_score(self, st: dict, amount: float):
@@ -2182,7 +2187,9 @@ class NetShield:
         if n < int(self.cfg["cadence_min_samples"]):
             return False
         mean = sum(ivs) / n
-        if mean <= 0 or mean > float(self.cfg["cadence_max_mean_interval"]):
+        if (mean <= 0
+                or mean < float(self.cfg.get("cadence_min_mean_interval", 0.05))
+                or mean > float(self.cfg["cadence_max_mean_interval"])):
             return False
         var = sum((x - mean) ** 2 for x in ivs) / n
         cv = (var ** 0.5) / mean
