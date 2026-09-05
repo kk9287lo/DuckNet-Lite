@@ -61,9 +61,7 @@ export DUCKNET_STATE_KEY=...   # 署名鍵を外に置くと改竄耐性が一�
 
 ## ライセンス
 
-AGPL-3.0-or-later です([LICENSE.txt](LICENSE.txt))。ネットワーク越しに使わせる場合もソース開示の義務が付きます(第 13 条)。その義務を負いたくない、あるいは全機能が要るならフル版へ。
-
-補足すると、フル版にも非商用・無償の Community 枠(全機能・キー不要)がありますが、そちらは商用利用ができません。商用でも無償で使いたいなら AGPL の Lite、という住み分けです。
+AGPL-3.0-or-later です([LICENSE.txt](LICENSE.txt))。ネットワーク越しに使わせる場合もソース開示の義務が付きます(第 13 条)。その義務を負いたくない、あるいは全機能が要るならフル版(商用)へ。
 
 同梱する第三者コードはありません(依存ゼロ)。表示は [THIRD_PARTY_NOTICES.txt](THIRD_PARTY_NOTICES.txt)、SBOM は [sbom.cdx.json](sbom.cdx.json)。
 
