@@ -318,9 +318,13 @@ class AdminDashboard:
         return {"ok": True}
 
 
+_ICON_MAX_BYTES = 1024 * 1024      # ブランドアイコン読込の上限(メモリ有界)
+
+
 def _load_brand_icon():
     """ブランドアイコンを読み込んで (bytes, content_type) を返す。DuckNet.ico(軽量・多サイズ)を
-    優先し、無ければ .png。探索: env DUCKNET_ICON_DIR → リポジトリ/カレントの ico/ → 同梱 assets/。
+    優先し、無ければ .png。探索: env DUCKNET_ICON_DIR → パッケージ直下の ico/ → 同梱 assets/。
+    CWD は探索しない(攻撃者が置いたファイルを読まない)。サイズは _ICON_MAX_BYTES で有界。
     見つからなければ (b"", "")=呼び出し側は絵文字グリフへフォールバック。"""
     here = os.path.dirname(os.path.abspath(__file__))          # …/dataplane
     repo_root = os.path.dirname(here)                          # リポジトリ直下
@@ -331,14 +335,17 @@ def _load_brand_icon():
         if env:
             cands.append(os.path.join(env, name))
     for name in ("DuckNet.ico", "DuckNet.png"):
-        for root in (repo_root, os.getcwd()):
-            cands.append(os.path.join(root, "ico", name))
+        cands.append(os.path.join(repo_root, "ico", name))
         cands.append(os.path.join(bundled, name))
     for p in cands:
         try:
             if p and os.path.exists(p):
+                if os.path.getsize(p) > _ICON_MAX_BYTES:   # 肥大ファイルは読まない
+                    continue
                 with open(p, "rb") as f:
-                    data = f.read()
+                    data = f.read(_ICON_MAX_BYTES + 1)
+                if not data or len(data) > _ICON_MAX_BYTES:
+                    continue
                 ct = "image/png" if p.lower().endswith(".png") else "image/x-icon"
                 return data, ct
         except Exception:

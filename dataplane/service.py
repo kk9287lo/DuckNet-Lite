@@ -15,6 +15,7 @@ service.py — DuckNet L7 Security スタンドアロン・サービス本体(CL
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 
 
@@ -199,7 +200,9 @@ def main(argv=None) -> int:
     ap.add_argument("--admin", type=int, default=8081, help="管理ダッシュボードのポート")
     ap.add_argument("--admin-host", default="127.0.0.1",
                     help="管理ダッシュボードの待受(既定=localhost限定)")
-    ap.add_argument("--token", default="", help="管理トークン(空=自動生成)")
+    ap.add_argument("--token", default=os.environ.get("DUCKNET_ADMIN_TOKEN", ""),
+                    help="管理トークン(空=自動生成)。env DUCKNET_ADMIN_TOKEN でも渡せる"
+                         "(argv は他ユーザーから読めるので秘密は env 推奨)")
     ap.add_argument("--cluster", action="store_true",
                     help="全コアで待受(Linux/macOS。Win等は単一へ降格)")
     ap.add_argument("--no-default-on", action="store_true",

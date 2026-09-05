@@ -308,7 +308,7 @@ _DEFAULTS = {
     "cadence_min_samples": 8,    # 判定に要する最小サンプル数
     "cadence_cv_threshold": 0.15,  # 変動係数(これ未満=規則正しすぎ=機械)
     "cadence_max_mean_interval": 3.0,  # 平均間隔がこれ超なら対象外(遅い正規ポーラを誤検知しない)
-    "cadence_min_mean_interval": 0.05, # これ未満=バースト(µs〜ms)はビーコンでなく flood/レート制限の
+    "cadence_min_mean_interval": 0.01, # これ未満=バースト(µs〜ms)はビーコンでなく flood/レート制限の
                                        # 領分=対象外。高分解能クロックでの tight-loop 誤検知も防ぐ。
     # 高FPシグネチャの個別ON/OFF(既定OFF)。{name: True} で有効化。誤検知が許容な環境だけ点ける。
     "optional_sigs": {},
@@ -2188,7 +2188,7 @@ class NetShield:
             return False
         mean = sum(ivs) / n
         if (mean <= 0
-                or mean < float(self.cfg.get("cadence_min_mean_interval", 0.05))
+                or mean < float(self.cfg.get("cadence_min_mean_interval", 0.01))
                 or mean > float(self.cfg["cadence_max_mean_interval"])):
             return False
         var = sum((x - mean) ** 2 for x in ivs) / n

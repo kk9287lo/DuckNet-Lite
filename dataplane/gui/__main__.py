@@ -21,6 +21,8 @@ import sys
 import threading
 import time
 import webbrowser
+import urllib.error
+import urllib.request
 from urllib.parse import urlparse
 
 from . import tray, ASSET_ICO
@@ -103,9 +105,13 @@ def _spawn_gateway(admin_port: int, token: str):
     listen = os.environ.get("DUCKNET_LISTEN", "8443")
     cmd = [sys.executable, "-m", "dataplane",
            "--backend", backend, "--listen", str(listen),
-           "--admin", str(admin_port), "--admin-host", "127.0.0.1",
-           "--token", token]
-    kw = {"stdin": subprocess.DEVNULL,
+           "--admin", str(admin_port), "--admin-host", "127.0.0.1"]
+    # トークンは argv ではなく env で渡す: コマンドラインは他ユーザーから読める
+    # (Linux の /proc/<pid>/cmdline は world-readable、Windows は WMI で取得可)。
+    # env(/proc/<pid>/environ)は同一UID/root 限定=露出面が小さい。
+    child_env = dict(os.environ)
+    child_env["DUCKNET_ADMIN_TOKEN"] = token
+    kw = {"stdin": subprocess.DEVNULL, "env": child_env,
           "stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
     if sys.platform.startswith("win"):
         kw["creationflags"] = 0x08000000 | 0x00000200   # CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP
@@ -117,11 +123,36 @@ def _spawn_gateway(admin_port: int, token: str):
         return None
 
 
+def _admin_is_ours(host: str, port: int, timeout: float = 1.0) -> bool:
+    """待受けているのが本製品の管理APIかを *トークンを送らずに* 確かめる。無認証の
+    GET /api/state は 401 + {"ok": false, "error": "token required"} を返すので、これを指紋にする。
+    別プロセスのポート占有を『本体が稼働中』と誤認し、起動を諦めたり秘密を渡したりしないため。"""
+    url = "http://%s:%d/api/state" % (host, port)
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as _r:
+            _r.read(1)
+        return False                              # 200=無認証で応答する別物(本製品は 401)
+    except urllib.error.HTTPError as e:
+        if e.code != 401:
+            return False
+        try:
+            body = e.read(256)
+        except Exception:
+            return False
+    except Exception:
+        return False
+    return b"token required" in body
+
+
 def _ensure_gateway(base_url: str, token: str):
     """本体が起動していなければ起動する。戻り値 (token, child)。child は本launcher が起動した
     子プロセス(既に稼働中なら None=触らない)。起動時は管理APIが上がるまで最大 ~6 秒待つ。"""
     host, port = _admin_addr(base_url)
     if _gateway_up(host, port):
+        if not _admin_is_ours(host, port):        # 別プロセスのポート占有を稼働中と誤認しない
+            print("[警告] %s:%d は本製品以外のプロセスが使用しています。ゲートウェイを起動できず、"
+                  "保護は動作していません。" % (host, port), file=sys.stderr)
+            return "", None                       # 占有プロセスへトークンを渡さない
         return token, None
     tok = token or secrets.token_urlsafe(24)
     child = _spawn_gateway(port, tok)
