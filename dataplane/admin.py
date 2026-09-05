@@ -177,9 +177,9 @@ def _audit_entry(path: str, b: dict, r: dict, pre_cfg: dict, pre_fw: dict):
 class AdminDashboard:
     def __init__(self, host: str = "127.0.0.1", port: int = 8081, token: str = "",
                  state_dir: str = "",
-                 brand: str = "", logo: str = "🦅",
+                 brand: str = "", logo: str = "🦆",
                  subtitle: str = "L7 防御 — 管理ダッシュボード",
-                 edge_guard=None):
+                 edge_guard=None, show_brand_icon: bool = True):
         self.host = host
         self.port = port
         self.token = token or secrets.token_urlsafe(24)
@@ -193,6 +193,23 @@ class AdminDashboard:
         self.brand = brand or os.environ.get("DUCKNET_COVER", "DuckNet L7 Security")
         self.logo = logo
         self.subtitle = subtitle
+        # ブランドアイコン: 実ファイル DuckNet.ico(無ければ .png)を /brand-icon で配信し、
+        # ヘッダ画像と favicon から参照する。ステルス時は配信せず、ロゴ/favicon を汎用グリフ(⚙)へ
+        # フォールバック=製品(鴨)を伏せる。呼び出し側の指定に依らず DUCKNET_COVER でも自動で伏せる。
+        if os.environ.get("DUCKNET_COVER", "").strip():
+            show_brand_icon = False
+            if self.logo == "🦆":
+                self.logo = "⚙"
+        self._icon_bytes, self._icon_ct = (_load_brand_icon() if show_brand_icon else (b"", ""))
+        if self._icon_bytes:
+            self._logo_html = '<img class="brand-ico" src="/brand-icon" alt="">'
+            self._favicon_html = '<link rel="icon" href="/brand-icon">'
+        else:
+            self._logo_html = self.logo
+            self._favicon_html = ("<link rel=\"icon\" href=\"data:image/svg+xml,"
+                                  "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'>"
+                                  "<text y='.9em' font-size='58'>" + self.logo
+                                  + "</text></svg>\">")
         # 検知ログの所在(別プロセスが書く)。DUCKNET_STATE_DIR で移設可。テストは上書き可。
         self._state_dir = state_dir or default_state_dir()
         self._server = None
@@ -299,6 +316,34 @@ class AdminDashboard:
             self._server.server_close()
             self._server = None
         return {"ok": True}
+
+
+def _load_brand_icon():
+    """ブランドアイコンを読み込んで (bytes, content_type) を返す。DuckNet.ico(軽量・多サイズ)を
+    優先し、無ければ .png。探索: env DUCKNET_ICON_DIR → リポジトリ/カレントの ico/ → 同梱 assets/。
+    見つからなければ (b"", "")=呼び出し側は絵文字グリフへフォールバック。"""
+    here = os.path.dirname(os.path.abspath(__file__))          # …/dataplane
+    repo_root = os.path.dirname(here)                          # リポジトリ直下
+    bundled = os.path.join(here, "gui", "assets")
+    cands = []
+    env = os.environ.get("DUCKNET_ICON_DIR", "").strip()
+    for name in ("DuckNet.ico", "DuckNet.png"):
+        if env:
+            cands.append(os.path.join(env, name))
+    for name in ("DuckNet.ico", "DuckNet.png"):
+        for root in (repo_root, os.getcwd()):
+            cands.append(os.path.join(root, "ico", name))
+        cands.append(os.path.join(bundled, name))
+    for p in cands:
+        try:
+            if p and os.path.exists(p):
+                with open(p, "rb") as f:
+                    data = f.read()
+                ct = "image/png" if p.lower().endswith(".png") else "image/x-icon"
+                return data, ct
+        except Exception:
+            pass
+    return b"", ""
 
 
 def _make_handler(app: AdminDashboard):
@@ -455,7 +500,8 @@ def _make_handler(app: AdminDashboard):
             path = self.path.split("?")[0]
             if path in ("/", "/index.html"):
                 html = (_HTML.replace("__BRAND__", app.brand)
-                        .replace("__LOGO__", app.logo)
+                        .replace("__LOGO__", app._logo_html)
+                        .replace("__FAVICON__", app._favicon_html)
                         .replace("__SUBTITLE__", app.subtitle))
                 # トークンは HTML/JS に埋め込まず HttpOnly Cookie で配る(XSS で抜けない)。ただし
                 # 配布は localhost or 認証済みのみ=無認証のリモートへトークンを渡さない(乗っ取り防止)。
@@ -471,6 +517,14 @@ def _make_handler(app: AdminDashboard):
                     ck[_COOKIE_NAME]["path"] = "/"
                     set_cookie = ck[_COOKIE_NAME].OutputString()
                 self._send(200, html, "text/html; charset=utf-8", set_cookie=set_cookie)
+                return
+            if path == "/brand-icon":
+                # ブランドアイコン(favicon/ヘッダロゴ)。認証前に読み込まれる=公開。
+                # ステルス時は配信しない(404)=製品(鴨)を伏せたまま。
+                if app._icon_bytes:
+                    self._send(200, app._icon_bytes, app._icon_ct)
+                else:
+                    self._send(404, _j({"ok": False, "error": "not found"}))
                 return
             if not self._auth():
                 self._send(401, _j({"ok": False, "error": "token required"}))
@@ -620,6 +674,7 @@ def _make_handler(app: AdminDashboard):
 
 _HTML = r"""<!doctype html><html lang="ja"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
+__FAVICON__
 <title>__BRAND__</title><style>
 :root{
  /* タイポグラフィ(型スケール) */
@@ -656,6 +711,7 @@ a{color:var(--blue)}
  backdrop-filter:saturate(160%) blur(10px);border-bottom:1px solid var(--line)}
 .brand{display:flex;align-items:center;gap:10px;font-size:var(--fs-xl);font-weight:700;letter-spacing:-.01em}
 .brand .logo{font-size:22px;filter:drop-shadow(0 2px 6px rgba(255,93,77,.5))}
+.brand .brand-ico{height:24px;width:24px;border-radius:6px;display:block;filter:drop-shadow(0 2px 6px rgba(0,0,0,.25))}
 .brand small{display:block;font-size:var(--fs-xs);font-weight:500;color:var(--dim);letter-spacing:var(--tracking);text-transform:uppercase}
 .spacer{flex:1}
 .pill{display:inline-flex;align-items:center;gap:7px;font-size:var(--fs-sm);font-weight:600;
@@ -841,6 +897,9 @@ th.sortable .sortarrow{display:inline-block;width:9px;font-size:9px;color:var(--
         <li>認証・濫用対策: JWT検査・クレデンシャル単位のレート制限</li>
         <li>状態の整合性: BAN/設定のHMAC署名による改竄耐性</li>
       </ul>
+      <h3>バージョン情報</h3>
+      <p>__BRAND__ — v1.3.0</p>
+      <p>軽量な L7 WAF / DDoS セキュリティゲートウェイ(無償版・AGPL-3.0-or-later)。外部依存ゼロ・OS 非侵襲・防御専用。ライセンス全文は LICENSE.txt、詳細は README.md を参照してください。</p>
       <p>より詳しい説明は README.md および docs/ 配下のドキュメントを参照してください。</p>
       <div class="upsell">
         <h3>フル版でできること</h3>
@@ -1105,6 +1164,9 @@ const JA2EN={
   "Auth & abuse controls: JWT inspection, per-credential rate limiting",
  "状態の整合性: BAN/設定のHMAC署名による改竄耐性":
   "State integrity: HMAC-signed ban/config state resists tampering",
+ "バージョン情報":"About",
+ "軽量な L7 WAF / DDoS セキュリティゲートウェイ(無償版・AGPL-3.0-or-later)。外部依存ゼロ・OS 非侵襲・防御専用。ライセンス全文は LICENSE.txt、詳細は README.md を参照してください。":
+  "A lightweight L7 WAF/DDoS security gateway (free edition, AGPL-3.0-or-later) — zero-dependency, OS-non-invasive, defense-only. See LICENSE.txt for the full license and README.md for details.",
  "より詳しい説明は README.md および docs/ 配下のドキュメントを参照してください。":
   "See README.md and the docs under docs/ for more detail.",
  "Lite は WAF / DDoS 対策の中核機能を無償で提供します。次のような領域は上位版(フル版)で加わります。":
