@@ -99,6 +99,9 @@ def safe_read_json(path: str, default: Any = None) -> Any:
     return default
 
 
+_O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)   # POSIX: 最終要素が symlink なら失敗
+
+
 def _rotate(path: str, backups: int) -> None:
     """path → path.1 → … → path.{backups} と押し出し、最古は破棄。失敗は無害に握る。"""
     oldest = f"{path}.{backups}"
@@ -138,11 +141,25 @@ def append_jsonl(path: str, obj: Any, *, max_bytes: int = 5_000_000,
             cur = 0
         if cur and cur + len(line.encode(encoding, "replace")) > max_bytes:
             _rotate(path, max(1, backups))
-        with open(path, "a", encoding=encoding) as f:
+        with _open_append_nofollow(path, encoding) as f:
             f.write(line)
         return True
     except Exception:
         return False
+
+
+def _open_append_nofollow(path: str, encoding: str):
+    """追記用に symlink を経由せず開く(#symlink-arbitrary-write)。
+    共有ディレクトリに置かれる監査ログを攻撃者が任意ファイルへの symlink に差し替えると、
+    素の open(path, "a") はそれを追従してしまい、ログ行の注入や対象ファイルの肥大を許す。
+    予め symlink を除去し(追従しない)、POSIX では O_NOFOLLOW でも最終要素の追従を拒否する。"""
+    try:
+        if os.path.islink(path):
+            os.unlink(path)
+    except OSError:
+        pass
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND | _O_NOFOLLOW, 0o600)
+    return os.fdopen(fd, "a", encoding=encoding)
 
 
 def tail_jsonl(path: str, n: int = 50) -> list:

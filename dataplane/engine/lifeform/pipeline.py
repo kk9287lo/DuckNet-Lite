@@ -30,6 +30,7 @@ pipeline.py — 高度なL7 DDoS / ネット侵入防御(アプリ層・OS非侵
 """
 from __future__ import annotations
 
+import functools
 import hashlib
 import hmac
 import ipaddress
@@ -59,15 +60,15 @@ _SIGNATURES = [
     # 要求しており、これを崩すと既存の確立された真陽性検知を弱める(タスク方針=既存の真陽性検知を
     # 犠牲にする narrowing はしない、に反する)。安全な絞り込みが見つからなかったため据え置き
     # (既知の限界として文書化。F7参照)。
-    ("xss", r"(?i)(<\s*script|onerror\s*=|javascript:|vbscript:|data:text/html|<\s*img[^>]{0,200}?onerror|document\.cookie)"),
+    ("xss", r"(?i)(<\s*script|onerror\s*=|javascript:|vbscript:|data:text/html|<\s*img[^>]{0,120}?onerror|document\.cookie)"),
     ("traversal", r"(?i)((?:\.\./){2,}|(?:\.\.\\){2,}|/etc/passwd|/etc/shadow|/etc/hosts|/proc/self|c:\\windows\\|\bwin\.ini\b|\bboot\.ini\b|\.\.;)"),
-    ("rce", r"(?i)((?:;|\|\||&&)\s*(cat|wget|curl|bash|sh|nc|powershell)\b|\$\([^)]*\)|`[^`]*`|\|\s*(nc|bash|sh|curl|wget|python)\b|\(\)\s\{|<\?php\b|<\?=)"),
+    ("rce", r"(?i)((?:;|\|\||&&)\s*(cat|wget|curl|bash|sh|nc|powershell)\b|\$\([^)]{0,200}\)|`[^`]{0,200}`|\|\s*(nc|bash|sh|curl|wget|python)\b|\(\)\s\{|<\?php\b|<\?=)"),
     ("scanner_ua", r"(?i)\b(sqlmap|nikto|nmap|masscan|acunetix|nessus|dirbuster|gobuster|wpscan|zgrab|nuclei|httpx)\b"),
     ("sensitive_path", r"(?i)(/\.env\b|/wp-login|/xmlrpc\.php|/phpmyadmin|/\.git/|/\.aws/|/actuator/|/\.ssh/)"),
     # ブラインド/時間/エラーベース SQLi: union/恒真式に出ない別系統(関数呼び・遅延・メタ表)。
     # information_schema はスキーマ修飾参照(information_schema.tables 等)必須=地の文の
     # 単発言及(「information_schemaを調べたい」等)を誤検知しない(実SQLiは常にドット修飾で使う)。
-    ("sqli_blind", r"(?i)(\bsleep\s*\(|\bbenchmark\s*\(|\bpg_sleep\s*\(|\bwaitfor[\s;]+delay\b|\bextractvalue\s*\(|\bupdatexml\s*\(|\bload_file\s*\(|\binto[\s;]+(?:out|dump)file\b|\binformation_schema\.\w+)"),
+    ("sqli_blind", r"(?i)(\bsleep\s*\(|\bbenchmark\s*\(|\bpg_sleep\s*\(|\bwaitfor[\s;]+delay\b|\bextractvalue\s*\(|\bupdatexml\s*\(|\bload_file\s*\(|\binto[\s;]+(?:out|dump)file\b|\binformation_schema\.\w+|\b(?:and|or)\b[\s;]*[0-9]{1,6}\s*=\s*\(\s*select\b)"),
     # NoSQL(Mongo)演算子注入: id[$ne]=1 / $where(配列添字形)、または {"$ne": ...} / $gt: ...
     # (JSONネイティブのキー形・コロン付き)。配列添字 filter[name] とは $ 接頭で区別=低誤検知。
     ("nosqli", r"(?i)(\[\$(?:ne|gt|lt|gte|lte|eq|in|nin|regex|where|exists|or|and|not|nor|all|elemmatch|mod|size|type)\b|\$where\b|[\"']?\$(?:ne|gt|lt|gte|lte|eq|in|nin|regex|where|exists|or|and|not|nor|all|elemmatch|mod|size|type)\b\s*[\"']?\s*:)"),
@@ -109,6 +110,19 @@ _SIGNATURES = [
     ("redirect", r"=//[a-z0-9.\-]"),
 ]
 _SIG_RE = [(name, re.compile(pat)) for name, pat in _SIGNATURES]
+# 高コストなシグネチャの前置ゲート(真陽性のスーパーセット): その名前の *どの分岐も*
+# 必ず含むリテラルを列挙する。1 つも無ければ正規表現は原理的にマッチしないので評価を省く。
+# 走査面は正規化済み(小文字化・比較演算子前後の空白除去)なので "1=1" 等の形で確実に現れる。
+# これが無いと "select from " 連打(8KB)だけで sqli が 8.4ms/req、"<img " 連打で xss が
+# 1.7ms/req を消費し、単一イベントループを数十 req/s で飽和させられた(CPU 枯渇DoS)。
+_SIG_GUARD = {
+    # union select / or 1=1 / '-- / select..from..where / drop table
+    "sqli": ("union", "1=1", "--", "where", "drop"),
+    # <script / onerror= / javascript: / vbscript: / data:text/html / <img..onerror /
+    # document.cookie
+    "xss": ("script", "onerror", "javascript:", "vbscript:", "data:text/html",
+            "document.cookie"),
+}
 _SIG_WEIGHT = {"sqli": 55, "xss": 45, "traversal": 50, "rce": 60,
                "scanner_ua": 65, "sensitive_path": 30,
                "sqli_blind": 60, "nosqli": 55, "lfi": 55, "jndi": 65, "ssrf": 60,
@@ -372,7 +386,10 @@ _DEDUP_CORPUS = [
     "%00", "passwd", "select from where", "0x41414141",
 ]
 _MAX_SCAN = 8192            # シグネチャ走査の入力上限(ReDoS/CPU枯渇の面積を有界化)
-_PRE_CUT = _MAX_SCAN * 2    # 正規化前の粗い上限
+_PRE_CUT = _MAX_SCAN * 2    # 正規化前の粗い上限(=正規化後の全体上限でもある)
+_SCAN_WIN_OVERLAP = 256     # 走査窓の重なり(窓境界を跨ぐ payload の分断を防ぐ)
+_MAX_SCAN_WINDOWS = 12      # 1 フィールドあたりの走査窓上限(走査 CPU 面積を有界化)
+_MIN_PARTS_PER_CHUNK = 2    # 生チャンク 1 つに必ず配る窓数(予算独占で未走査を作らない)
 _O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)   # POSIX: 最終要素が symlink なら open 失敗。Win は無し。
 
 
@@ -527,6 +544,17 @@ def registered_scan_decoders() -> list:
     return sorted(_SCAN_DECODERS)
 
 
+_NFKC_MAX_EXPAND = 4        # 1 文字あたりの NFKC 展開許容倍率(超える文字は展開しない)
+
+
+@functools.lru_cache(maxsize=8192)
+def _nfkc_char(c: str) -> str:
+    """1 文字の NFKC。展開が _NFKC_MAX_EXPAND を超える文字は畳まずそのまま返す。
+    走査面の長さを入力の定数倍に抑えるための安全弁([[_normalize_full]] の異常時経路)。"""
+    n = unicodedata.normalize("NFKC", c)
+    return n if len(n) <= _NFKC_MAX_EXPAND else c
+
+
 def _strip_sql_comments(s: str) -> str:
     """SQL インラインコメントを *線形時間* で除去する(旧: 有界 lazy 正規表現)。
     2パス構成は旧実装と完全一致: (1) MySQL 版付き /*! [digits] 中身 */ は囲みだけ剥がして
@@ -576,9 +604,11 @@ def _strip_sql_comments(s: str) -> str:
     return "".join(out)
 
 
-def _normalize_for_scan(s: str) -> str:
+def _normalize_full(s: str) -> str:
     """シグネチャ走査前の正規化。難読化(多重エンコード/インラインコメント/空白増し/Unicode)を
-    減らし、入力長を有界化して ReDoS と CPU 枯渇を抑える。完全な無害化ではない。"""
+    減らし、入力長を有界化して ReDoS と CPU 枯渇を抑える。完全な無害化ではない。
+    返値は 1 窓(_MAX_SCAN)へ *切り詰めない*(全域を [[_scan_windows]] が窓分割する)。
+    長さは _PRE_CUT で有界=正規化中の NFKC 展開等でも走査面積は爆発しない。"""
     if not s:
         return ""
     s = s[:_PRE_CUT]
@@ -629,10 +659,17 @@ def _normalize_for_scan(s: str) -> str:
             s = re.sub(r"\\u([0-9a-fA-F]{4})|\\x([0-9a-fA-F]{2})|\\U([0-9a-fA-F]{8})", _unesc, s)
         if not s.isascii():                          # ASCII はそのまま(高速パス)。非ASCIIのみ重処理。
             try:
-                # NFKC は 1 文字を最大 ~18 文字へ展開する(例 U+FDFA)。エスケープ復号で ASCII から
-                # 高コードポイントを再生成した入力だと、per-char Cf フィルタと後段 regex が過大長を
-                # 走査し event-loop を占有する(#D1)。展開直後に _PRE_CUT へ再切詰して有界化する。
-                s = unicodedata.normalize("NFKC", s)[:_PRE_CUT]
+                # NFKC は 1 文字を最大 18 文字へ展開する(例 U+FDFA)。8KB を埋められると走査面が
+                # 入力の十数倍に膨れ、(a) そのまま全域を走査すれば CPU 枯渇DoS、(b) 溢れた分を
+                # 切り捨てれば後続 payload が走査面から消えるバイパス、という二択になる。
+                # そこで *異常に伸びる時だけ* 「大きく伸びる文字を展開しない」正規化へ落とす。
+                # ASCII の難読化に使える互換文字(全角英数 1→1・合字 ﬁ→2・丸数字 1→1・㈱ 1→3)は
+                # いずれも _NFKC_MAX_EXPAND 以内なので畳み込みは維持=検知能力は落ちない。
+                # 展開しないのは U+FDFA(アラビア語句)等、ASCII 攻撃文字列を作れない文字だけ。
+                t = unicodedata.normalize("NFKC", s)
+                if len(t) > len(s) * _NFKC_MAX_EXPAND:
+                    t = "".join(_nfkc_char(c) for c in s)
+                s = t[:_PRE_CUT]
             except Exception:
                 s = s[:_PRE_CUT]
             # 書式文字(Cf=ゼロ幅/ソフトハイフン/方向制御 等)と \t\r\n 以外の制御文字を除去。
@@ -684,7 +721,68 @@ def _normalize_for_scan(s: str) -> str:
         s = re.sub(r"\s*(<=|>=|<>|!=|=|<|>)\s*", r"\1", s)  # 比較演算子前後の空白除去(1 < 2 → 1<2)
     if ";" in s or "|" in s:
         s = re.sub(r"([;|])\s+", r"\1", s)   # ;/| 直後の空白除去(; cat → ;cat)
-    return s[:_MAX_SCAN].lower()
+    return s[:_PRE_CUT].lower()
+
+
+def _normalize_for_scan(s: str) -> str:
+    """正規化して 1 窓分(_MAX_SCAN)へ切り詰める。単発フィールドの軽量参照用。
+    *走査* には使わないこと(切り詰めた分が「転送されるのに未走査」の迂回窓になる)。"""
+    return _normalize_full(s)[:_MAX_SCAN]
+
+
+def _normalized_parts(chunk: str, step: int, depth: int = 0):
+    """生入力 1 断片を正規化し、走査窓の列として返す。
+    正規化が _PRE_CUT で頭打ちになった場合(=復号/NFKC 展開で入力が膨らんだ)、末尾を捨てると
+    その先の payload が走査面から消えるため、生入力の側を半分に割って各々正規化し直す
+    (重なりを付けて境界を跨ぐ payload を保つ)。展開率に依らず全域が必ずどれかの窓に載る。
+    深さと最小長で有界=悪意ある入力でも分割は数回で止まる。"""
+    n = _normalize_full(chunk)
+    if len(n) < _PRE_CUT or depth >= 4 or len(chunk) <= 512:
+        if len(n) <= _MAX_SCAN:
+            return [n]
+        return [n[j:j + _MAX_SCAN] for j in range(0, len(n), step)]
+    half = len(chunk) // 2
+    out = _normalized_parts(chunk[:half + _SCAN_WIN_OVERLAP], step, depth + 1)
+    out.extend(_normalized_parts(chunk[half:], step, depth + 1))
+    return out
+
+
+def _scan_windows(s: str) -> tuple:
+    """1 フィールドの走査面を返す。生入力を _MAX_SCAN 窓+重なりで刻み、*窓ごとに* 正規化して
+    (正規化結果が長ければさらに窓分割して)返す。
+    旧実装は「正規化してから [:_MAX_SCAN] で切る」だったため、次の 2 つが『backend へ転送
+    されるのに未走査』の迂回窓になっていた(いずれも実証済のバイパス):
+      (a) proxy が転送するヘッダ/リクエストターゲット(最大 16384)の 8192 以降。先頭を
+          無害な "A" で埋めるだけで後続の Log4Shell/SQLi が全署名を回避できた。
+      (b) 正規化中の NFKC 展開(1 文字→最大 18 文字。例 U+FDFA)で押し出された後半。
+          切り詰めは正規化 *後* だったため、展開させるだけで後続 payload が消えた。
+    生入力の側で刻めば、展開で溢れた分も次の生窓に必ず現れる=全域が走査面に載る。重なりは
+    窓境界を跨ぐ payload の分断を防ぐ。生入力は _PRE_CUT、窓数は _MAX_SCAN_WINDOWS で有界
+    (=CPU 枯渇にならない)。8192 以下の通常フィールドは窓 1 枚=従来と同じ経路・同じ費用。"""
+    raw = s[:_PRE_CUT]
+    if not raw:
+        return ("",)
+    step = _MAX_SCAN - _SCAN_WIN_OVERLAP
+    starts = [0]
+    while starts[-1] + _MAX_SCAN < len(raw):
+        starts.append(starts[-1] + step)
+    # 窓予算はチャンク数で按分する。全体の上限だけで打ち切ると、先頭チャンクを大量展開する
+    # 文字(NFKC で 1→18 文字)で埋めて予算を使い切らせ、*後続チャンクを丸ごと未走査に*
+    # できてしまう(先頭パディング回避の再来・実証済)。逆に固定の小さな上限にすると、
+    # 1 チャンク内の展開を刻んだ断片が入り切らず取りこぼす。按分なら両方を満たす。
+    budget = max(_MIN_PARTS_PER_CHUNK, _MAX_SCAN_WINDOWS // len(starts))
+    wins, seen = [], set()
+    for i in starts:
+        n_here = 0
+        for _p in _normalized_parts(raw[i:i + _MAX_SCAN], step):
+            if n_here >= budget:
+                break
+            if _p in seen:                 # 重なり由来の同一窓は走査しない(無駄な CPU)
+                continue
+            seen.add(_p)
+            wins.append(_p)
+            n_here += 1
+    return tuple(wins) or ("",)
 
 
 def _path_for_match(path: str) -> str:
@@ -759,11 +857,16 @@ def _stacked_query_suspect(blob: str) -> bool:
 # 変換された区切り文字。CRLF注入 <svg\nonload=… を \s 限定だと見逃すため追加)を許容。
 # prescan ゲート外で常時評価。
 _XSS_HANDLER_RE = re.compile(
-    r"<\s*[a-z][a-z0-9]{0,15}[^>]{0,200}?[\s/;]on[a-z]{3,12}\s*=", re.I)
+    r"<\s*[a-z][a-z0-9]{0,15}[^>]{0,120}?[\s/;]on[a-z]{3,12}\s*=", re.I)
 
 
 def _xss_event_handler_suspect(blob: str) -> bool:
-    """正規化済み文字列に『タグ内の onXxx= イベントハンドラ』があるか=ハンドラ型 XSS。"""
+    """正規化済み文字列に『タグ内の onXxx= イベントハンドラ』があるか=ハンドラ型 XSS。
+    先に必須文字(< / on / =)の有無だけ見る: 3 つのどれかが欠ければ正規表現は絶対に
+    マッチしない=真陽性を落とさずに、"<img " 連打のような入力で正規表現が 8KB を
+    バックトラック走査する CPU 枯渇(実測 6.4ms/req・イベントループ占有)を避ける。"""
+    if "<" not in blob or "=" not in blob or "on" not in blob:
+        return False
     return _XSS_HANDLER_RE.search(blob) is not None
 
 
@@ -851,6 +954,8 @@ class NetShield:
         self._traffic_path = os.path.join(base, "traffic.json")  # 送出量/接続時間(窓集計)
         self._traffic: dict = {}        # ip -> {day(int): [out_bytes, in_bytes, conn_sec]}
         self._traffic_last_save = 0.0
+        self._bans_last_save = 0.0      # BAN 永続化の間引き用(直近書込時刻)
+        self._bans_dirty = False        # 間引きで未書込の変更が残っているか
         # ネットワーク使用量リスト(誰が/どのサイトと/どれだけ)+ 見返せるログ
         self._usage_path = os.path.join(base, "usage.json")
         self._usage_log_path = os.path.join(base, "usage_log.jsonl")
@@ -1555,6 +1660,15 @@ class NetShield:
                 continue
         self._geo_nets = nets
 
+    def _scan_field(self, text: str, *, only: frozenset | None = None):
+        """1 フィールドを *全域* 走査する([[_scan_windows]] の各窓へ署名照合)。
+        返値は _scan_signatures と同形 (name, weight) / (None, 0.0)。"""
+        for _w in _scan_windows(text):
+            hit, weight = self._scan_signatures(_w, only=only)
+            if hit is not None:
+                return hit, weight
+        return None, 0.0
+
     def _scan_signatures(self, blob: str, *, only: frozenset | None = None):
         """1走査面(正規化済み文字列)への署名/構造検知。(name, weight) or (None, 0.0)を返す。
         prescan ゲート付き builtin署名 + 常時カスタム署名 + 構造検知(恒真式/スタック/XSSハンドラ)。
@@ -1579,6 +1693,9 @@ class NetShield:
                     continue                     # 汎用走査では専用フィールド系は判定しない(#FP)
                 if name in _OPTIONAL_SIGS and not opt.get(name):
                     continue                     # 高FPシグネチャは cfg で有効化された時のみ評価
+                _g = _SIG_GUARD.get(name)
+                if _g is not None and not any(_lit in blob for _lit in _g):
+                    continue                 # 必須リテラル皆無=マッチ不能。高価な走査を省く
                 if saferegex.search(rgx, blob, _MAX_SCAN):   # 入力上限で ReDoS 面積を有界化
                     return name, _SIG_WEIGHT.get(name, 30)
         if only is not None:
@@ -1628,23 +1745,25 @@ class NetShield:
             if _f:
                 _targets.append(_f)
         _targets.extend(h for h in (headers or "").split("\n") if h)
-        blob = _normalize_for_scan(_targets[0])    # 主走査面(reason/後続参照の後方互換用)
-        sig_hit, sig_weight = self._scan_signatures(blob)
+        _wins0 = _scan_windows(_targets[0])        # 主走査面(全域を窓分割=切り詰めない)
+        blob = _wins0[0]                           # reason/後続参照の後方互換用(先頭窓)
+        sig_hit, sig_weight = (None, 0.0)
+        for _w in _wins0:
+            sig_hit, sig_weight = self._scan_signatures(_w)
+            if sig_hit is not None:
+                break
         # フィールド限定シグネチャ(#FP: scanner_ua/sensitive_path・_FIELD_SCOPED_SIGS)は上の汎用
         # 走査面(path+query+UA混成)からは除外済み。ここで各々の専用フィールド *単体* を対象に
         # 個別判定する(scanner_ua=user_agentのみ/sensitive_path=pathのみ)。bio等の自由記述
         # フィールド内の言及や、query/headers越しの言及では判定しない=意味論どおりのスコープ。
         if sig_hit is None and user_agent:
-            sig_hit, sig_weight = self._scan_signatures(
-                _normalize_for_scan(user_agent), only=_UA_ONLY_SIGS)
+            sig_hit, sig_weight = self._scan_field(user_agent, only=_UA_ONLY_SIGS)
         if sig_hit is None and path:
-            sig_hit, sig_weight = self._scan_signatures(
-                _normalize_for_scan(path), only=_PATH_ONLY_SIGS)
+            sig_hit, sig_weight = self._scan_field(path, only=_PATH_ONLY_SIGS)
         for _t in _targets[1:_MAX_SCAN_FIELDS]:    # ヘッダ各値を独立面として(必要分だけ)走査
             if sig_hit is not None:
                 break
-            _nb = _normalize_for_scan(_t)
-            sig_hit, sig_weight = self._scan_signatures(_nb)
+            sig_hit, sig_weight = self._scan_field(_t)   # 各値も全域(切り詰めない)
         # テレメトリ(ロック外で算出=ロック保持時間を伸ばさない)。method は攻撃者入力ゆえ
         # 既知メソッド名のみ採用し OTHER に畳む(辞書の無制限肥大を防ぐ)。
         mkey = method.upper() if (method and method.isalpha() and len(method) <= 10) else "OTHER"
@@ -1716,9 +1835,17 @@ class NetShield:
             if self.cfg.get("cred_rate_enabled") and cred:
                 cr = self._credential_rate(cred)
                 if cr >= int(self.cfg.get("cred_rate_limit", 600)):
-                    self._add_score(st, float(self.cfg.get("cred_rate_score", 40)))
                     self._metrics["cred_rate_hit"] = self._metrics.get("cred_rate_hit", 0) + 1
-                    reasons.append(f"cred-rate:{cr}")
+                    # カウンタは *クレデンシャル共有* なのに、加点先は要求元 IP だった。
+                    # 共有キー(モバイルアプリ埋込・フロントエンド公開キー・流出トークン)を
+                    # 攻撃者が自分のホストから回して窓を超えさせ続ければ、同じキーを使う
+                    # *正規利用者* の IP に毎回 +40 が乗り、数リクエストで BAN できた
+                    # (第三者への BAN 転嫁)。加点はやめ、超過した *その要求だけ* を絞る。
+                    # BAN もスコアも残さないので巻き添えは一時的で回復する。IP 単位の濫用は
+                    # 既存のレート制限/脅威スコアが引き続き担当する=検知能力は落ちない。
+                    return self._enforce_or_audit(
+                        ip, "block", st,
+                        f"クレデンシャル単位のレート超過({cr})", kind="cred_rate")
             # 1.265) JWT 検査(evolution #68): Bearer JWT の alg:none(無署名=認証バイパス)/
             #        許可外 alg(alg 混同攻撃)を遮断。署名検証はアプリ(鍵が無い)、ここは構造点検のみ。
             if self.cfg.get("jwt_inspect_enabled") and auth:
@@ -1862,10 +1989,12 @@ class NetShield:
         sig_hit, weight, i = None, 0.0, 0
         while i < len(data):
             try:
-                blob = _normalize_for_scan(data[i:i + win].decode("latin1", "replace"))
+                # 正規化 *後* を再度窓分割する: NFKC 展開(1 文字→最大 18 文字)で後半が
+                # 1 窓の外へ押し出されるのを防ぐ(生バイト窓の刻みだけでは足りない)。
+                sig_hit, weight = self._scan_field(
+                    data[i:i + win].decode("latin1", "replace"))
             except Exception:
                 break
-            sig_hit, weight = self._scan_signatures(blob)
             if sig_hit:
                 break
             if i + win >= len(data):
@@ -2502,10 +2631,23 @@ class NetShield:
         if migrate:                               # 旧来の無署名 blocklist→署名済みへ移行
             self._save_bans()
 
-    def _save_bans(self):
+    def _save_bans(self, force: bool = False):
+        """BAN 表をディスクへ。新規BANのたびに全件を JSON 化して fsync する実装だったため、
+        BAN 表が育つほど 1 回の書込が重くなり(実測: 20000 件で 3.2MB / 133ms)、しかもそれを
+        グローバルロックを握ったまま行っていた。多数の送信元(IPv6 /64 で十分)で囮URLを踏んで
+        BAN 表を膨らませれば、以後は毎秒数リクエストで全通信を止められる=DoS になっていた。
+        そこで最小間隔で間引く(未書込は _bans_dirty に残し、次の保存/flush_state で必ず出す)。
+        force=True は shutdown 等の確実に書き切りたい場面用。"""
         if not self.cfg.get("persist_bans"):
             return
         now = _now()
+        self._bans_dirty = True
+        iv = float(self.cfg.get("ban_persist_min_interval_sec", 2.0) or 0)
+        big = len(self._ips) >= int(self.cfg.get("ban_persist_debounce_from", 512) or 0)
+        if not force and big and iv > 0 and (now - self._bans_last_save) < iv:
+            return                      # 表が小さいうちは従来どおり即時保存(耐久性優先)
+        self._bans_last_save = now
+        self._bans_dirty = False
         retain = float(self.cfg.get("ban_escalation_retain_sec", 86400) or 0)
         bans = {}
         for ip, s in self._ips.items():
@@ -2532,7 +2674,7 @@ class NetShield:
         明示 flush することで最新のエスカレーション記憶(期限切れ offender の保持分も)を
         取りこぼさない。persist_bans=False なら _save_bans は no-op(=安全に何もしない)。"""
         with self._lock:
-            self._save_bans()
+            self._save_bans(force=True)     # 間引きを無視して必ず書き切る
         return {"ok": True, "persisted": bool(self.cfg.get("persist_bans"))}
 
     def is_banned_fast(self, ip: str) -> bool:

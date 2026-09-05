@@ -62,6 +62,15 @@ def _body_has_unbounded_or_alt(body: str) -> bool:
                 inner = body[i + 1:j]
                 if "," in inner and inner.split(",", 1)[1].strip() == "":
                     return True  # {n,} = 上限なし
+                if "," in inner:
+                    # {m,n}(m<n)= *可変長* の内側反復。外側量化子と組むと分解が曖昧になり
+                    # 指数爆発する((a{1,10})+b は lint を素通りしていた)。上限付きでも弾く。
+                    _lo, _, _hi = inner.partition(",")
+                    try:
+                        if int(_hi.strip() or "0") > int(_lo.strip() or "0"):
+                            return True
+                    except ValueError:
+                        return True          # 解釈不能な量化子は安全側で危険扱い
                 i = j + 1
                 continue
         i += 1

@@ -60,6 +60,8 @@ MODULES = [
     "test_connlimit_global",    # グローバル同時接続上限(FD/ソケット枯渇のロードシェッド)
     "test_saferegex",           # ReDoS 耐性(lint/入力上限/線形リテラル照合)・組込sig安全性
     "test_smuggling",           # HTTP リクエストスマグリング/デシンク拒否(CL.TE/裸LF/obs-fold等)
+    "test_scanwindow",          # 走査面のバイパス封じ(パディング/NFKC展開/窓予算)と資源境界
+    "test_vulnfix",             # 脆弱性修正の回帰(CSRF/トークン配布/署名束縛)
 ]
 
 

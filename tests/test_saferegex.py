@@ -20,6 +20,17 @@ def test_lint_flags_nested_quantifiers():
     assert saferegex.lint("a" * 2000) != ""       # 長すぎ
 
 
+def test_lint_flags_variable_bounded_inner_quantifier():
+    """{m,n}(m<n)= *可変長* の内側反復も外側量化子と組めば指数爆発する。
+    旧 lint は上限なし {n,} しか見ておらず、(a{1,10})+b が「安全」として通り、
+    24 文字の入力で 0.6 秒を消費するカスタム署名を登録できた。"""
+    for bad in (r"(a{1,10})+b", r"(x{1,5}y{1,5})+z", r"(a{2,})+b"):
+        assert saferegex.lint(bad) != "", bad
+    # 固定回数({n} や {n}{m})や外側量化子の無い {m,n} は従来どおり安全
+    for ok in (r"(a{3}){2}b", r"\d{1,3}\.\d{1,3}", r"^[a-z]{1,32}$"):
+        assert saferegex.lint(ok) == "", ok
+
+
 def test_compile_safe_behaviour():
     rx = saferegex.compile_safe(r"(?i)\bdrop\b\s+\btable\b")
     assert rx.search("... DROP TABLE users ...")

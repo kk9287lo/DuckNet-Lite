@@ -477,23 +477,38 @@ def _make_handler(app: AdminDashboard):
 
         def _origin_ok(self) -> bool:
             """状態変更 POST の Origin/Referer 同一オリジン検査(CSRF/rebinding の多層防御)。
-            Origin(無ければ Referer)が提示されていて、その host が許可外なら拒否する。
+            Origin(無ければ Referer)が提示されていて、その host が *この要求の Host と
+            一致しない* なら拒否する。以前は _hostname_allowed に委ねていたが、あれは
+            rebinding 対策として「IPリテラルなら何でも許可」する判定なので、攻撃者が自分の
+            サーバへ IP で到達させたページ(Origin: http://203.0.113.9)からの POST が
+            同一オリジン扱いで通ってしまっていた。CSRF 判定は同一オリジンの一致で行う。
             プログラム的クライアント(Origin/Referer 無し)はトークン必須で別途守られる。"""
             src = self.headers.get("Origin") or self.headers.get("Referer") or ""
             if not src:
                 return True
-            return self._hostname_allowed(self._host_of(src))
+            shost = self._host_of(src)
+            if not shost:
+                return False
+            host = self._host_of(self.headers.get("Host"))
+            if host and shost == host:
+                return True                  # 同一オリジン(通常のダッシュボード操作)
+            allowed = os.environ.get("DUCKNET_ADMIN_ALLOWED_HOSTS", "")
+            return shost in {h.strip().lower() for h in allowed.split(",") if h.strip()}
 
         @staticmethod
-        def _may_set_token_cookie(peer_ip, authed, query_token, real_token) -> bool:
+        def _may_set_token_cookie(peer_ip, authed, query_token, real_token,
+                                  forwarded: bool = False) -> bool:
             """`/` 訪問時にトークン Cookie を配ってよいか。**無認証の第三者へは配らない**
             (admin を非localhostへ公開してもトークン窃取で乗っ取られない)。許可条件:
-            localhost 経由 / 既に有効トークン提示(header・cookie)/ ?token=<起動時トークン>
-            (リモートブラウザの初回ブートストラップ)。"""
-            if peer_ip in ("127.0.0.1", "::1", "::ffff:127.0.0.1"):
-                return True
+            既に有効トークン提示(header・cookie)/ ?token=<起動時トークン>(リモートブラウザ
+            の初回ブートストラップ)/ 転送ヘッダを伴わない loopback からの直接アクセス。
+            forwarded=True(X-Forwarded-For 等あり)の loopback は前段リバースプロキシ越しで
+            あり、peer が 127.0.0.1 に潰れているだけ=実体は任意の第三者。ここを素通しに
+            すると、admin をリバースプロキシで公開した構成で *誰でも* 管理トークンを受け取れた。"""
             if authed:
                 return True
+            if peer_ip in ("127.0.0.1", "::1", "::ffff:127.0.0.1") and not forwarded:
+                return True                  # 本当にローカル端末からの直接アクセス
             return bool(query_token) and hmac.compare_digest(
                 str(query_token).encode("utf-8", "ignore"),
                 str(real_token).encode("utf-8", "ignore"))
@@ -516,7 +531,10 @@ def _make_handler(app: AdminDashboard):
                 qtok = (parse_qs(urlparse(self.path).query).get("token") or [""])[0]
                 peer = (self.client_address or ("",))[0]
                 set_cookie = None
-                if self._may_set_token_cookie(peer, self._auth(), qtok, app.token):
+                fwd = any(self.headers.get(h) for h in
+                          ("X-Forwarded-For", "X-Real-IP", "Forwarded",
+                           "X-Forwarded-Host", "X-Client-IP"))
+                if self._may_set_token_cookie(peer, self._auth(), qtok, app.token, fwd):
                     ck = http.cookies.SimpleCookie()
                     ck[_COOKIE_NAME] = app.token
                     ck[_COOKIE_NAME]["httponly"] = True

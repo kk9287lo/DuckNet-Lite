@@ -52,8 +52,25 @@ def _read_key_file(key_path: str):
             return None                       # symlink は拒否(リダイレクト無効化)
         fd = os.open(key_path, os.O_RDONLY | _O_BIN | _O_NOFOLLOW)
         try:
-            if not _stat.S_ISREG(os.fstat(fd).st_mode):
+            fst = os.fstat(fd)
+            if not _stat.S_ISREG(fst.st_mode):
                 return None                   # 通常ファイル以外(FIFO/デバイス/ディレクトリ等)は拒否
+            if os.name == "posix":
+                # 所有者と権限も確かめる。共有 state_dir に *他ユーザーが作った* 鍵を読むと、
+                # 攻撃者の知っている鍵で「署名は正しい」と判定してしまい、署名済み状態
+                # (BAN/設定)の偽造を検出できなくなる。他人所有は拒否。
+                if fst.st_uid != os.geteuid() and os.geteuid() != 0:
+                    return None
+                if fst.st_mode & 0o077:
+                    # group/other から読める=鍵が漏れうる。ただしここで *拒否* すると、
+                    # 既存インストール(緩い権限で作られた鍵)では読めない→O_EXCL は
+                    # FileExistsError→永続化されない一時鍵を返す、という経路に落ちて
+                    # 起動のたびに鍵が変わり、自分が署名した BAN/設定を自分で検証できず
+                    # 既定値へ黙って戻ってしまう。自分の物なら締め直して読む(自己修復)。
+                    try:
+                        os.fchmod(fd, 0o600)
+                    except OSError:
+                        return None       # 締められない=保護できないので使わない
             return os.read(fd, 1 << 16)
         finally:
             os.close(fd)
@@ -119,9 +136,15 @@ def _hw_path(path: str) -> str:
 
 
 def _read_file_hw(path: str, key: bytes) -> int:
-    """サイドカー .hw(署名済みの最大バージョン)を読む。検証失敗/欠損は 0。"""
+    """サイドカー .hw(署名済みの最大バージョン)を読む。検証失敗/欠損は 0。
+    署名対象に *対象ファイルの basename* を含める(本体エンベロープの purpose 束縛と同じ考え)。
+    以前は {"_ver": n} だけに署名していたため、ある state の .hw を別の state の .hw として
+    そのまま置ける=低いバージョンの .hw を移植して高水位を下げ、ロールバック防止を無効化
+    できた。束縛が無い旧形式は受理しない(0 扱い)=移植を将来にわたって無効化する。
+    旧形式からの移行時は高水位が一度 0 に戻るが、メモリ高水位(_MEM_HW)と ms 由来の
+    単調バージョンが働き、次回書込みで束縛付き .hw に置き換わる。"""
     raw = safe_read_json(_hw_path(path), None)
-    if isinstance(raw, dict) and verify_payload({"_ver": raw.get("_ver", 0)},
+    if isinstance(raw, dict) and verify_payload(_hw_payload(path, raw.get("_ver", 0)),
                                                 raw.get("_sig", ""), key):
         try:
             return int(raw.get("_ver", 0))
@@ -130,8 +153,17 @@ def _read_file_hw(path: str, key: bytes) -> int:
     return 0
 
 
+def _hw_payload(path: str, ver) -> dict:
+    """.hw の署名対象。basename で束縛して別 state への移植を無効化する。"""
+    try:
+        ver = int(ver)
+    except (TypeError, ValueError):
+        ver = 0
+    return {"_hw": 1, "_ver": ver, "_for": os.path.basename(path)}
+
+
 def _write_file_hw(path: str, ver: int, key: bytes) -> None:
-    env = {"_ver": int(ver), "_sig": sign_payload({"_ver": int(ver)}, key)}
+    env = {"_ver": int(ver), "_sig": sign_payload(_hw_payload(path, ver), key)}
     try:
         atomic_write_json(_hw_path(path), env, indent=0)
     except Exception:

@@ -389,6 +389,10 @@ def _header_names(buf: bytes, max_headers: int = 64) -> list:
         return []
 
 
+_SCAN_PART_OVERLAP = 256    # ヘッダ値分割時の重なり(境界跨ぎペイロードの分断を防ぐ)
+_SCAN_MAX_PARTS = 4         # 1 ヘッダ値あたりの最大分割数(走査面積を有界に保つ)
+
+
 def _scan_header_values(buf: bytes, per: int = 8192, max_headers: int = 64) -> str:
     """攻撃者制御のヘッダ値(Referer/X-Forwarded-For/Cookie/独自ヘッダ等)を WAF の走査面へ。
     Log4Shell/SQLi 等は UA 以外のあらゆるヘッダから来る。構造系/高頻度・低リスク(Accept* 等)は除外。
@@ -408,14 +412,32 @@ def _scan_header_values(buf: bytes, per: int = 8192, max_headers: int = 64) -> s
             k, sep, v = ln.partition(b":")
             if not sep or k.strip().lower() in _SCAN_SKIP_HDR:
                 continue
-            v = v.strip()[:per]
-            if len(vals) < max_headers:
-                vals.append(v)
+            v = v.strip()
+            # per を超える値は *切り捨てず* 重なり付きで分割し、全量を走査面へ載せる。
+            # 旧実装は v[:per] で切っていたため、per〜転送サイズの範囲が「転送されるのに
+            # 未走査」の迂回窓だった(単一ヘッダを padding して Log4Shell 等を素通しできた)。
+            # engine 側も 1 フィールド _MAX_SCAN で切るので、上限を上げるだけでは塞がらない。
+            # 重なりは境界を跨ぐペイロードの分断を防ぐ。断片数は上限化(走査面積を有界に保つ)。
+            if len(v) <= per:
+                parts = [v]
             else:
-                tail.append(v)
+                _step = max(1, per - _SCAN_PART_OVERLAP)
+                parts = [v[i:i + per] for i in range(0, len(v), _step)][:_SCAN_MAX_PARTS]
+            for _pv in parts:
+                if len(vals) < max_headers:
+                    vals.append(_pv)
+                else:
+                    tail.append(_pv)
         if tail:
-            # 上限超ヘッダを 1 フィールドに結合して必ず走査(転送される全ヘッダ内容を走査面に残す)
-            vals.append(b" ".join(tail)[:per])
+            # 上限超ヘッダを結合して必ず走査(転送される全ヘッダ内容を走査面に残す)。
+            # ここも切り捨てず重なり付き分割: 末尾バケットだけ未走査窓が残るのを防ぐ。
+            _t = b" ".join(tail)
+            if len(_t) <= per:
+                vals.append(_t)
+            else:
+                _step = max(1, per - _SCAN_PART_OVERLAP)
+                vals.extend(_t[i:i + per]
+                            for i in range(0, len(_t), _step))
         return b"\n".join(vals).decode("latin1", "replace")
     except Exception:
         return ""
@@ -708,6 +730,24 @@ class AsyncEdgeGuard:
             self.metrics["dropped"] += 1
             return self._close(writer)
         if not buf:
+            return self._close(writer)
+        if b"\r\n\r\n" not in buf:
+            # ヘッダ終端を観測できないまま上限に達した。このまま進むと『検査面に載らないのに
+            # backend へは転送される』ヘッダが生まれ(走査面 < 転送面)、WAF を素通りできる。
+            # 転送せず 431 で拒否する(fail-closed)。framing 検査の死角も同時に塞ぐ。
+            self.metrics["dropped"] += 1
+            self.metrics["head_too_large"] = self.metrics.get("head_too_large", 0) + 1
+            try:
+                from ..lifeform.pipeline import net_shield
+                net_shield().penalize(ip, reason="ヘッダ過大(終端未観測)=走査面外への押し出し",
+                                      kind="head_too_large")
+            except Exception:
+                pass
+            try:
+                writer.write(_http_response("431 Request Header Fields Too Large",
+                                            '{"ok":false,"error":"header too large"}'))
+            except Exception:
+                pass
             return self._close(writer)
         method, path, ua, host = _parse_head(buf)
 
