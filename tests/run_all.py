@@ -1,4 +1,4 @@
-"""tests/run_all.py — DuckNet L7 Security 全テスト(依存ゼロ・pytest不要)。
+"""tests/run_all.py — DuckNet-Lite 全テスト(依存ゼロ・pytest不要)。
 
 実行:
     python tests/run_all.py        # リポジトリ直下から

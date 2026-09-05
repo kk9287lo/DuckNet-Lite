@@ -1,5 +1,5 @@
 """
-test_dataplane.py — 製品(DuckNet L7 Security)の管理ダッシュボード + 単独バンドル検証
+test_dataplane.py — 製品(DuckNet-Lite)の管理ダッシュボード + 単独バンドル検証
 ====================================================================================
   · 管理ダッシュボード(Web GUI)の制御API: 状態取得・トークン保護・ON/OFF・ルール・
     ハニーポット・エッジ前衛設定DL が動く。
@@ -70,7 +70,7 @@ def test_dashboard_state_and_token():
             assert "firewall" in st and "shield" in st and "capabilities" in st
             # HTML(ダッシュボード)はtoken不要で取得できる
             code, html = _req(url + "/")
-            assert code == 200 and b"DuckNet L7 Security" in html
+            assert code == 200 and b"DuckNet-Lite" in html      # 上位版の名前を名乗らない
             # 総合ビューが論理セクションに整理されている(情報設計の回帰防止)
             assert html.count(b'class="sect"') == 6
             for label in ["概況", "脅威モニタリング", "WAF / 検知設定",

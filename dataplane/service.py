@@ -1,5 +1,5 @@
 """
-service.py — DuckNet L7 Security スタンドアロン・サービス本体(CLI/起動エントリ)
+service.py — DuckNet-Lite スタンドアロン・サービス本体(CLI/起動エントリ)
 ====================================================================================
 『あなたのWebサーバの手前にポン置きするだけで DDoS / WAF 防御が完了する』軽量プロキシ。
 外部依存ゼロ(標準ライブラリのみ)・OS非侵襲・防御専用。
@@ -129,7 +129,7 @@ def run(backend: str = "127.0.0.1:8080", listen: int = 8443,
     admin = AdminDashboard(host=admin_host, port=admin_port, token=token, edge_guard=guard)
     a = admin.start()
     print("=" * 64)
-    print(" DuckNet L7 Security — セキュリティゲートウェイ 起動")
+    print(" DuckNet-Lite — セキュリティゲートウェイ 起動")
     print("=" * 64)
     print(f" 管理ダッシュボード : {a['url']}")
     print(f" 管理トークン       : {a['token']}")
@@ -156,7 +156,7 @@ def run(backend: str = "127.0.0.1:8080", listen: int = 8443,
     # WAF 状態(BAN/累犯回数)も flush=再起動越しのエスカレーション記憶を取りこぼさない。
     _block_until_shutdown(lambda: guard.stop(grace=drain_grace), admin.stop,
                           net_shield().flush_state)
-    print("\nDuckNet L7 Security を停止しました。")
+    print("\nDuckNet-Lite を停止しました。")
 
 
 def _strip_autostart_flags(raw) -> list:
@@ -192,7 +192,7 @@ def main(argv=None) -> int:
         return _tray_main(args[1:])
     ap = argparse.ArgumentParser(
         prog="ducknet-lite",
-        description="DuckNet L7 Security — 軽量 DDoS/WAF セキュリティゲートウェイ(L7・依存ゼロ)")
+        description="DuckNet-Lite — 軽量 DDoS/WAF セキュリティゲートウェイ(L7・依存ゼロ)")
     ap.add_argument("--backend", default="127.0.0.1:8080",
                     help="守る対象(あなたのWebサーバ) HOST:PORT")
     ap.add_argument("--listen", type=int, default=8443, help="前衛ガードの待受ポート")

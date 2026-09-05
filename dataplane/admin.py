@@ -1,5 +1,5 @@
 """
-admin.py — DuckNet L7 Security 管理ダッシュボード(Web GUI・stdlib http.server)
+admin.py — DuckNet-Lite 管理ダッシュボード(Web GUI・stdlib http.server)
 ====================================================================================
 中小企業のWeb担当者が『管理画面で攻撃をグラフ化・ON/OFFをクリック』できる製品UI。
 外部依存ゼロ(標準ライブラリのみ)。app_firewall + net_shield を1画面で操作・監視する。
@@ -190,7 +190,7 @@ class AdminDashboard:
         # 画面の表示名/アイコン。ステルス運用では汎用名(例 "System Health Monitor")に
         # 差し替えて、管理画面のタイトル/ヘッダ/Server ヘッダから製品を伏せる。明示が無ければ
         # DUCKNET_COVER env を尊重し(遮断ページと同じ秘匿源=適用漏れを防ぐ)、無ければ製品名。
-        self.brand = brand or os.environ.get("DUCKNET_COVER", "DuckNet L7 Security")
+        self.brand = brand or os.environ.get("DUCKNET_COVER", "DuckNet-Lite")
         self.logo = logo
         self.subtitle = subtitle
         # ブランドアイコン: 実ファイル DuckNet.ico(無ければ .png)を /brand-icon で配信し、

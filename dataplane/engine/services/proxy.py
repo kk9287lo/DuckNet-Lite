@@ -288,7 +288,7 @@ def _block_page(info: dict, submitted: bool = False, msg: str = "") -> bytes:
     import html as _html
     from ..core.i18n import t, lang
     lg = lang()
-    brand = _html.escape(os.environ.get("DUCKNET_COVER", "DuckNet L7 Security"))
+    brand = _html.escape(os.environ.get("DUCKNET_COVER", "DuckNet-Lite"))
     remain = int(info.get("remain_sec", 0))
     if submitted:
         center = (f"<h2>{t('block.received.h')}</h2>"
@@ -584,7 +584,7 @@ class AsyncEdgeGuard:
     def __init__(self, backend_host: str = "127.0.0.1", backend_port: int = 8787,
                  listen_host: str = "127.0.0.1", listen_port: int = 8799,
                  head_timeout: float = 10.0, backend_unix: str = "",
-                 license_check=None, health_path: str = "", write_timeout: float = 60.0):
+                 health_path: str = "", write_timeout: float = 60.0):
         self.backend_host = backend_host
         self.backend_port = backend_port
         self.listen_host = listen_host
@@ -601,9 +601,6 @@ class AsyncEdgeGuard:
         # ヘルスチェック用パス(opt-in)。LB/オーケストレータの死活監視を WAF/バックエンド非経由で
         # 即 200 応答するための予約パス。既定は空=無効(env DUCKNET_HEALTH_PATH で既定指定可)。
         self.health_path = (health_path or os.environ.get("DUCKNET_HEALTH_PATH", "")).strip()
-        # ライセンス検証はホットパスでは **メモリBooleanを返す callable** だけ(外部I/Oなし)。
-        # 未設定(None)なら無効化=評価/OSS運用はそのまま。商用は gateway が LicenseManager を渡す。
-        self.license_check = license_check
         self._loop = None
         self._server = None
         self._thread = None
@@ -791,19 +788,6 @@ class AsyncEdgeGuard:
                 from ..lifeform.pipeline import net_shield
                 net_shield().penalize(ip, reason="HTTP smuggling framing(CL/TE)",
                                       kind="smuggling")
-            except Exception:
-                pass
-            return self._close(writer)
-
-        # 0) ライセンス(商用): ホットパスは Boolean 1個だけ(外部I/Oなし=詰まらない)。
-        #    無効/期限切れなら 402 を即返して切断(防御性能は1ミリも落とさない)。
-        if self.license_check is not None and not self.license_check():
-            self.metrics["dropped"] += 1
-            writer.write(_http_response(
-                "402 Payment Required", '{"error":"license invalid or expired"}',
-                extra=deception.headers_for(ip)))
-            try:
-                await writer.drain()
             except Exception:
                 pass
             return self._close(writer)

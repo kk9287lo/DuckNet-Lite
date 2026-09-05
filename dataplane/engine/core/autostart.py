@@ -108,7 +108,7 @@ def install_windows_runkey(name, command, *, winreg_mod=None) -> dict:
 
 # ── Linux: systemd / macOS: launchd(ユニット文の生成=純粋) ───────────────
 def systemd_unit_text(command, *, user: str = "ducknet",
-                      description: str = "DuckNet L7 Security") -> str:
+                      description: str = "DuckNet-Lite") -> str:
     exec_start = _quote(command)
     return (
         "[Unit]\n"

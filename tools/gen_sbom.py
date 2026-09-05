@@ -1,5 +1,5 @@
 """
-gen_sbom.py — DuckNet L7 Security の SBOM(CycloneDX 1.5)を生成する。
+gen_sbom.py — DuckNet-Lite の SBOM(CycloneDX 1.5)を生成する。
 ====================================================================================
 依存ゼロ(stdlib のみ)で再実行可能。出力: リポジトリ直下 `sbom.cdx.json`。
 B2B/エンタープライズ調達で要求される機械可読の部品表(SBOM)を提供する。

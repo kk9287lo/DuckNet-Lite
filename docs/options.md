@@ -11,7 +11,6 @@ DuckNet の挙動は CLI 引数・環境変数・設定キー(cfg)で制御し�
 | `DUCKNET_LANG` | (自動) | サーバ生成文言の言語 `ja`/`en`。未設定なら OS ロケールに追随(英語環境は自動 en、それ以外 ja)。 |
 | `DUCKNET_STATE_DIR` | OS 既定 | 状態ファイル(BAN/設定/署名/テレメトリ)の保存先。 |
 | `DUCKNET_STATE_KEY` | (生成) | 状態ファイル署名の HMAC 鍵。外部鍵を推奨(未設定時は state_dir に 0600 で生成するため、同ディスクの root には弱い)。 |
-| `DUCKNET_OFFLINE` | (空) | 外部接続を一切しない(テスト/隔離環境)。 |
 | `DUCKNET_DRAIN_TIMEOUT` | `60` | 応答転送の書込み(drain)デッドライン秒(#9 slow-read/zero-window 対策)。 |
 | `DUCKNET_HEALTH_PATH` | (空) | LB 死活監視用に即 200 を返す予約パス(WAF/バックエンド非経由)。 |
 

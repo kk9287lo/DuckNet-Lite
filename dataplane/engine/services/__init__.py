@@ -1,1 +1,1 @@
-"""vendored subset for DuckNet L7 Security (stdlib only)."""
+"""vendored subset for DuckNet-Lite (stdlib only)."""

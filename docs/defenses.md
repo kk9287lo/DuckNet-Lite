@@ -63,3 +63,54 @@ DuckNet L7 の防御と、それを制御する設定キーの一覧です(`NetS
 1. まず既定 ON のまま監査(`mode=audit`)で運用し、誤検知を観察します。
 2. 配備に合う opt-in を audit モードから入れます(`open_redirect_mode=audit`)。
 3. 問題なければ enforce へ。全体の厳格度は `paranoia` で調整できます。
+
+## 設定キー全一覧(補遺)
+
+上の表で触れていない設定キーです。既定値は `NetShield._DEFAULTS`(唯一の真実)から取っています。
+値の意味が上の表と重なるものは、そちらの説明を優先してください。
+
+| 設定キー | 既定 | 概要 |
+|---|---|---|
+| `rate_per_sec` | `20.0` | IP毎の定常許容レート |
+| `burst` | `40` | バースト許容 |
+| `force_conn_close` | `True` | 応答へ `Connection: close` を強制し、keep-alive 越しの検査回避を防ぐ |
+| `throttle_response` | `True` | throttle時に 429 を返す(False=即時切断・無応答) |
+| `throttle_retry_after` | `1` | 429 の Retry-After 秒(クライアントへの再試行目安) |
+| `subnet_window_sec` | `3600` | BAN を集計する時間窓(秒) |
+| `subnet_score` | `30` | hot サブネットの新規IPへ一度だけ加える score(deny_score未満=ソフト) |
+| `origin_header` | `"X-Edge-Token"` | トークンを載せるヘッダ名(中立名・バックエンドと合わせる) |
+| `origin_window_sec` | `30` | トークンの時間バケット幅(リプレイ窓・時計ずれ吸収) |
+| `stall_min_rate` | `1.0` | 「直近 busy」とみなす最小レート(req/s)。これ未満は静観 |
+| `slowloris_score` | `50` | ヘッダ未完(slowloris)1回あたりの加点(反復でBAN) |
+| `resp_error_window_sec` | `60` | 4xx 集計窓 |
+| `resp_error_score` | `50` | 閾超過1回あたりの加点(note_response は block_score のみ判定= |
+| `cred_rate_score` | `40` | 超過時の加点(既定=deny_score 相当→次要求で単発拒否) |
+| `resp_stall_sec` | `0.0` | 迂回検知: 直近まで busy だったのに応答が途絶えた状態を疑う秒数 |
+| `open_redirect_safe_path` | `"/"` | enforce 時に書き換える安全な遷移先 |
+| `graphql_max_complexity` | `100` | 選択セット数の上限(エイリアス/フィールド増幅対策) |
+| `graphql_block_introspection` | `True` | __schema/__type を遮断(本番のスキーマ漏洩防止) |
+| `graphql_max_batch` | `10` | バッチ(配列)オペレーション数の上限 |
+| `ban_escalation_retain_sec` | `86400` | 累犯回数(ban_count)を再起動越しに覚えておく窓(BAN期限切れ後) |
+| `block_page` | `True` | 遮断時に HTML の説明ページを返す(False=最小 JSON) |
+| `appeal_enabled` | `True` | 遮断ページに『解除リクエスト(異議申立)』を表示 |
+| `appeal_after_sec` | `120` | BANから この秒数 経過後にのみ解除リクエストを表示(数分後) |
+| `mode` | `"enforce"` | `enforce`(遮断)/ `audit`(遮断せず記録のみ) |
+| `blocked_extensions` | `(空)` | 遮断する拡張子(例 .env .sql .bak .git .ini) |
+| `blocked_urls` | `(空)` | 遮断するURL部分文字列(例 /admin /wp-admin) |
+| `require_tls` | `False` | 正規TLS以外(平文)を遮断(X-Forwarded-Proto=https 必須) |
+| `geo_mode` | `"off"` | `off` / `allow` / `block` — `geo_cidrs` による地域判定の動作 |
+| `geo_cidrs` | `(空)` | 地域判定に使う CIDR 一覧(GeoIP DB 不要) |
+| `quota_enabled` | `False` | 送出量/接続時間クォータの集計と超過判定を有効化 |
+| `quota_window_days` | `1` | 集計窓(1〜N日) |
+| `site_blacklist` | `(空)` | `site_mode=block` のときに拒否する Host(ドメイン)の一覧 |
+| `ip_mode` | `"off"` | `off` / `allow` / `block` — IP/CIDR リストの動作 |
+| `ip_whitelist` | `(空)` | `ip_mode=allow` のときに通す IP/CIDR の一覧 |
+| `ip_blacklist` | `(空)` | `ip_mode=block` のときに拒否する IP/CIDR の一覧 |
+| `usage_record` | `True` | ホスト別の利用状況(リクエスト数等)を記録する |
+| `score_halflife_sec` | `30.0` | スコア半減期 |
+| `cadence_score` | `35` | 機械的規則性を検知した時の加点 |
+| `cadence_min_samples` | `8` | 判定に要する最小サンプル数 |
+| `cadence_cv_threshold` | `0.15` | 変動係数(これ未満=規則正しすぎ=機械) |
+| `cadence_max_mean_interval` | `3.0` | 平均間隔がこれ超なら対象外(遅い正規ポーラを誤検知しない) |
+| `cadence_min_mean_interval` | `0.01` | これ未満=バースト(µs〜ms)はビーコンでなく flood/レート制限の |
+| `optional_sigs` | `(空)` | 高FPシグネチャの個別 ON/OFF(`paranoia` を上げると自動で入る) |

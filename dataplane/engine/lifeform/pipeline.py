@@ -2572,7 +2572,7 @@ class NetShield:
                              "mac": macs.get(ip, "")})
         rows.sort(key=lambda r: (r["banned"], r["score"], r["reqs_window"]), reverse=True)
         _zones = ["loopback", "private", "public", "special", "unknown"]
-        return {"center": "DuckNet L7 Security", "nodes": rows[:n],
+        return {"center": "DuckNet-Lite", "nodes": rows[:n],
                 "zones": {z: sum(1 for r in rows if r["zone"] == z) for z in _zones}}
 
     def apt_report(self, n: int = 15) -> dict:

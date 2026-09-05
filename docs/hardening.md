@@ -56,7 +56,7 @@ export DUCKNET_STATE_KEY="$(cat /etc/ducknet/keys/state.key)"     # 状態(#52�
 
 ```ini
 [Unit]
-Description=DuckNet L7 Security
+Description=DuckNet-Lite
 After=network-online.target
 Wants=network-online.target
 

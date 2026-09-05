@@ -11,3 +11,6 @@ venv/
 # 運用者のローカル設定(ライセンス秘密を含みうる)。例は app.env.example を追跡。
 /app.env
 .claude/launch.json
+
+# 内部の引き継ぎメモ(ローカル専用・公開リポジトリには載せない)
+NEXT_STEPS.md

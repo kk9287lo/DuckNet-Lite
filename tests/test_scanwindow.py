@@ -129,7 +129,7 @@ def test_credential_rate_does_not_ban_other_users():
     # 共有キーの濫用で *別IP の正規利用者* が BAN されない(BAN の第三者転嫁の回帰)。
     with tempfile.TemporaryDirectory() as d:
         sh = _shield(d, cred_rate_enabled=True, cred_rate_limit=20,
-                     challenge_score=40, block_score=100)
+                     deny_score=40, block_score=100)
         for _ in range(40):
             sh.inspect("203.0.113.200", path="/api", cred="shared-key")
         victim = "10.9.9.9"
