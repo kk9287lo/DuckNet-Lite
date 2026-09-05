@@ -19,8 +19,8 @@ jobs:
           - os: windows-latest
             python: "3.12"
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python }}
       - name: Run test suite (stdlib only, no install needed)
@@ -32,8 +32,8 @@ jobs:
     name: build & verify package
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
       - name: Install build tooling
@@ -61,7 +61,7 @@ jobs:
           python -m venv /tmp/v
           /tmp/v/bin/python -m pip install dist/*.whl
           /tmp/v/bin/ducknet-lite --help
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: dist
           path: dist/*
