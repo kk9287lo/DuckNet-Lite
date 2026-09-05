@@ -34,10 +34,10 @@ Python 3.10 以上なら `pip install` は要りません。起動ラッパ(`run
 
 ## フル版との違い
 
-Lite版は最小限の機能に絞っています。下記の機能は上位の DuckNet L7 Security のみ搭載
+Lite版は最小限の機能に絞っています。下記の機能は上位の DuckNet L7 Security にのみ搭載しています。
 
 - 可用性: 自己完全性チェックとファイル修復、watchdog による自動再起動、`--supervise`。
-- ボット選別システム: 動的 PoW チャレンジで人を通しつつボットを弾く(Lite は拒否/BAN の二値のみ)。GeoIP・allowlist・ステルス運用もk濃。
+- ボット選別システム: 動的 PoW チャレンジで人を通しつつボットを弾く(Lite は拒否/BAN の二値のみ)。GeoIP・allowlist・ステルス運用も加わります。
 - 侵入後検知: LDAP/SMB/Kerberos デコイ、カナリアトークン、ハニーポット、DNS フィルタ。
 - SOC連携: SIEM/Slack 転送、脅威インテリジェンス(IoC)、MITRE ATT&CK ルール。
 - 大規模配備: LDAP 列挙検知プロキシ、ノード間の BAN 同期、商用ライセンス管理。
