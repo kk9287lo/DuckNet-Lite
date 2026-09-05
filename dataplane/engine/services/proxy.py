@@ -1550,14 +1550,28 @@ class AsyncEdgeGuard:
         return self.start()
 
     async def _drain(self, grace: float):
-        """graceful shutdown: ① 新規受理を止め(listener close)② 進行中の接続が捌けるのを最大
-        `grace` 秒待ち ③ 停止合図。`grace<=0`(既定)は待たず即時=従来挙動。残接続数を返す。"""
+        """graceful shutdown: ① 新規受理を止め ② 進行中の接続が捌けるのを最大 `grace` 秒待ち
+        ③ 停止合図。`grace<=0`(既定)は待たず即時=従来挙動。残接続数を返す。
+        新規受理の停止は listener ソケットだけを閉じて行う: asyncio.Server.close() は Python 3.13 で
+        *進行中の接続まで* 切断する(3.12 以前は listener のみ)ため、drain の前に呼ぶと in-flight を
+        取りこぼす。in-flight を捌き切ってから Server.close() する=全バージョンで graceful。"""
         if self._server is not None:
-            self._server.close()                  # 新規受理のみ停止(進行中タスクは非キャンセル)
+            # listener のみ閉じる=新規受理を止め、in-flight は生かす。sockets 非公開のサーバ
+            # (テスト用フェイク等)は空扱いにして下の Server.close() に委ねる。
+            for _sock in getattr(self._server, "sockets", None) or ():
+                try:
+                    _sock.close()
+                except Exception:
+                    pass
         deadline = self._loop.time() + max(0.0, float(grace))
         while self._active > 0 and self._loop.time() < deadline:
             await asyncio.sleep(0.05)
         remaining = self._active
+        if self._server is not None:
+            try:
+                self._server.close()              # in-flight 捌け後なら安全(全バージョン共通の後片付け)
+            except Exception:
+                pass
         if self._stop_event is not None:
             self._stop_event.set()                # _serve を解放=ループ終了
         return remaining
