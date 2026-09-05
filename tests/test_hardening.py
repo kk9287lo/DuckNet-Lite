@@ -215,6 +215,7 @@ def test_hot_path_is_reasonably_fast():
     # ホットパス(inspect)が混在トラフィックで妥当な時間で回る(エラーゼロ)。緩い上限で非フレーク。
     with tempfile.TemporaryDirectory() as tmp:
         sh = NetShield(state_dir=tmp); sh.enable()
+        sh.cfg["persist_bans"] = False          # ホットパスCPUを測る: BAN毎のディスク書込を排除
         corpus = ["/index.html", "?q=hello", "1 union select a from b", "<script>alert(1)",
                   "../../etc/passwd", "${jndi:ldap://e}", "/.env", "id[$ne]=1"]
         t0 = time.perf_counter()
