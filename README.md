@@ -1,6 +1,6 @@
 # DuckNet-Lite
 
-Web サーバの前に置く L7 の WAF / DDoS ゲートウェイです。Python の標準ライブラリだけで動き、外部依存はありません。OS には手を入れず、やるのは防御だけ。
+Web サーバの前に置く L7 の WAF / DDoS ゲートウェイです。外部依存なしにPython の標準ライブラリだけで動き、OSを汚さずに導入可能です。
 
 DuckNet L7 Security の無償版で、ライセンスは AGPL-3.0-or-later。中身はコアの WAF/DDoS リバースプロキシと、最小限の Web 管理画面。これだけでも実運用に使えます。
 
@@ -34,12 +34,12 @@ Python 3.10 以上なら `pip install` は要りません。起動ラッパ(`run
 
 ## フル版との違い
 
-Lite はコアに絞っています。次は上位の DuckNet L7 Security 側にあります。
+Lite版は最小限の機能に絞っています。下記の機能は上位の DuckNet L7 Security のみ搭載
 
 - 可用性: 自己完全性チェックとファイル修復、watchdog による自動再起動、`--supervise`。
-- ボット選別: 動的 PoW チャレンジで人を通しつつボットを弾く(Lite は拒否/BAN の二値のみ)。GeoIP・allowlist・ステルス運用も。
-- 侵入後の検知: LDAP/SMB/Kerberos デコイ、カナリアトークン、ハニーポット、DNS フィルタ。
-- 連携: SIEM/Slack 転送、脅威インテリジェンス(IoC)、MITRE ATT&CK ルール。
+- ボット選別システム: 動的 PoW チャレンジで人を通しつつボットを弾く(Lite は拒否/BAN の二値のみ)。GeoIP・allowlist・ステルス運用もk濃。
+- 侵入後検知: LDAP/SMB/Kerberos デコイ、カナリアトークン、ハニーポット、DNS フィルタ。
+- SOC連携: SIEM/Slack 転送、脅威インテリジェンス(IoC)、MITRE ATT&CK ルール。
 - 大規模配備: LDAP 列挙検知プロキシ、ノード間の BAN 同期、商用ライセンス管理。
 
 ## 落とされない・改竄されない
