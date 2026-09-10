@@ -1736,12 +1736,14 @@ class AsyncEdgeGuard:
             return {"ok": False, "error": "起動タイムアウト"}
         if self._start_error:                         # 待受に失敗した実際の理由を返す
             return {"ok": False, "error": self._start_error}
-        return {"ok": True, "listen": f"{self.listen_host}:{self.listen_port}",
-                "backend": f"{self.backend_host}:{self.backend_port}",
+        from ..core.netaddr import hostport as _hp      # IPv6 リテラルは [] で囲う
+        return {"ok": True, "listen": _hp(self.listen_host, self.listen_port),
+                "backend": _hp(self.backend_host, self.backend_port),
                 "note": "asyncio Fail-Fastガード。block/denyは即TCP切断(スレッド非消費)。"}
 
     def url(self) -> str:
-        return f"http://{self.listen_host}:{self.listen_port}"
+        from ..core.netaddr import url as _url          # IPv6 リテラルは [] で囲う
+        return _url(self.listen_host, self.listen_port)
 
     def stop(self, grace: float = 0.0) -> dict:
         """停止。`grace>0` なら進行中リクエストを最大 grace 秒ドレイン(受理停止→捌けるまで待機)。

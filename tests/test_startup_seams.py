@@ -8,11 +8,18 @@ test_startup_seams.py — 起動部と繋ぎ目の潜在バグの再発防止。
   · --cluster の停止経路が丸ごと機能せず、子ワーカーが待受ポートを握ったまま残る
   · 防御を用意できないときに黙って素通しする(fail-open)
   · 許可リストが空だと「全部許可」になる(allowlist の意味が反転)
+  · クラスタの再起動が *閉じた* listener を使い回して二度と上がらない
+  · ロケール未設定(C/POSIX)を「英語」と誤読し、Python のバージョン差で UI 言語が変わる
+  · 状態ディレクトリに書けなくても何も言わず、BAN もライセンスも毎回消える
 """
+import io
 import os
 import socket
+import sys
 import tempfile
+import threading
 import time
+from unittest import SkipTest   # OS 機能が無い環境は黙って通さず明示 SKIP
 
 from dataplane import service
 from dataplane.engine.lifeform.pipeline import NetShield
@@ -100,6 +107,90 @@ def test_stop_workers_is_a_noop_without_cluster():
     g = AsyncEdgeGuard(listen_host="127.0.0.1", listen_port=0)
     assert g._workers == []
     assert g._stop_workers(0.0) == 0
+
+
+# ── IPv6 専用ホスト ──
+def _ipv6_or_skip():
+    if not socket.has_ipv6:
+        raise SkipTest("IPv6 非対応のビルド")
+    try:
+        s = socket.socket(socket.AF_INET6)
+        s.bind(("::1", 0))
+        s.close()
+    except OSError as e:
+        raise SkipTest(f"IPv6 ループバックが使えない環境: {e!r}")
+
+
+def test_address_is_written_with_brackets_for_ipv6():
+    """`f"{host}:{port}"` は host が IPv6 だと `::1:8081` になり、URL としても
+    アドレスとしても壊れる。表記を1か所(netaddr)に集めて [] で囲う(RFC 3986)。"""
+    from dataplane.engine.core import netaddr
+    assert netaddr.hostport("127.0.0.1", 8443) == "127.0.0.1:8443"
+    assert netaddr.hostport("::1", 8443) == "[::1]:8443"
+    assert netaddr.hostport("[::1]", 8443) == "[::1]:8443"     # 二重に囲わない
+    assert netaddr.hostport("::", 8443) == "[::]:8443"
+    assert netaddr.hostport("example.test", 80) == "example.test:80"
+    assert netaddr.url("::1", 8081) == "http://[::1]:8081"
+    assert netaddr.url("::1", 8081, "/api/state") == "http://[::1]:8081/api/state"
+    assert netaddr.url("127.0.0.1", 8081, "api/state") == "http://127.0.0.1:8081/api/state"
+    assert netaddr.is_v6_literal("::1") and netaddr.is_v6_literal("[fe80::1]")
+    assert not netaddr.is_v6_literal("127.0.0.1") and not netaddr.is_v6_literal("host")
+    # 表記の往復: netaddr で書いたものを service._split_hostport が読み戻せる
+    for host in ("127.0.0.1", "::1", "example.test"):
+        h, p = service._split_hostport(netaddr.hostport(host, 8443), 80)
+        assert (h, p) == (host, 8443), (host, h, p)
+
+
+def test_family_for_follows_the_listen_address():
+    from dataplane.engine.core import netaddr
+    assert netaddr.family_for("127.0.0.1") == socket.AF_INET
+    assert netaddr.family_for("0.0.0.0") == socket.AF_INET
+    _ipv6_or_skip()
+    assert netaddr.family_for("::1") == socket.AF_INET6
+    assert netaddr.family_for("::") == socket.AF_INET6
+
+
+def test_admin_dashboard_can_listen_on_ipv6():
+    """http.server の既定 address_family は AF_INET 固定。--admin-host に IPv6 を
+    指定すると gaierror(-9) で bind に失敗し、service.run() はそこで SystemExit する
+    ―― つまり **IPv6 専用ホストでは製品が一切起動できなかった**。"""
+    _ipv6_or_skip()
+    from dataplane.admin import AdminDashboard
+    probe = socket.socket(socket.AF_INET6)
+    probe.bind(("::1", 0))
+    port = probe.getsockname()[1]
+    probe.close()
+    adm = AdminDashboard(host="::1", port=port, token="tok-ipv6")
+    a = adm.start()
+    try:
+        assert a.get("ok") is True, a
+        assert a["url"] == f"http://[::1]:{adm.port}", a["url"]     # GUI がこの URL を使う
+        s = socket.socket(socket.AF_INET6)                          # 実際に到達できる
+        s.settimeout(5.0)
+        s.connect(("::1", adm.port))
+        s.sendall(b"GET /api/state HTTP/1.1\r\nHost: [::1]\r\nConnection: close\r\n\r\n")
+        head = s.recv(64)
+        s.close()
+        assert head.startswith(b"HTTP/1."), head
+    finally:
+        adm.stop()
+
+
+def test_guard_reports_ipv6_listen_address_in_a_usable_form():
+    _ipv6_or_skip()
+    probe = socket.socket(socket.AF_INET6)
+    probe.bind(("::1", 0))
+    port = probe.getsockname()[1]
+    probe.close()
+    g = AsyncEdgeGuard(backend_host="::1", backend_port=9,
+                       listen_host="::1", listen_port=port)
+    info = g.start()
+    try:
+        assert info.get("ok") is True, info
+        assert info["listen"] == f"[::1]:{g.listen_port}", info["listen"]
+        assert g.url() == f"http://[::1]:{g.listen_port}", g.url()
+    finally:
+        g.stop(grace=0.0)
 
 
 # ── fail-open の封じ込め ──

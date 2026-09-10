@@ -132,7 +132,8 @@ def _admin_is_ours(host: str, port: int, timeout: float = 1.0) -> bool:
     """待受けているのが本製品の管理APIかを *トークンを送らずに* 確かめる。無認証の
     GET /api/state は 401 + {"ok": false, "error": "token required"} を返すので、これを指紋にする。
     別プロセスのポート占有を『本体が稼働中』と誤認し、起動を諦めたり秘密を渡したりしないため。"""
-    url = "http://%s:%d/api/state" % (host, port)
+    from ..engine.core.netaddr import url as _url
+    url = _url(host, port, "/api/state")           # IPv6 リテラルは [] で囲う
     # 既定の opener は環境変数のプロキシ設定(http_proxy 等)を拾う。ローカルの指紋確認が
     # プロキシ経由になると別物の応答を見て「本製品ではない」と誤判定し、ゲートウェイを
     # 起動できなくなる。ここは必ず直接続する。

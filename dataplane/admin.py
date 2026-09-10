@@ -304,18 +304,26 @@ class AdminDashboard:
     def start(self) -> dict:
         handler = _make_handler(self)
 
+        from .engine.core import netaddr
+
         class _Server(ThreadingHTTPServer):
             # Windows の SO_REUSEADDR は「他プロセスが待受中のポートにも bind できる」
             # 意味になり、管理面を横取りされ得る(POSIX の TIME_WAIT 再利用とは別物)。
             # 管理プレーンは再利用より排他を優先する。
             allow_reuse_address = not sys.platform.startswith("win")
+            # http.server の既定は AF_INET 固定。--admin-host に IPv6(::1 や ::)を
+            # 指定すると gaierror(-9) で bind に失敗し、起動そのものが止まっていた
+            # (= IPv6 専用ホストでは製品が一切動かない)。待受先に合わせて解決する。
+            address_family = netaddr.family_for(self.host, self.port)
 
         self._server = _Server((self.host, self.port), handler)
         self.port = self._server.server_address[1]
         self._thread = threading.Thread(target=self._server.serve_forever,
                                         daemon=True, name="shield-admin")
         self._thread.start()
-        return {"ok": True, "url": f"http://{self.host}:{self.port}",
+        # IPv6 リテラルは [] で囲う。素の f-string だと `http://::1:8081` という
+        # 不正な URL になり、GUI が本体を見つけられなくなる(RFC 3986)。
+        return {"ok": True, "url": netaddr.url(self.host, self.port),
                 "token": self.token}
 
     def stop(self) -> dict:
