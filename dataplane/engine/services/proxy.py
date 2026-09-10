@@ -125,12 +125,22 @@ def _set_request_header(buf: bytes, name: str, value: str) -> bytes:
 
 
 def _header_value(buf: bytes, name_lower: bytes) -> str:
-    """head から指定ヘッダ(小文字名)の値を返す(無ければ空)。最初の1本のみ。"""
+    """head から指定ヘッダ(小文字名)の値を返す(無ければ空)。
+
+    同名ヘッダが複数回現れたら **出現順にカンマで連結** する(RFC 7230 §3.2.2:
+    繰り返しヘッダは 1 本のカンマ区切りと等価)。
+    以前は *最初の 1 本* しか読んでいなかった。クライアントが X-Forwarded-For を
+    1 本置き、信頼 proxy が *追記* する構成(HAProxy の add-header / Apache の
+    RequestHeader add / 多段 proxy)では、攻撃者が置いた側だけを読んでしまい
+    **身元を完全に選べた** ―― 任意の第三者IPを BAN させることも、自分の BAN や
+    レート制限を回避することもできた(実測: proxy が追記した本物の IP が無視された)。
+    連結すれば _real_client_ip が右から辿るので、proxy が最後に足した本物が採れる。"""
     head = buf.split(b"\r\n\r\n", 1)[0]
+    out = []
     for ln in head.split(b"\r\n")[1:]:
         if ln.lower().startswith(name_lower + b":"):
-            return ln[len(name_lower) + 1:].strip().decode("latin-1", "replace")
-    return ""
+            out.append(ln[len(name_lower) + 1:].strip().decode("latin-1", "replace"))
+    return ", ".join(out)
 
 
 _MAX_XFF_HOPS = 16          # X-Forwarded-For を辿る最大ホップ数(実運用は数個)
@@ -203,9 +213,16 @@ def _forwarded_proto_tls(peer_ip: str, buf: bytes, trusted) -> bool:
     # 旧実装は buf 全体の substring 照合で、body や別ヘッダ値に文字列 "x-forwarded-proto: https"
     # を仕込むだけで tls=True を偽装でき、信頼 proxy が正しく http をセットしても require_tls を
     # 回避できた(#forwarded-trust)。_real_client_ip の XFF 解析と同じく _header_value を使う。
-    # プロキシ連鎖("https, http")では先頭=元クライアントのプロトコルを採る。
-    xfp = _header_value(buf, b"x-forwarded-proto").split(",", 1)[0].strip().lower()
-    return xfp == "https"
+    # **全ホップが https のときだけ** TLS とみなす。先頭だけを見ると、クライアントが
+    # X-Forwarded-Proto を 1 本置き proxy が追記する構成で `https, http` となり、
+    # 攻撃者の自己申告が勝って require_tls を回避できた(実測: 平文の直結クライアントが
+    # 信頼 proxy 越しに TLS を騙れた)。値が食い違うとき「元は TLS だった」と決めつける
+    # 根拠は無いので、フェイルクローズする(経路に平文ホップがあるなら require_tls は
+    # 通すべきでない、とも言える)。proxy 側は set/replace 系のディレクティブを使い、
+    # クライアント由来の値を残さない設定が正しい。
+    parts = [p.strip().lower() for p in
+             _header_value(buf, b"x-forwarded-proto").split(",") if p.strip()]
+    return bool(parts) and all(p == "https" for p in parts)
 
 
 # 解除リクエスト(異議申立)の受付パス。遮断中ユーザーでも到達できる(BAN判定の手前)。

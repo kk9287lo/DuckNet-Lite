@@ -65,6 +65,67 @@ def test_single_ip_trusted_entry():
     assert _real_client_ip("198.51.100.1", buf, ["198.51.100.1"]) == "1.2.3.4"
 
 
+# ── 同名ヘッダの複数出現(RFC 7230 §3.2.2) ──
+def _req_multi(name, *values):
+    h = b"GET / HTTP/1.1\r\nHost: x\r\n"
+    for v in values:
+        h += name + b": " + v + b"\r\n"
+    return h + b"\r\n"
+
+
+def test_repeated_headers_are_joined_like_one_comma_list():
+    """RFC 7230 §3.2.2: 同名ヘッダの繰り返しは 1 本のカンマ区切りと等価。
+    以前は *最初の 1 本* しか読んでおらず、後続を丸ごと落としていた。"""
+    buf = _req_multi(b"X-Forwarded-For", b"1.2.3.4", b"5.6.7.8")
+    assert _header_value(buf, b"x-forwarded-for") == "1.2.3.4, 5.6.7.8"
+    # 1 本だけのときの見え方は変わらない(既存の呼び出し側の前提を壊さない)
+    assert _header_value(_req_multi(b"X-Forwarded-For", b"1.2.3.4"),
+                         b"x-forwarded-for") == "1.2.3.4"
+    assert _header_value(_req_multi(b"X-Other", b"v"), b"x-forwarded-for") == ""
+
+
+def test_appending_proxy_cannot_be_tricked_into_using_the_forged_identity():
+    """クライアントが X-Forwarded-For を 1 本置き、信頼 proxy が *追記* する構成
+    (HAProxy の add-header / Apache の RequestHeader add / 多段 proxy)。
+    最初の 1 本しか見ないと攻撃者が置いた側だけを読み、**身元を完全に選べた** ――
+    任意の第三者IPを BAN させることも、自分の BAN やレート制限を回避することもできた。
+    連結して右から辿れば、proxy が最後に足した本物が採れる。"""
+    trusted = ["127.0.0.1/32"]
+    buf = _req_multi(b"X-Forwarded-For",
+                     b"198.51.100.9",          # 攻撃者が置いた捏造値
+                     b"203.0.113.7")           # proxy が追記した本物
+    assert _real_client_ip("127.0.0.1", buf, trusted) == "203.0.113.7"
+    buf3 = _req_multi(b"X-Forwarded-For",
+                      b"198.51.100.9", b"198.51.100.10", b"203.0.113.7")
+    assert _real_client_ip("127.0.0.1", buf3, trusted) == "203.0.113.7"
+    # 直結(非信頼 peer)なら、何本置かれても peer のまま
+    assert _real_client_ip("203.0.113.1", buf, trusted) == "203.0.113.1"
+
+
+def test_xfp_fails_closed_when_the_hops_disagree():
+    """X-Forwarded-Proto が食い違うときは TLS と見なさない。
+    先頭だけ見ると `https, http`(攻撃者が置いた https + proxy が追記した http)で
+    自己申告が勝ち、平文の直結クライアントが require_tls を回避できた。"""
+    trusted = ["127.0.0.1/32"]
+    ok = _req_multi(b"X-Forwarded-Proto", b"https")
+    assert _forwarded_proto_tls("127.0.0.1", ok, trusted) is True
+    assert _forwarded_proto_tls(
+        "127.0.0.1", _req_multi(b"X-Forwarded-Proto", b"https", b"https"), trusted) is True
+    for values in ((b"https", b"http"), (b"http", b"https"), (b"https", b"")):
+        buf = _req_multi(b"X-Forwarded-Proto", *[v for v in values if v])
+        if len([v for v in values if v]) < 2:
+            continue
+        assert _forwarded_proto_tls("127.0.0.1", buf, trusted) is False, values
+    # 1 本の中でカンマ連鎖してきた場合も同じ
+    assert _forwarded_proto_tls(
+        "127.0.0.1", _req_multi(b"X-Forwarded-Proto", b"https, http"), trusted) is False
+    assert _forwarded_proto_tls(
+        "127.0.0.1", _req_multi(b"X-Forwarded-Proto", b"https , https"), trusted) is True
+    # 値が無い/空なら TLS ではない
+    assert _forwarded_proto_tls("127.0.0.1", b"GET / HTTP/1.1\r\nHost: x\r\n\r\n",
+                                trusted) is False
+
+
 # ── X-Forwarded-Proto の信頼(#33): tls 偽装の封じ込め ──
 def _req_xfp(https):
     proto = b"https" if https else b"http"
