@@ -162,14 +162,35 @@ def _open_append_nofollow(path: str, encoding: str):
     return os.fdopen(fd, "a", encoding=encoding)
 
 
+_TAIL_AVG_LINE = 512   # 末尾読みの初期見積り(1行あたりバイト数)
+_TAIL_MAX_ROUNDS = 6   # 見積りが外れた時の読み直し上限(有界化)
+
+
 def tail_jsonl(path: str, n: int = 50) -> list:
     """JSONL ファイル末尾の最大 n 行を新しい順(末尾=最新が先頭)で読む。
     欠損/壊れ行は飛ばし、例外は投げない(管理画面の横断表示などに使う)。"""
     try:
         if not os.path.isfile(path):
             return []
-        with open(path, encoding="utf-8", errors="replace") as f:
-            lines = f.readlines()[-max(1, n):]
+        n = max(1, n)
+        # 末尾 n 行が欲しいだけなのに readlines() でファイル全体を読み込んでいた。
+        # 管理画面がポーリングで叩くため、ログが育つほど 1 回の読み取り量が増える
+        # (= 蓄積量 x ポーリング回数)。末尾から必要なぶんだけ遡って読む。
+        want = n * _TAIL_AVG_LINE
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            for _ in range(_TAIL_MAX_ROUNDS):
+                start = max(0, size - want)
+                f.seek(start)
+                raw = f.read(size - start)
+                lines = raw.decode("utf-8", "replace").splitlines()
+                if start > 0:
+                    lines = lines[1:]           # 先頭は途中で切れている可能性がある
+                if len(lines) >= n or start == 0:
+                    break
+                want *= 4                       # 行が長かった=範囲を広げて読み直す
+        lines = lines[-n:]
     except Exception:
         return []
     out = []

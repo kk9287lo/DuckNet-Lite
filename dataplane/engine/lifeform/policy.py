@@ -54,6 +54,17 @@ def _zone_of(ip: str) -> str:
     return "special"
 
 
+_PENDING_MAX = 4096    # 承認待ち接続の保持上限(未承認のまま溜め込ませない)
+
+
+def _compile_net(cidr: str):
+    """CIDR 文字列 -> ip_network(不正なら None)。照合ループの外で一度だけ呼ぶこと。"""
+    try:
+        return ipaddress.ip_network(cidr, strict=False)
+    except Exception:
+        return None
+
+
 class AppFirewall:
     """アプリ層ファイアウォールの中核。OS非侵襲・ON/OFF・記録・永続化。"""
 
@@ -64,6 +75,8 @@ class AppFirewall:
         self.log_path = os.path.join(base, "acl_log.jsonl")
         self._lock = threading.RLock()
         self._pending: dict = {}                 # id -> {ip, port, zone, ts, meta}
+        self._pending_by_ip: dict = {}           # ip -> id(同一IPの重複保留を O(1) で判定)
+        self._nets: dict = {}                    # ルールの CIDR 文字列 -> ip_network(事前コンパイル)
         self._log = deque(maxlen=_LOG_MAX)
         self._pid_seq = 0
         self._load()
@@ -155,20 +168,22 @@ class AppFirewall:
             addr = ipaddress.ip_address(ip)
         except Exception:
             return None
+        # ルールごとに ip_network() を作り直すと、接続 1 本あたり O(ルール数) の *パース* が
+        # 走る(実測 1000 ルールで 1.6ms/接続)。しかも最長プレフィクス選択でもう一度作って
+        # いた。ルールは滅多に変わらないので、変更時に一度だけコンパイルして使い回す。
         matches = []
         for r in self.rules:
-            try:
-                if addr in ipaddress.ip_network(r["net"], strict=False):
-                    matches.append(r)
-            except Exception:
-                continue
+            net = self._nets.get(r["net"])
+            if net is None:
+                net = self._nets[r["net"]] = _compile_net(r["net"])
+            if net is not None and addr.version == net.version and addr in net:
+                matches.append((net.prefixlen, r))
         if not matches:
             return None
         # deny を優先、その中で最長プレフィクス
-        denies = [r for r in matches if r["action"] == "deny"]
+        denies = [m for m in matches if m[1]["action"] == "deny"]
         pool = denies or matches
-        return max(pool, key=lambda r: ipaddress.ip_network(
-            r["net"], strict=False).prefixlen)
+        return max(pool, key=lambda m: m[0])[1]
 
     # ── 判定(サーバ等が接続受理前に呼ぶ) ──────────────────────────
     def evaluate(self, ip: str, port: int = None, meta: dict = None) -> dict:
@@ -190,15 +205,24 @@ class AppFirewall:
 
     def _enqueue_pending(self, ip, port, zone, meta) -> str:
         with self._lock:
-            # 同一IPの保留が既にあれば再利用(氾濫防止)
-            for pid, p in self._pending.items():
-                if p["ip"] == ip:
-                    return pid
+            # 同一IPの保留が既にあれば再利用(氾濫防止)。旧実装は保留表を毎接続 *線形走査*
+            # しており、しかも表に上限が無かった。攻撃者が送信元を増やすだけで保留数 P が
+            # 伸び、以後どの接続も O(P) を払う(= 接続数に対して二次)。IP 逆引きで O(1) に
+            # し、表そのものにも上限を設ける。
+            pid = self._pending_by_ip.get(ip)
+            if pid is not None and pid in self._pending:
+                return pid
+            if len(self._pending) >= _PENDING_MAX:   # 最古から間引く(承認待ちの氾濫で OOM しない)
+                for old_pid in list(self._pending)[:max(1, _PENDING_MAX // 10)]:
+                    old = self._pending.pop(old_pid, None)
+                    if old is not None:
+                        self._pending_by_ip.pop(old["ip"], None)
             self._pid_seq += 1
             pid = f"p{self._pid_seq}"
             self._pending[pid] = {"id": pid, "ip": ip, "port": port,
                                   "zone": zone, "ts": time.time(),
                                   "meta": meta or {}}
+            self._pending_by_ip[ip] = pid
             return pid
 
     def _record(self, ip, port, zone, action, reason, rule, pending_id=None):

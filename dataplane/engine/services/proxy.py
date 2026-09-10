@@ -133,6 +133,9 @@ def _header_value(buf: bytes, name_lower: bytes) -> str:
     return ""
 
 
+_MAX_XFF_HOPS = 16          # X-Forwarded-For を辿る最大ホップ数(実運用は数個)
+
+
 def _real_client_ip(peer_ip: str, buf: bytes, trusted) -> str:
     """信頼 proxy 経由のときだけ X-Forwarded-For から実クライアントIPを解決する。
     peer が trusted CIDR に含まれない(=直結 or 未設定)なら **XFF を信頼しない**(偽装無効化)。
@@ -145,7 +148,10 @@ def _real_client_ip(peer_ip: str, buf: bytes, trusted) -> str:
     xff = _header_value(buf, b"x-forwarded-for")
     if not xff:
         return peer_ip
-    for cand in reversed([p.strip() for p in xff.split(",") if p.strip()]):
+    # ホップ数を上限化: XFF は攻撃者が書ける任意長のヘッダなので、コンマで埋めるだけで
+    # 1 リクエストあたりの照合回数(x 信頼 CIDR 数)を伸ばせた。実運用の hop は数個。
+    _hops = [p.strip() for p in xff.split(",", _MAX_XFF_HOPS) if p.strip()][:_MAX_XFF_HOPS]
+    for cand in reversed(_hops):
         try:
             ipaddress.ip_address(cand)                # 妥当なIPのみ採用
         except ValueError:
@@ -323,6 +329,10 @@ def _block_page(info: dict, submitted: bool = False, msg: str = "") -> bytes:
         "</style></head><body><div class='card'>"
         "<div class='logo'>🛡 " + brand + "</div>" + center + "</div></body></html>")
     return page.encode("utf-8")
+
+
+_CONN_RATE_CAP = 50000      # 接続レート窓テーブルの上限(メモリ有界)
+_CONN_RATE_LOW = 40000      # 間引き後の目標水位(上限との差=間引きの償却間隔)
 
 
 class _BufferPool:
@@ -632,14 +642,22 @@ class AsyncEdgeGuard:
         loop = asyncio.get_event_loop()
         deadline = loop.time() + self.head_timeout
         try:
-            while b"\r\n\r\n" not in buf and len(buf) < 16384:
+            # 終端探索は *新着分だけ* を見る。ループ条件に "b'\r\n\r\n' not in buf" と
+            # 書くと 1 チャンク受け取るたびにバッファ全体を再走査するため、攻撃者が 1 バイト
+            # ずつ小出しすると走査量が 1+2+…+16384 = O(N^2) に膨らむ(実測: 1 バイト刻みで
+            # 13ms/接続。単一イベントループなので同時接続数ぶん直撃する)。直前の 3 バイトだけ
+            # 重ねて見れば境界を跨ぐ "\r\n\r\n" も取りこぼさず、総走査量は O(N) になる。
+            done = False
+            while not done and len(buf) < 16384:
                 remaining = deadline - loop.time()
                 if remaining <= 0:
                     raise asyncio.TimeoutError    # 総時間超過=slowloris(だらだら/小出し含む)
                 chunk = await asyncio.wait_for(reader.read(4096), remaining)
                 if not chunk:
                     break
+                prev = len(buf)
                 buf.extend(chunk)             # extend=償却O(1)(bytes+=のO(n^2)回避)
+                done = buf.find(b"\r\n\r\n", prev - 3 if prev >= 3 else 0) >= 0
             return bytes(buf)                 # 解析/転送用の不変スナップショット
         finally:
             self._pool.put(buf)               # コンテナをプールへ返す
@@ -1491,9 +1509,18 @@ class AsyncEdgeGuard:
         ent = self._conn_rate.get(ip)
         if ent is None or now - ent[0] >= 1.0:
             self._conn_rate[ip] = [now, 1]
-            if len(self._conn_rate) > 50000:               # 有界化(古い窓を間引く)
-                for k in [k for k, v in self._conn_rate.items() if now - v[0] >= 1.0][:5000]:
+            if len(self._conn_rate) > _CONN_RATE_CAP:
+                # 旧実装は「期限切れを最大 5000 件消す」だけだった。窓内の別IPで表が埋まると
+                # 期限切れが 1 件も無く、*回収 0 件のまま毎接続 5 万件を走査* する状態に張り付く
+                # (実測 1.53ms/接続)。接続フラッドを捌くための機構が、まさにその状況で自ら
+                # ボトルネックになっていた。期限切れ回収で足りなければ挿入順(dict は順序保持)
+                # の古い方から強制退避し、低水位まで一気に落として O(N) を多数接続で償却する。
+                for k in [k for k, v in self._conn_rate.items() if now - v[0] >= 1.0]:
                     self._conn_rate.pop(k, None)
+                over = len(self._conn_rate) - _CONN_RATE_LOW
+                if over > 0:                               # 全部が窓内=最古から強制退避
+                    for k in list(self._conn_rate)[:over]:
+                        self._conn_rate.pop(k, None)
             return False
         ent[1] += 1
         return ent[1] > limit

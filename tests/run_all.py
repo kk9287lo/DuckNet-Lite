@@ -62,6 +62,7 @@ MODULES = [
     "test_smuggling",           # HTTP リクエストスマグリング/デシンク拒否(CL.TE/裸LF/obs-fold等)
     "test_scanwindow",          # 走査面のバイパス封じ(パディング/NFKC展開/窓予算)と資源境界
     "test_vulnfix",             # 脆弱性修正の回帰(CSRF/トークン配布/署名束縛)
+    "test_complexity",          # 二次コスト(O(N^2))の再発防止(間引きの低水位・走査量削減の非回帰)
 ]
 
 

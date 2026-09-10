@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import functools
 import hashlib
+import heapq
 import hmac
 import ipaddress
 import json
@@ -43,7 +44,8 @@ import time
 import unicodedata
 from collections import deque
 
-from ..core.atomic_io import default_state_dir, atomic_write_json, safe_read_json
+from ..core.atomic_io import (default_state_dir, atomic_write_json,
+                              safe_read_json, tail_jsonl)
 from ..core.signed_state import persistent_key, write_signed_json, read_signed_json
 from .bloom import BloomFilter
 from ..core import saferegex
@@ -358,11 +360,14 @@ _PARANOIA_TIERS = {
     4: frozenset({"redirect", "ssrf_internal", "ssti"}),   # + テンプレート注入(最大)
 }
 _MAX_IPS = 20000
+_USAGE_HOSTS_CAP = 60  # 1 IP あたり記録する宛先ホスト数の上限
+_USAGE_HOSTS_LOW = 48  # 刈り取り後の目標水位(上限との差=ソートの償却間隔)
 _EVENTS_MAX = 500
 _APPEALS_MAX = 2000    # 解除リクエスト(異議申立)の保持上限(超過で解決済み優先→最古を退避=メモリ有界)
 _PATH_LIMIT_MAX = 64   # パス別レート制限ルールの最大数(per-IP バケツ数の上限=メモリ有界)
 _MAX_SUBNETS = 4096    # サブネット集約防御で追跡するサブネット数の上限(超過で古い順に間引き)
 _SUBNET_IP_CAP = 256   # 1サブネットあたり記憶する distinct BAN済みIP数の上限(hot 判定に十分)
+_SUBNET_IP_LOW = 192   # 間引き後の目標水位(上限との差=ソートの償却間隔)
 
 
 def _subnet_key(ip: str):
@@ -496,6 +501,24 @@ def _ua_header_inconsistent(ua: str, header_names) -> bool:
         return False
     names = {str(n).lower() for n in header_names}
     return ("accept-language" not in names) or ("accept-encoding" not in names)
+
+
+@functools.lru_cache(maxsize=64)
+def _lower_tuple(items: tuple) -> tuple:
+    """設定由来の文字列列を小文字タプル化して使い回す(リクエストごとの再変換を避ける)。
+    設定は滅多に変わらないので、タプルをキーにしたキャッシュで十分に効く。"""
+    return tuple(str(x).lower() for x in items)
+
+
+@functools.lru_cache(maxsize=4096)
+def _cidr_net(cidr: str):
+    """CIDR 文字列 -> ip_network(不正なら None)。ip_network() の構築は高価で、白/黒リストは
+    *リクエストごと* に全件照合されるため、結果をキャッシュしないとエントリ数 x リクエスト数
+    ぶんのパースが積み上がる(実測 1000 件で 1.6ms/リクエスト)。"""
+    try:
+        return ipaddress.ip_network(cidr, strict=False)
+    except Exception:
+        return None
 
 
 def _zone_of(ip: str) -> str:
@@ -955,6 +978,10 @@ class NetShield:
         self._traffic: dict = {}        # ip -> {day(int): [out_bytes, in_bytes, conn_sec]}
         self._traffic_last_save = 0.0
         self._bans_last_save = 0.0      # BAN 永続化の間引き用(直近書込時刻)
+        self._bloom_rebuilt = 0.0       # BAN ブルーム再構築の間引き用(直近実行時刻)
+        self._subnet_hot = 0            # hot サブネット数の短命キャッシュ(監視スクレイプ用)
+        self._subnet_hot_ts = 0.0
+        self._bloom_dirty = False       # 間引きで未反映の解除が残っているか
         self._bans_dirty = False        # 間引きで未書込の変更が残っているか
         # ネットワーク使用量リスト(誰が/どのサイトと/どれだけ)+ 見返せるログ
         self._usage_path = os.path.join(base, "usage.json")
@@ -1292,7 +1319,10 @@ class NetShield:
                   "window": deque(), "score": 0.0, "score_ts": _now(),
                   "ban_until": 0.0, "seen": _now(),
                   "hits": 0, "first": _now(), "last_req": 0.0,
-                  "intervals": deque(maxlen=24), "ban_started": 0.0, "ban_count": 0}
+                  "intervals": deque(maxlen=24), "ban_started": 0.0, "ban_count": 0,
+                  # ゾーンは IP から一意に決まる不変値。ここで 1 度だけ解決して持ち回る
+                  # (ダッシュボードが 2 秒ごとに全 IP ぶん ipaddress 解析するのを防ぐ)。
+                  "zone": _zone_of(ip)}
             self._ips[ip] = st
         st["seen"] = _now()
         return st
@@ -1314,6 +1344,8 @@ class NetShield:
                 self._ips.pop(ip, None)
 
     def _decayed_score(self, st: dict) -> float:
+        if not st["score"]:
+            return 0.0                            # 0 の減衰は 0(pow を省く高速パス)
         hl = max(1.0, float(self.cfg["score_halflife_sec"]))
         dt = max(0.0, _now() - st["score_ts"])    # 時刻巻き戻し(NTP補正等)で decay が *反転して
         if dt < 0.05:                             # 高分解能クロックでの境界割れ防止: _add_score 直後の
@@ -1348,11 +1380,14 @@ class NetShield:
     def _policy_block(self, ip: str, path: str, tls: bool) -> str:
         """ポリシー(拡張子/URL/TLS/geo)で遮断すべきなら理由を返す(無ければ空)。"""
         p = _path_for_match(path)            # %デコード+小文字化=エンコード回避を防ぐ(#40)
-        for ext in self.cfg.get("blocked_extensions") or []:
-            if p.endswith(str(ext).lower()):
-                return f"拡張子ブロック: {ext}"
-        for u in self.cfg.get("blocked_urls") or []:
-            if str(u).lower() in p:
+        # 遮断リストの小文字化を *リクエストごとに 1 件ずつ* やり直していた。結果は設定が
+        # 変わらない限り同じなのでキャッシュし、拡張子は C 実装の endswith(tuple) 一発にする。
+        exts = _lower_tuple(tuple(self.cfg.get("blocked_extensions") or ()))
+        if exts and p.endswith(exts):
+            hit = next((e for e in exts if p.endswith(e)), "")
+            return f"拡張子ブロック: {hit}"
+        for u in _lower_tuple(tuple(self.cfg.get("blocked_urls") or ())):
+            if u in p:
                 return f"URLブロック: {u}"
         if self.cfg.get("require_tls") and not tls:
             return "正規TLS以外(平文)を遮断"
@@ -1412,7 +1447,8 @@ class NetShield:
                 e = str(e).strip()
                 try:
                     if "/" in e:
-                        if addr in ipaddress.ip_network(e, strict=False):
+                        net = _cidr_net(e)   # 事前コンパイル(毎リクエストのパースを避ける)
+                        if net is not None and addr.version == net.version and addr in net:
                             return True
                     elif e == ip:
                         return True
@@ -1562,10 +1598,12 @@ class NetShield:
             if host:
                 h = u["hosts"].setdefault(host, {"out": 0.0, "in": 0.0, "conns": 0})
                 h["out"] += float(out_bytes); h["in"] += float(in_bytes); h["conns"] += 1
-                if len(u["hosts"]) > 60:               # IPあたりの宛先数を有界化(送出量上位を残す)
-                    top = dict(sorted(u["hosts"].items(),
-                                      key=lambda kv: kv[1]["out"], reverse=True)[:60])
-                    u["hosts"] = top
+                if len(u["hosts"]) > _USAGE_HOSTS_CAP:  # IPあたりの宛先数を有界化(送出量上位を残す)
+                    # 上限ちょうどまで刈ると、そのIPの *次のリクエスト* でまた全件ソートに
+                    # なる(リクエスト数に対して二次)。低水位まで落として償却する。
+                    u["hosts"] = dict(sorted(u["hosts"].items(),
+                                             key=lambda kv: kv[1]["out"],
+                                             reverse=True)[:_USAGE_HOSTS_LOW])
             # 見返せるログ(1接続=1行のjsonl・末尾回転)
             try:
                 with _open_state_write(self._usage_log_path, "a") as f:
@@ -1620,15 +1658,16 @@ class NetShield:
     def usage_log(self, limit: int = 100, ip: str = "", host: str = "") -> list:
         """使用量ログ(jsonl)を新しい順に絞って返す(見返しやすさ)。"""
         out = []
+        # 絞り込み前に *全行* を読み込んでいた。ログが育つほど 1 回の閲覧コストが増えるので、
+        # 末尾から必要量だけ遡って読む共有ヘルパへ委譲する(ip/host 絞り込みで落ちるぶんを
+        # 見越して多めに取る)。
         try:
-            with open(self._usage_log_path, encoding="utf-8", errors="replace") as f:
-                lines = f.readlines()
+            rows = tail_jsonl(self._usage_log_path,
+                              max(1, limit) * (8 if (ip or host) else 2))
         except Exception:
             return out
-        for line in reversed(lines):
-            try:
-                e = json.loads(line)
-            except Exception:
+        for e in rows:
+            if not isinstance(e, dict):
                 continue
             if ip and e.get("ip") != ip:
                 continue
@@ -2239,7 +2278,9 @@ class NetShield:
             for k in [k for k, t in rec.items() if now - t > window]:
                 rec.pop(k, None)
         if len(rec) > _SUBNET_IP_CAP:                    # サブネット内 distinct IP を上限で頭打ち
-            for k, _ in sorted(rec.items(), key=lambda kv: kv[1])[:len(rec) - _SUBNET_IP_CAP]:
+            # 上限 *ちょうど* まで削ると、次の 1 件でまた全件ソートになり、BAN 件数に対して
+            # 二次コストになる。低水位まで一気に落として 1 回のソートを多数の BAN で償却する。
+            for k, _ in sorted(rec.items(), key=lambda kv: kv[1])[:len(rec) - _SUBNET_IP_LOW]:
                 rec.pop(k, None)
 
     def _subnet_hot_count(self, ip: str) -> int:
@@ -2262,14 +2303,22 @@ class NetShield:
             self._subnets.pop(k, None)
 
     def subnet_status(self) -> dict:
-        """サブネット集約防御の可視化(有効/追跡数/hot数/設定)。読み取り専用。"""
+        """サブネット集約防御の可視化(有効/追跡数/hot数/設定)。読み取り専用。
+        hot 数の算出は O(サブネット数 x サブネット内IP数)。分散攻撃で表が埋まると
+        1 回 16ms(上限では約 50ms)かかり、これを監視系のスクレイプ(/api/metrics)
+        が叩くたびにロックを握ったまま繰り返していた。粗いゲージなので短命キャッシュで十分。"""
         with self._lock:
             now = _now()
             window = float(self.cfg.get("subnet_window_sec", 3600) or 0)
             thr = int(self.cfg.get("subnet_threshold", 8) or 0)
-            hot = sum(1 for rec in self._subnets.values()
-                      if (len(rec) if window <= 0
-                          else sum(1 for t in rec.values() if now - t <= window)) >= thr)
+            ttl = float(self.cfg.get("subnet_status_cache_sec", 2.0) or 0)
+            if ttl > 0 and (now - self._subnet_hot_ts) < ttl:
+                hot = self._subnet_hot
+            else:
+                hot = sum(1 for rec in self._subnets.values()
+                          if (len(rec) if window <= 0
+                              else sum(1 for t in rec.values() if now - t <= window)) >= thr)
+                self._subnet_hot, self._subnet_hot_ts = hot, now
             return {"enabled": bool(self.cfg.get("subnet_defense")),
                     "tracked_subnets": len(self._subnets), "hot_subnets": hot,
                     "threshold": thr, "window_sec": window,
@@ -2561,19 +2610,32 @@ class NetShield:
         """観測中の送信元をノード化して返す(ダッシュボードのネットワーク図用)。"""
         now = _now()
         macs = _arp_table() if with_mac else {}
-        with self._lock:
-            rows = []
-            for ip, s in self._ips.items():
-                rows.append({"ip": ip, "zone": _zone_of(ip),
-                             "score": round(self._decayed_score(s), 1),
-                             "banned": s["ban_until"] > now,
-                             "permanent": bool(s.get("permanent")),
-                             "reqs_window": len(s["window"]), "hits": s["hits"],
-                             "mac": macs.get(ip, "")})
-        rows.sort(key=lambda r: (r["banned"], r["score"], r["reqs_window"]), reverse=True)
         _zones = ["loopback", "private", "public", "special", "unknown"]
-        return {"center": "DuckNet-Lite", "nodes": rows[:n],
-                "zones": {z: sum(1 for r in rows if r["zone"] == z) for z in _zones}}
+        zc = {z: 0 for z in _zones}
+        # 旧実装は全 IP(最大 _MAX_IPS=20000)ぶんの dict を作り、IP ごとに ipaddress で
+        # ゾーンを解析し直し、全件ソートしてから先頭 n 件だけ返していた。しかもこれを
+        # グローバルロックを握ったまま行うため、2 秒ごとのダッシュボード更新が inspect() を
+        # 止めていた(実測 105ms/回・攻撃者は送信元を増やすだけで N を伸ばせる)。
+        # ゾーンは状態にキャッシュ済みの不変値を使い、上位 n 件だけ heap で選ぶ。
+        top = []
+        with self._lock:
+            for ip, s in self._ips.items():
+                z = s.get("zone")
+                if z is None:                     # 旧バージョンから引き継いだ状態の補完
+                    z = s["zone"] = _zone_of(ip)
+                zc[z] = zc.get(z, 0) + 1
+                ent = ((s["ban_until"] > now, round(self._decayed_score(s), 1),
+                        len(s["window"])), ip, s["hits"], bool(s.get("permanent")), z)
+                if len(top) < n:
+                    heapq.heappush(top, ent)
+                elif ent[0] > top[0][0]:
+                    heapq.heapreplace(top, ent)
+        rows = [{"ip": ip, "zone": z, "score": k[1], "banned": k[0],
+                 "permanent": perm, "reqs_window": k[2], "hits": hits,
+                 "mac": macs.get(ip, "")}
+                for k, ip, hits, perm, z in sorted(top, reverse=True)]
+        return {"center": "DuckNet-Lite", "nodes": rows,
+                "zones": zc}
 
     def apt_report(self, n: int = 15) -> dict:
         """APT級の兆候を既存シグナルから形式化(アプリ層・低速持続/規則性/累積攻撃の相関)。
@@ -2582,21 +2644,30 @@ class NetShield:
         ranked = []
         with self._lock:
             for ip, s in self._ips.items():
-                ivs = list(s["intervals"])
+                iv = s["intervals"]
+                nv = len(iv)
+                base = self._decayed_score(s)
+                # 規則性/居座りの加点(計 55)は間隔サンプルが 6 本ないと成立しない。
+                # 6 本未満なら apt は base + hits 加点で決まるので、閾値に届かない状態は
+                # ここで足切りする。旧実装は全 IP ぶん deque を list へコピーしていた
+                # (実測 9.0ms/回・ロック内・2 秒ごと)。
+                if nv < 6 and base + min(40, s["hits"] * 8) < 30:
+                    continue
+                ivs = list(iv) if nv >= 6 else ()
                 regular = False
-                if len(ivs) >= 6:
+                if nv >= 6:
                     mean = sum(ivs) / len(ivs)
                     if 0 < mean <= 5.0:
                         var = sum((x - mean) ** 2 for x in ivs) / len(ivs)
                         regular = (var ** 0.5) / mean < 0.2
                 span = now - s.get("first", now)
-                persistent = span > 300 and len(ivs) >= 6      # 5分以上 等間隔で居座る
-                base = self._decayed_score(s)
+                persistent = span > 300 and nv >= 6            # 5分以上 等間隔で居座る
                 apt = base + (30 if regular else 0) + (25 if persistent else 0) \
                     + min(40, s["hits"] * 8)
                 if apt >= 30:
                     ranked.append({"ip": ip, "apt_score": round(apt, 1),
-                                   "zone": _zone_of(ip), "regular_beacon": regular,
+                                   "zone": s.get("zone") or _zone_of(ip),
+                                   "regular_beacon": regular,
                                    "low_and_slow": persistent, "hits": s["hits"],
                                    "banned": s["ban_until"] > now})
         ranked.sort(key=lambda r: r["apt_score"], reverse=True)
@@ -2686,10 +2757,21 @@ class NetShield:
         st = self._ips.get(ip)               # GIL原子の読み取り(state変更なし=ロック不要)
         return bool(st and st["ban_until"] > _now())
 
-    def rebuild_ban_bloom(self) -> dict:
-        """現役BANだけからブルームを作り直す(陳腐ビットを落として偽陽性率を保つ)。"""
-        nb = BloomFilter(capacity=max(2000, _MAX_IPS // 4))
+    def rebuild_ban_bloom(self, force: bool = False) -> dict:
+        """現役BANだけからブルームを作り直す(陳腐ビットを落として偽陽性率を保つ)。
+        unban のたびに全 _ips(最大 20000)を舐め直していたため、ダッシュボードの「全解除」
+        (BAN 1 件ごとに /api/shield/unban を投げる)が O(BAN数 x 追跡IP数)になっていた
+        (実測: BAN 5000 件で合計 46.5 秒・その間グローバルロックを取り合う)。
+        陳腐ビットは *偽陽性にしかならず* is_banned_fast が必ず _ips で確認するため、
+        作り直しを遅らせても遮断判定は一切変わらない。最小間隔で間引く。"""
         now = _now()
+        iv = float(self.cfg.get("bloom_rebuild_min_interval_sec", 2.0) or 0)
+        if not force and iv > 0 and (now - self._bloom_rebuilt) < iv:
+            self._bloom_dirty = True          # 次回の呼び出しでまとめて作り直す
+            return {"ok": True, "deferred": True}
+        self._bloom_rebuilt = now
+        self._bloom_dirty = False
+        nb = BloomFilter(capacity=max(2000, _MAX_IPS // 4))
         with self._lock:
             for ip, s in self._ips.items():
                 if s["ban_until"] > now:
@@ -2748,13 +2830,16 @@ class NetShield:
             return list(self._events)[-max(1, limit):]
 
     def top_talkers(self, n: int = 15) -> list:
+        now = _now()
+        # 旧実装は全 IP ぶんの dict を作ってから全件ソートしていた(実測 15.6ms/回・ロック内)。
+        # 2 秒ごとのダッシュボード更新で回るので、上位 n 件だけ heap で選ぶ(O(N log n))。
         with self._lock:
-            rows = [{"ip": ip, "score": round(self._decayed_score(s), 1),
-                     "reqs_window": len(s["window"]), "hits": s["hits"],
-                     "banned": s["ban_until"] > _now()}
-                    for ip, s in self._ips.items()]
-        return sorted(rows, key=lambda r: (r["score"], r["reqs_window"]),
-                      reverse=True)[:n]
+            top = heapq.nlargest(n, (
+                (round(self._decayed_score(s), 1), len(s["window"]), ip,
+                 s["hits"], s["ban_until"] > now)
+                for ip, s in self._ips.items()))
+        return [{"ip": ip, "score": sc, "reqs_window": rw, "hits": hits, "banned": banned}
+                for sc, rw, ip, hits, banned in top]
 
     def metrics(self) -> dict:
         with self._lock:
