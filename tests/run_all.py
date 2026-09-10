@@ -10,6 +10,7 @@ import importlib
 import os
 import sys
 import traceback
+from unittest import SkipTest     # 環境依存テストの明示スキップ(標準ライブラリのみ)
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.dirname(_HERE)
@@ -69,6 +70,7 @@ MODULES = [
 
 def main() -> int:
     total = passed = 0
+    skipped = []
     for name in MODULES:
         mod = importlib.import_module(name)
         fns = [v for k, v in sorted(vars(mod).items())
@@ -79,12 +81,21 @@ def main() -> int:
                 fn()
                 passed += 1
                 print(f"PASS {name}.{fn.__name__}")
+            except SkipTest as e:   # 環境を満たせないテスト(Tk 無しのサーバ等)
+                skipped.append(f"{name}.{fn.__name__}")
+                print(f"SKIP {name}.{fn.__name__} -> {e}")
             except Exception as e:  # noqa: BLE001 (テストランナー)
                 print(f"FAIL {name}.{fn.__name__} -> {e!r}")
                 traceback.print_exc()
-    print(f"\n=== {passed}/{total} passed ===")
+    failed = total - passed - len(skipped)
+    tail = f" ({len(skipped)} skipped)" if skipped else ""
+    print(f"\n=== {passed}/{total} passed{tail} ===")
+    if skipped:
+        # 飛ばしたテストは *必ず* 名前を出す。黙って素通りさせると「全部緑」に見えて
+        # 実際には走っていない、という最悪の読み違いが起きる(以前はそうなっていた)。
+        print("skipped: " + ", ".join(skipped))
     _cleanup()
-    return 0 if passed == total else 1
+    return 0 if failed == 0 else 1
 
 
 def _cleanup():
