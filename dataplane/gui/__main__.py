@@ -189,6 +189,10 @@ def _stop_child(child):
 
 
 def main(argv=None) -> int:
+    # GUI から起動したときも app.env を効かせる(以前はシェルのランチャだけが
+    # 読んでおり、ダブルクリック起動では DUCKNET_BACKEND 等が黙って無視された)。
+    from ..service import load_env_file
+    load_env_file()
     if not tray.available():
         print("トレイ常駐は Windows 専用です(他 OS では非対応)。"
               "Lite は CLI + Web ダッシュボードで運用してください。", file=sys.stderr)

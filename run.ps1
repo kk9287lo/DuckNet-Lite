@@ -30,7 +30,12 @@ if (Test-Path -LiteralPath $envFile) {
     $t = $line.Trim()
     if ($t -and -not $t.StartsWith('#') -and $t.Contains('=')) {
       $k, $v = $t -split '=', 2
-      Set-Item -Path ("env:" + $k.Trim()) -Value $v.Trim()
+      $k = $k.Trim()
+      # 呼び出し時の指定を優先(ファイルは既定値)。旧実装は無条件に上書きしていた。
+      if ($k -match '^[A-Za-z_][A-Za-z0-9_]*$' -and
+          -not (Test-Path -LiteralPath ("env:" + $k))) {
+        Set-Item -Path ("env:" + $k) -Value $v.Trim()
+      }
     }
   }
 }

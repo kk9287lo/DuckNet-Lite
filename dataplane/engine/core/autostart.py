@@ -108,14 +108,21 @@ def install_windows_runkey(name, command, *, winreg_mod=None) -> dict:
 
 # ── Linux: systemd / macOS: launchd(ユニット文の生成=純粋) ───────────────
 def systemd_unit_text(command, *, user: str = "ducknet",
-                      description: str = "DuckNet-Lite") -> str:
+                      description: str = "DuckNet L7 Security",
+                      workdir: str = "") -> str:
+    """systemd unit を生成する。生成物には環境の受け渡しが無く、app.env に置いた設定が
+    systemd 経由の起動でだけ効かなかった(手動起動や run.sh とは挙動が食い違う)。
+    作業ディレクトリと EnvironmentFile を明示する(ファイルが無ければ '-' で無視される)。"""
     exec_start = _quote(command)
+    workdir = workdir or os.getcwd()
     return (
         "[Unit]\n"
         f"Description={description}\n"
         "After=network-online.target\nWants=network-online.target\n\n"
         "[Service]\nType=simple\n"
         f"User={user}\n"
+        f"WorkingDirectory={workdir}\n"
+        f"EnvironmentFile=-{workdir}/app.env\n"
         f"ExecStart={exec_start}\n"
         "Restart=on-failure\nRestartSec=2\n"
         "StartLimitIntervalSec=60\nStartLimitBurst=5\n\n"

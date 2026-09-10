@@ -11,7 +11,10 @@ rem   DUCKNET_PYTHON    使う Python を明示(未設定なら .venv -> py -3 -
 rem   DUCKNET_ENV_FILE  読み込む設定ファイル(既定: スクリプトと同じ場所の app.env)
 rem 終了コード: 製品の終了コードをそのまま返す。起動前提を満たさない場合は 9。
 rem =============================================================================
-setlocal EnableExtensions EnableDelayedExpansion
+rem NOTE: delayed expansion stays OFF on purpose. The app.env loop below does
+rem   set "%%A=%%B", and with delayed expansion any "!" inside a value is eaten.
+rem   Nothing in this script needs !var! expansion.
+setlocal EnableExtensions DisableDelayedExpansion
 chcp 65001 >nul 2>&1
 set "SELF=%~dp0"
 pushd "%SELF%"
@@ -20,7 +23,8 @@ rem 1) 任意の設定ファイル(KEY=VALUE / # はコメント)
 if not defined DUCKNET_ENV_FILE set "DUCKNET_ENV_FILE=%SELF%app.env"
 if exist "%DUCKNET_ENV_FILE%" (
   for /f "usebackq eol=# tokens=1* delims==" %%A in ("%DUCKNET_ENV_FILE%") do (
-    if not "%%A"=="" set "%%A=%%B"
+    rem 既に環境にある値は上書きしない(呼び出し時の指定が常に勝つ)
+    if not "%%A"=="" if not defined %%A set "%%A=%%B"
   )
 )
 

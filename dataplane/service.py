@@ -81,6 +81,47 @@ def _split_hostport(spec: str, default_port: int):
     return (host or "127.0.0.1"), p
 
 
+def load_env_file(path: str = "") -> int:
+    """app.env(KEY=VALUE)を環境変数へ *既定値として* 取り込む。返値=取り込んだ件数。
+    既に環境にある値は上書きしない(呼び出し時の指定が常に勝つ)。壊れた行は黙って
+    飛ばす: 設定ファイルの書き間違いでゲートウェイが起動しないのが最悪なので、
+    読めるところだけ読む。= の前後の空白、字下げしたコメント、CRLF、値を囲む
+    引用符に対応する(シェル側の実装はここで躓いてランチャごと落ちていた)。"""
+    p = path or os.environ.get("DUCKNET_ENV_FILE", "")
+    if not p:
+        # ランチャは配置先へ cd してから起動するので CWD を先に見る。パッケージの親
+        # (ソースツリー配置)も候補にして、どちらの置き方でも拾えるようにする。
+        here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        for cand in (os.path.join(os.getcwd(), "app.env"), os.path.join(here, "app.env")):
+            if os.path.isfile(cand):
+                p = cand
+                break
+        else:
+            return 0
+    n = 0
+    try:
+        with open(p, encoding="utf-8", errors="replace") as f:
+            lines = f.readlines()
+    except OSError:
+        return 0
+    for raw in lines:
+        line = raw.strip().lstrip("\ufeff")
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, val = line.partition("=")
+        key = key.strip()
+        if not key.replace("_", "").isalnum() or key[0].isdigit():
+            continue                      # 不正なキーは飛ばす(export 失敗で落とさない)
+        val = val.strip()
+        if len(val) >= 2 and val[0] == val[-1] and val[0] in "\"'":
+            val = val[1:-1]               # 値を囲む引用符は外す
+        if key in os.environ:
+            continue                      # 呼び出し時の指定を優先
+        os.environ[key] = val
+        n += 1
+    return n
+
+
 def _install_shutdown_handlers(ev) -> list:
     """SIGTERM / SIGINT(+Windows の SIGBREAK)受信で `ev`(threading.Event)をセットする。
     張れたシグナル名のリストを返す。コンテナ/オーケストレータは停止に **SIGTERM** を送るので、
@@ -242,6 +283,8 @@ def _strip_autostart_flags(raw) -> list:
 
 def main(argv=None) -> int:
     _force_utf8_stdio()
+    # 引数の既定値は env から読むので、パーサを組み立てる *前* に取り込む。
+    load_env_file()
     args = list(sys.argv[1:] if argv is None else argv)
     if args and args[0] == "tray":                # システムトレイ常駐(トレイのみ・Windows)
         from .gui.__main__ import main as _tray_main

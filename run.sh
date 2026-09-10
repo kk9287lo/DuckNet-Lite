@@ -20,10 +20,24 @@ cd "$SELF"
 die() { printf 'DuckNet: %s\n' "$*" >&2; exit 9; }
 
 # 1) 任意の設定ファイル(KEY=VALUE・# はコメント)。source せず安全に取り込む。
+# 製品側の設定は Python(dataplane.service.load_env_file)が同じファイルを読むので、
+# ここで拾うのは *シェル自身が使う* DUCKNET_PYTHON 等だけでよい。
+# 旧実装は set -e 下で `export "$key=$val"` していたため、`KEY = value` のように = の
+# 前後へ空白を入れただけでランチャごと起動不能になっていた("not a valid identifier")。
+# 既に環境にある値は上書きしない(呼び出し時の指定が常に勝つ)。
 ENV_FILE="${DUCKNET_ENV_FILE:-$SELF/app.env}"
 if [ -f "$ENV_FILE" ]; then
-  while IFS='=' read -r key val || [ -n "$key" ]; do
-    case "$key" in ''|\#*) continue ;; esac
+  while IFS= read -r line || [ -n "$line" ]; do
+    line="${line%$'\r'}"                       # CRLF 保存された場合の \r を落とす
+    line="${line#"${line%%[![:space:]]*}"}"     # 先頭の空白(字下げ)
+    case "$line" in ''|\#*) continue ;; esac    # 空行・コメント
+    case "$line" in *=*) ;; *) continue ;; esac
+    key="${line%%=*}"; val="${line#*=}"
+    key="${key%"${key##*[![:space:]]}"}"        # キー末尾の空白
+    val="${val#"${val%%[![:space:]]*}"}"        # 値先頭の空白
+    val="${val%"${val##*[![:space:]]}"}"        # 値末尾の空白
+    case "$key" in ''|*[!A-Za-z0-9_]*) continue ;; esac   # 不正キーは飛ばす
+    [ -n "${!key+x}" ] && continue              # 呼び出し時の指定を優先
     export "$key=$val"
   done < "$ENV_FILE"
 fi

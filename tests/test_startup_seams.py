@@ -152,3 +152,44 @@ def test_flush_state_also_forces_traffic_and_usage():
         sh.flush_state()
         assert os.path.exists(sh._traffic_path), "traffic が書き出されていない"
         assert os.path.exists(sh._usage_path), "usage が書き出されていない"
+
+
+# ── app.env の読み込み(全入口で同じ挙動) ──
+def test_env_file_loader_is_forgiving_and_caller_wins():
+    """設定ファイルの読み込みは製品本体が行う。以前はシェルのランチャ 3 本が各々の
+    脆いパーサを持ち、`KEY = value` のように = の前後へ空白を入れただけで run.sh が
+    起動不能になり、GUI ランチャに至っては app.env を読んでさえいなかった。"""
+    with tempfile.TemporaryDirectory() as d:
+        p = os.path.join(d, "app.env")
+        with open(p, "w", encoding="utf-8", newline="") as f:
+            f.write("# コメント\n"
+                    "DUCKNET_TEST_A=plain\n"
+                    "  DUCKNET_TEST_B = spaced \n"        # = の前後に空白
+                    "   # 字下げコメント\n"
+                    'DUCKNET_TEST_C="quoted!bang"\r\n'    # 引用符 + CRLF
+                    "DUCKNET_TEST_D=has=equals\n"
+                    "BAD-KEY=x\n")                        # 不正キーは飛ばす(落とさない)
+        keys = ["DUCKNET_TEST_A", "DUCKNET_TEST_B", "DUCKNET_TEST_C",
+                "DUCKNET_TEST_D", "BAD-KEY", "DUCKNET_TEST_E"]
+        old = {k: os.environ.get(k) for k in keys}
+        try:
+            os.environ["DUCKNET_TEST_E"] = "fromcaller"
+            with open(p, "a", encoding="utf-8") as f:
+                f.write("DUCKNET_TEST_E=fromfile\n")
+            service.load_env_file(p)
+            assert os.environ["DUCKNET_TEST_A"] == "plain"
+            assert os.environ["DUCKNET_TEST_B"] == "spaced"
+            assert os.environ["DUCKNET_TEST_C"] == "quoted!bang"
+            assert os.environ["DUCKNET_TEST_D"] == "has=equals"
+            assert "BAD-KEY" not in os.environ
+            assert os.environ["DUCKNET_TEST_E"] == "fromcaller"   # 呼び出し側が勝つ
+        finally:
+            for k, v in old.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+
+
+def test_env_file_missing_is_not_an_error():
+    assert service.load_env_file(os.path.join(tempfile.gettempdir(), "no-such-app.env")) == 0
