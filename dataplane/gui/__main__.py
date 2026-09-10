@@ -85,8 +85,13 @@ def _msgbox(text: str, title: str) -> None:
 # ── 本体(ゲートウェイ)の自動起動 ──────────────────────────────────────
 def _admin_addr(base_url: str):
     """管理APIの (host, port) を DUCKNET_ADMIN_URL から解く。"""
-    u = urlparse(base_url if "://" in base_url else "http://" + base_url)
-    return (u.hostname or "127.0.0.1", int(u.port or 8081))
+    try:
+        u = urlparse(base_url if "://" in base_url else "http://" + base_url)
+        return (u.hostname or "127.0.0.1", int(u.port or 8081))
+    except ValueError:
+        # urlparse(...).port は非数値/範囲外で ValueError を投げる。DUCKNET_ADMIN_URL の
+        # 綴り間違いだけでトレイが例外死するのは割に合わないので既定へ落とす。
+        return ("127.0.0.1", 8081)
 
 
 def _gateway_up(host: str, port: int, timeout: float = 0.5) -> bool:
@@ -128,8 +133,12 @@ def _admin_is_ours(host: str, port: int, timeout: float = 1.0) -> bool:
     GET /api/state は 401 + {"ok": false, "error": "token required"} を返すので、これを指紋にする。
     別プロセスのポート占有を『本体が稼働中』と誤認し、起動を諦めたり秘密を渡したりしないため。"""
     url = "http://%s:%d/api/state" % (host, port)
+    # 既定の opener は環境変数のプロキシ設定(http_proxy 等)を拾う。ローカルの指紋確認が
+    # プロキシ経由になると別物の応答を見て「本製品ではない」と誤判定し、ゲートウェイを
+    # 起動できなくなる。ここは必ず直接続する。
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     try:
-        with urllib.request.urlopen(url, timeout=timeout) as _r:
+        with opener.open(url, timeout=timeout) as _r:
             _r.read(1)
         return False                              # 200=無認証で応答する別物(本製品は 401)
     except urllib.error.HTTPError as e:

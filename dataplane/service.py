@@ -38,6 +38,49 @@ from dataplane.engine.lifeform.pipeline import net_shield
 from .admin import AdminDashboard
 
 
+def _env_float(name: str, default: float) -> float:
+    """env から float を読む。不正値は既定へフォールバックし警告する。
+    素の float(os.environ[...]) だと、綴り間違い 1 つでゲートウェイが起動時に生の
+    ValueError で落ちる(--help すら出せない)。防御が上がらないのが最悪なので、
+    設定ミスは警告して既定で動かす。"""
+    raw = (os.environ.get(name) or "").strip()
+    if not raw:
+        return float(default)
+    try:
+        return float(raw)
+    except ValueError:
+        print(f" [警告] {name}={raw!r} は数値として読めません。既定 {default} を使います。",
+              file=sys.stderr)
+        return float(default)
+
+
+def _split_hostport(spec: str, default_port: int):
+    """"HOST:PORT" を (host, port) へ。IPv6 の "[::1]:8080" と裸の "::1" も扱う。
+    旧実装は partition(":") + int() だったため、ポートの綴り間違いはもちろん
+    *IPv6 アドレスを指定しただけ* で起動時に ValueError で落ちていた
+    ("[::1]:8080" は port=":1]:8080" と解釈されていた)。"""
+    s = (spec or "").strip()
+    if s.startswith("["):                      # [IPv6]:port 形式
+        end = s.find("]")
+        if end == -1:
+            raise SystemExit(f"アドレスの形式が不正です: {spec!r}(例 [::1]:8080)")
+        host, rest = s[1:end], s[end + 1:]
+        port = rest[1:] if rest.startswith(":") else ""
+    elif s.count(":") > 1:                     # 裸の IPv6(ポート指定なし)
+        host, port = s, ""
+    else:
+        host, _, port = s.partition(":")
+    if not port:
+        return (host or "127.0.0.1"), int(default_port)
+    try:
+        p = int(port)
+    except ValueError:
+        raise SystemExit(f"ポート番号が不正です: {spec!r}")
+    if not (1 <= p <= 65535):
+        raise SystemExit(f"ポート番号が範囲外です: {p}(1-65535)")
+    return (host or "127.0.0.1"), p
+
+
 def _install_shutdown_handlers(ev) -> list:
     """SIGTERM / SIGINT(+Windows の SIGBREAK)受信で `ev`(threading.Event)をセットする。
     張れたシグナル名のリストを返す。コンテナ/オーケストレータは停止に **SIGTERM** を送るので、
@@ -102,8 +145,7 @@ def run(backend: str = "127.0.0.1:8080", listen: int = 8443,
         health_path: str = "", drain_grace: float = 5.0,
         config_path: str = "") -> None:
     import os as _os
-    bhost, _, bport = backend.partition(":")
-    bport = int(bport or 80)
+    bhost, bport = _split_hostport(backend, 80)
 
     # 製品の既定は『防御ON』(売り物なので最初から守る)。設定は永続化される。
     if defaults_on:
@@ -126,8 +168,30 @@ def run(backend: str = "127.0.0.1:8080", listen: int = 8443,
     guard = AsyncEdgeGuard(backend_host=bhost or "127.0.0.1", backend_port=bport,
                            listen_host=host, listen_port=listen,
                            health_path=health_path)
+    # 前衛ガードを admin より *先* に起動する。--cluster は os.fork() するので、admin の
+    # 待受ソケットが既に開いていると全ワーカーへ継承され、親が死んでも管理ポートが開いた
+    # ままになる(実測: 親へ SIGTERM 後も管理ポート・前衛ポートとも開放されず)。
+    if cluster:
+        res = guard.serve_cluster()
+        if res.get("mode") == "single":
+            print(f" [note] {res.get('reason')}")
+        if not res.get("ok"):
+            raise SystemExit(f"前衛ガード起動失敗: {res.get('error') or '原因不明'}")
+    else:
+        info = guard.start()
+        if not info.get("ok"):
+            raise SystemExit(f"前衛ガード起動失敗: {info.get('error')}")
     admin = AdminDashboard(host=admin_host, port=admin_port, token=token, edge_guard=guard)
-    a = admin.start()
+    try:
+        a = admin.start()
+    except Exception as e:
+        # 管理ポートが塞がっている等でここが失敗すると、既に起動済みの前衛ガード
+        # (--cluster では fork 済みのワーカー)が後始末されないまま親だけ死ぬ。
+        try:
+            guard.stop(grace=0.0)
+        except Exception:
+            pass
+        raise SystemExit(f"管理ダッシュボード起動失敗: {type(e).__name__}: {e}")
     print("=" * 64)
     print(" DuckNet-Lite — セキュリティゲートウェイ 起動")
     print("=" * 64)
@@ -138,17 +202,9 @@ def run(backend: str = "127.0.0.1:8080", listen: int = 8443,
               " トークンを認証なしで配布します=到達できる相手に管理権限が漏れます。")
         print("        ネットワークへ直接公開しないでください(SSHトンネル/リバースプロキシ/"
               "ホストの127.0.0.1へのみポート公開を推奨)。")
-    print(f" 防御中(前衛)       : 0.0.0.0:{listen}  →  バックエンド {bhost}:{bport}")
+    print(f" 防御中(前衛)       : {host}:{listen}  →  バックエンド {bhost}:{bport}")
     print("=" * 64)
 
-    if cluster:
-        res = guard.serve_cluster()
-        if res.get("mode") == "single":
-            print(f" [note] {res.get('reason')}")
-    else:
-        info = guard.start()
-        if not info.get("ok"):
-            raise SystemExit(f"前衛ガード起動失敗: {info.get('error')}")
     if drain_grace > 0:
         print(f" 停止時ドレイン     : 最大 {drain_grace:g}s(進行中リクエストを捌いてから停止)")
     # SIGTERM(コンテナ/k8s の停止シグナル)/ SIGINT で graceful 停止。
@@ -210,9 +266,8 @@ def main(argv=None) -> int:
     ap.add_argument("--health-path", default="", metavar="PATH",
                     help="死活監視用パス(例 /healthz)。一致リクエストは WAF/バックエンド非経由で"
                          "即200を返す。LB/オーケストレータ用。既定OFF(env DUCKNET_HEALTH_PATH 可)")
-    import os as _os
     ap.add_argument("--drain-grace", type=float, metavar="SEC",
-                    default=float(_os.environ.get("DUCKNET_DRAIN_GRACE", "5") or 0),
+                    default=_env_float("DUCKNET_DRAIN_GRACE", 5.0),
                     help="停止(SIGTERM/SIGINT)時に進行中リクエストを捌く最大秒数。"
                          "0=即時停止。既定5(env DUCKNET_DRAIN_GRACE 可)")
     ap.add_argument("--config", default="", metavar="PATH",

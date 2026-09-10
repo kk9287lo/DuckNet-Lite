@@ -221,6 +221,9 @@ _DEFAULTS = {
     # 要求ボディ検査(evolution #61): head-only の死角=POST/JSON/GraphQL 本文の SQLi/XSS/RCE/SSTI を、
     # 本文先頭を *有界* に能動読取して head と同じ署名エンジンで走査する。block_score 超で BAN。
     "body_scan_enabled": True,   # 要求ボディのシグネチャ走査(head-only の死角を塞ぐ)
+    # WAF が解けない Content-Encoding(br 等)のボディは検査不能=通さない。
+    # False にすると圧縮バイトのまま走査して素通しする(=バイパス余地を残す)。
+    "body_reject_unscannable_encoding": True,
     "body_scan_max_bytes": 65536,  # 本文先頭この量だけ走査(全バッファしない=fail-fast/有界)
     # 誤BAN低減(#FP): 要求ボディ(=問い合わせフォーム等の本文)由来のシグネチャは確度が低い
     #   (一般ユーザーが "SELECT 文について" 等と書く)。本文ヒットのスコア寄与をこの係数で下げ、
@@ -1033,6 +1036,11 @@ class NetShield:
         フェイルセーフし system イベントで警報。無署名(旧来)は生値を使いつつ migrate=True を返し、
         呼び出し側が再保存で署名済みへ移行する。攻撃者が書き換えた状態を *信頼しない* のが要点。"""
         status, val = read_signed_json(path, self._state_key, default)
+        # 署名は「改竄されていない」ことしか保証しない。正しく署名された壊れた JSON や
+        # 無署名の旧形式が配列/文字列/None でも呼び出し側は mapping 前提で .get() する。
+        # 期待した形でなければ安全側の default に倒す(呼び出し側を全部守る)。
+        if val is not None and not isinstance(val, type(default)):
+            return default, False
         if status == "unsigned" and self._state_signed_before:
             status = "tampered"      # 署名運用後の無署名出現=平文すり替えの疑い→改竄扱い
         if status in ("tampered", "rolled_back"):
@@ -1109,8 +1117,12 @@ class NetShield:
     def _load_sigs(self):
         d, migrate = self._read_state(self._sig_path, {}, "signatures")
         d = d or {}
+        # pattern が文字列であることも長さも見ずに再コンパイルへ渡していた。数値や巨大な
+        # 文字列が入っていると _compile_custom で例外/過大コストになる。入口で弾く。
         self._custom = [s for s in (d.get("signatures") or [])
-                        if isinstance(s, dict) and s.get("pattern")]
+                        if isinstance(s, dict)
+                        and isinstance(s.get("pattern"), str)
+                        and 0 < len(s["pattern"]) <= 2000]
         self._compile_custom()
         if migrate:
             self._save_sigs()
@@ -1254,7 +1266,10 @@ class NetShield:
         return bool(self.cfg["enabled"])
 
     def enable(self) -> dict:
-        self.cfg["enabled"] = True; self._save(); return {"ok": True, "enabled": True}
+        with self._lock:            # 近隣の設定変更はすべてロック下。ここだけ素通しだった
+            self.cfg["enabled"] = True
+            self._save()
+        return {"ok": True, "enabled": True}
 
     def disable(self) -> dict:
         self.cfg["enabled"] = False; self._save(); return {"ok": True, "enabled": False}
@@ -1268,6 +1283,8 @@ class NetShield:
                 exp = type(self.cfg[k])
                 if exp is float and isinstance(v, int) and not isinstance(v, bool):
                     v = float(v)                # int→float を許容(GB/秒/日数を int で渡せる)
+                if isinstance(v, bool) is not isinstance(self.cfg[k], bool):
+                    continue      # bool は int の部分型。true/false が数値枠へ入るのを防ぐ
                 if isinstance(v, exp):
                     self.cfg[k] = v; changed[k] = v
             self._save()
@@ -1392,7 +1409,12 @@ class NetShield:
         if self.cfg.get("require_tls") and not tls:
             return "正規TLS以外(平文)を遮断"
         gm = self.cfg.get("geo_mode", "off")
-        if gm in ("allow", "block") and self._geo_nets:
+        # allow(許可リスト)は *空でも* 評価する。旧実装は self._geo_nets が空だと
+        # ブロックごとスキップし、「この地域だけ許可」の設定が黙って『全部許可』に
+        # なっていた(CIDR を 1 つ綴り間違えただけで発生)。空の許可リスト=どこにも
+        # 含まれない=全遮断、が allowlist の正しい意味で、ip_mode="whitelist" の
+        # 既存挙動とも揃う。block はリストが空なら遮断対象なし=そのままで正しい。
+        if (gm == "allow") or (gm == "block" and self._geo_nets):
             try:
                 addr = ipaddress.ip_address(ip)
                 inside = any(addr in net for net in self._geo_nets)
@@ -2159,16 +2181,28 @@ class NetShield:
     def set_blocked_methods(self, methods) -> dict:
         """遮断する HTTP メソッド一覧を *置換* で設定し永続化。英字のみ・大文字化・重複除去。
         空配列=無効。XST(TRACE/TRACK)/プロキシ濫用(CONNECT)等の低FPな異常メソッド向け。"""
-        norm = []
-        if isinstance(methods, (list, tuple)):
-            for m in methods:
-                m = str(m).strip().upper()
-                if m and m.isalpha() and len(m) <= 16 and m not in norm:
-                    norm.append(m)
+        # 型が違う入力(宣言的設定の JSON で "TRACE,CONNECT" のような文字列を書いた等)を
+        # 黙って [] として *置換* すると、遮断メソッドの設定が消えたまま ok:True が返り、
+        # 運用者は防御が効いていると誤解する。受理できない型は拒否して現状を保つ。
+        if isinstance(methods, str):
+            methods = [m for m in methods.replace(",", " ").split() if m]
+        elif not isinstance(methods, (list, tuple)):
+            return {"ok": False, "error": "blocked_methods は配列で指定してください",
+                    "blocked_methods": list(self.cfg.get("blocked_methods") or [])}
+        norm, rejected = [], []
+        for m in methods:
+            m = str(m).strip().upper()
+            if m and m.isalpha() and len(m) <= 16 and m not in norm:
+                norm.append(m)
+            elif m:
+                rejected.append(m[:16])
         with self._lock:
             self.cfg["blocked_methods"] = norm
             self._save()
-        return {"ok": True, "blocked_methods": list(norm)}
+        out = {"ok": True, "blocked_methods": list(norm)}
+        if rejected:                          # 黙って捨てない(設定ミスを気づけるように)
+            out["rejected"] = rejected
+        return out
 
 
     # ── 出口DLP(evolution #6) ──
@@ -2682,10 +2716,18 @@ class NetShield:
         d = d or {}
         now = _now()
         retain = float(self.cfg.get("ban_escalation_retain_sec", 86400) or 0)
-        for ip, b in (d.get("bans") or {}).items():
-            until = float("inf") if b.get("permanent") else float(b.get("until") or 0)
-            cnt = int(b.get("count") or 0)
-            started = float(b.get("started") or now)
+        raw = d.get("bans")
+        for ip, b in (raw.items() if isinstance(raw, dict) else ()):
+            # 1 エントリでも壊れていると、以前は起動時に例外で落ちて *防御が上がらなかった*。
+            # 壊れた行だけ捨てて残りを復元する(BAN 表全体を失わない)。
+            if not isinstance(b, dict) or not isinstance(ip, str):
+                continue
+            try:
+                until = float("inf") if b.get("permanent") else float(b.get("until") or 0)
+                cnt = int(b.get("count") or 0)
+                started = float(b.get("started") or now)
+            except (TypeError, ValueError):
+                continue
             if not b.get("permanent") and until <= now:
                 # 期限切れBAN: 累犯回数だけ保持窓内なら復元(エスカレーションを再起動越しに継続)。
                 if cnt > 0 and retain > 0 and (now - started) <= retain:
@@ -2746,6 +2788,16 @@ class NetShield:
         取りこぼさない。persist_bans=False なら _save_bans は no-op(=安全に何もしない)。"""
         with self._lock:
             self._save_bans(force=True)     # 間引きを無視して必ず書き切る
+            # traffic/usage も間引き付きで書いているので、停止時に force しないと
+            # 直近の集計(最大 15 秒ぶん)が毎回失われる。
+            for _fn in (getattr(self, "_save_traffic", None),
+                        getattr(self, "_save_usage", None)):
+                if _fn is None:
+                    continue
+                try:
+                    _fn(force=True)
+                except Exception:
+                    pass
         return {"ok": True, "persisted": bool(self.cfg.get("persist_bans"))}
 
     def is_banned_fast(self, ip: str) -> bool:
@@ -2776,7 +2828,9 @@ class NetShield:
             for ip, s in self._ips.items():
                 if s["ban_until"] > now:
                     nb.add(ip)
-        self._ban_bloom = nb
+            # 公開もロック内で行う。外に出すと、スナップショットと差し替えの間に
+            # 記録された BAN がブルームから落ち、is_banned_fast が素通しにしてしまう。
+            self._ban_bloom = nb
         return {"ok": True, "bloom": nb.info()}
 
     # ── 記録/指標 ──

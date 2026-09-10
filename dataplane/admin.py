@@ -21,6 +21,7 @@ import json
 import os
 import re
 import secrets
+import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -302,7 +303,14 @@ class AdminDashboard:
 
     def start(self) -> dict:
         handler = _make_handler(self)
-        self._server = ThreadingHTTPServer((self.host, self.port), handler)
+
+        class _Server(ThreadingHTTPServer):
+            # Windows の SO_REUSEADDR は「他プロセスが待受中のポートにも bind できる」
+            # 意味になり、管理面を横取りされ得る(POSIX の TIME_WAIT 再利用とは別物)。
+            # 管理プレーンは再利用より排他を優先する。
+            allow_reuse_address = not sys.platform.startswith("win")
+
+        self._server = _Server((self.host, self.port), handler)
         self.port = self._server.server_address[1]
         self._thread = threading.Thread(target=self._server.serve_forever,
                                         daemon=True, name="shield-admin")
@@ -315,6 +323,15 @@ class AdminDashboard:
             self._server.shutdown()
             self._server.server_close()
             self._server = None
+        # serve_forever スレッドを回収する。join しないまま返すと、インタプリタ終了と
+        # 競合して「解釈中のシャットダウン」例外を出したり、テストがポートを掴んだまま
+        # 次のケースへ進んだりする。daemon なので待てなければ諦める。
+        t, self._thread = getattr(self, "_thread", None), None
+        if t is not None and t.is_alive():
+            try:
+                t.join(timeout=3.0)
+            except Exception:
+                pass
         return {"ok": True}
 
 

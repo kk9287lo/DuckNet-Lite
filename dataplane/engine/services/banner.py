@@ -52,7 +52,10 @@ _COPRIME = [s for s in range(1, max(2, len(_FAMILIES)))
 
 def is_enabled() -> bool:
     """デセプションが有効か(既定オフ。DUCKNET_DECEPTION で opt-in)。"""
-    return os.environ.get("DUCKNET_DECEPTION", "").lower() not in ("", "0", "false", "no")
+    # 旧実装は「列挙した 4 語以外は全部 ON」だった(DUCKNET_DECEPTION=off でも ON)。
+    # 明示的に真と読める値だけを ON にする。
+    return (os.environ.get("DUCKNET_DECEPTION") or "").strip().lower() in (
+        "1", "true", "yes", "on")
 
 
 def rotating_banner(seed: str = "", window: int = 30, now: float = None) -> str:

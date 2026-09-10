@@ -63,6 +63,7 @@ MODULES = [
     "test_scanwindow",          # 走査面のバイパス封じ(パディング/NFKC展開/窓予算)と資源境界
     "test_vulnfix",             # 脆弱性修正の回帰(CSRF/トークン配布/署名束縛)
     "test_complexity",          # 二次コスト(O(N^2))の再発防止(間引きの低水位・走査量削減の非回帰)
+    "test_startup_seams",       # 起動部と繋ぎ目の潜在バグ(設定ミス耐性/起動診断/停止経路/fail-closed)
 ]
 
 

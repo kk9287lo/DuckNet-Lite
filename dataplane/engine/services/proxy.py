@@ -615,6 +615,10 @@ class AsyncEdgeGuard:
         self._server = None
         self._thread = None
         self._ready = threading.Event()
+        self._start_error = ""        # 待受開始に失敗した理由(start() が返す)
+        self._workers = []            # --cluster で fork した子ワーカーの pid
+        self._listen_sock = None      # --cluster で親が使う SO_REUSEPORT ソケット
+        self._defense_warned = set()  # 防御を用意できなかった理由(重複表示を避ける)
         self._stop_event = None       # ループ内 asyncio.Event(graceful drain の停止合図)
         self._active = 0              # 進行中の接続ハンドラ数(ループスレッドのみが触る=ロック不要)
         self._conn_per_ip: dict = {}  # ip -> 同時接続数(limit_conn 用・ループスレッドのみ=ロック不要)
@@ -719,6 +723,21 @@ class AsyncEdgeGuard:
                     self._conn_per_ip[ip] = v
             self._active -= 1
 
+    def _defense_unavailable(self, what: str, exc) -> None:
+        """防御機構を用意できなかったことを記録する(同じ原因は 1 度だけ表示)。
+        黙って素通しすると『動いているのに守っていない』最悪の状態になるため、
+        呼び出し側は必ず接続を落とすこと。"""
+        self.metrics["defense_unavailable"] = self.metrics.get("defense_unavailable", 0) + 1
+        key = f"{what}:{type(exc).__name__}"
+        if key in self._defense_warned:
+            return
+        self._defense_warned.add(key)
+        try:
+            print(f"[重大] {what} を初期化できないため接続を遮断しています: "
+                  f"{type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
+        except Exception:
+            pass
+
     async def _handle_conn(self, reader, writer):
         self.metrics["accepted"] += 1
         ip = "127.0.0.1"
@@ -816,9 +835,12 @@ class AsyncEdgeGuard:
             from ..lifeform.policy import app_firewall, _zone_of
             fw = app_firewall()
             fw_enabled = fw.is_enabled()
-        except Exception:
-            fw = None
-            fw_enabled = False
+        except Exception as e:
+            # 取得に失敗した=判定できない。すぐ下の evaluate() は fail-closed なのに
+            # ここだけ素通しだった。防御を張れないまま通すくらいなら落とす。
+            self._defense_unavailable("app_firewall", e)
+            self.metrics["dropped"] += 1
+            return self._close(writer)
         if fw_enabled:
             try:
                 fw_allowed = fw.evaluate(ip).get("action") == "allow"
@@ -837,8 +859,13 @@ class AsyncEdgeGuard:
             from ..lifeform.pipeline import net_shield
             sh = net_shield()
             shield_enabled = sh.is_enabled()
-        except Exception:
-            shield_enabled = False
+        except Exception as e:
+            # WAF 本体を用意できない(state dir が書けない/ENOSPC 等)。シングルトンは
+            # 成功時にしか確定しないので、以後プロセスの寿命いっぱい無防備なまま通り続ける。
+            # 検知ゲートと同じく fail-closed にし、原因を 1 度だけ表に出す。
+            self._defense_unavailable("net_shield", e)
+            self.metrics["dropped"] += 1
+            return self._close(writer)
         if shield_enabled:
             _p = path.split("?")[0]
             # 解除リクエスト(異議申立)経路はBAN判定の手前=遮断中のユーザーでも到達できる。
@@ -1285,6 +1312,20 @@ class AsyncEdgeGuard:
                                                    int(sh.cfg.get("body_scan_max_bytes", 65536)))
                     if dec:
                         pb = dec                       # 解凍できたら解凍後を走査面に
+                    elif sh.cfg.get("body_reject_unscannable_encoding", True):
+                        # 解けない符号化(br 等)のボディを *圧縮バイトのまま* 走査しても
+                        # 署名は当たらない。バックエンドがその符号化に対応していれば
+                        # 実質バイパスになるので、検査できない本文は通さない。
+                        self.metrics["dropped"] += 1
+                        self.metrics["body_unscannable"] = self.metrics.get(
+                            "body_unscannable", 0) + 1
+                        try:
+                            writer.write(_http_response(
+                                "415 Unsupported Media Type",
+                                '{"ok":false,"error":"unsupported content-encoding"}'))
+                        except Exception:
+                            pass
+                        return self._close(writer)
             blocked = sh.inspect_body(ip, pb).get("action") == "block"
             if not blocked:                            # #66: 危険なアップロード拡張子も拒否
                 blocked = sh.scan_upload(ip, pb).get("action") == "block"
@@ -1547,8 +1588,15 @@ class AsyncEdgeGuard:
 
     # ── 起動/停止(別スレッドのイベントループで常駐) ──
     async def _serve(self):
-        self._server = await asyncio.start_server(
-            self._handle, self.listen_host, self.listen_port)
+        if self._listen_sock is not None:
+            # --cluster: 親も SO_REUSEPORT のソケットで待受ける。素の
+            # start_server(host, port) だと、先に fork した子が SO_REUSEPORT で
+            # 掴んだポートに対して EADDRINUSE になる。
+            self._server = await asyncio.start_server(self._handle,
+                                                      sock=self._listen_sock)
+        else:
+            self._server = await asyncio.start_server(
+                self._handle, self.listen_host, self.listen_port)
         self.listen_port = self._server.sockets[0].getsockname()[1]
         self._stop_event = asyncio.Event()
         self._ready.set()
@@ -1634,9 +1682,15 @@ class AsyncEdgeGuard:
         self._loop.set_exception_handler(lambda loop, ctx: None)
         try:
             self._loop.run_until_complete(self._serve())
-        except (Exception, asyncio.CancelledError):
+        except asyncio.CancelledError:
             pass
+        except Exception as e:
+            # 起動失敗(ポート使用中・権限不足・名前解決不能 等)の理由を捨てていたため、
+            # 呼び出し側には 5 秒後に「起動タイムアウト」としか見えなかった。理由を残し、
+            # _ready を立てて即座に返せるようにする(待たせない・原因が分かる)。
+            self._start_error = f"{type(e).__name__}: {e}"
         finally:
+            self._ready.set()             # 成功・失敗どちらでも待機側を解放する
             try:
                 self._loop.close()
             except Exception:
@@ -1655,12 +1709,16 @@ class AsyncEdgeGuard:
             pass
 
     def start(self, timeout: float = 5.0) -> dict:
+        self._start_error = ""
+        self._ready.clear()
         self._raise_fd_limit()                        # #79: FD ソフト上限を引き上げ(可能なら)
         self._thread = threading.Thread(target=self._run, daemon=True,
                                         name="ducknet-edge")
         self._thread.start()
         if not self._ready.wait(timeout):
             return {"ok": False, "error": "起動タイムアウト"}
+        if self._start_error:                         # 待受に失敗した実際の理由を返す
+            return {"ok": False, "error": self._start_error}
         return {"ok": True, "listen": f"{self.listen_host}:{self.listen_port}",
                 "backend": f"{self.backend_host}:{self.backend_port}",
                 "note": "asyncio Fail-Fastガード。block/denyは即TCP切断(スレッド非消費)。"}
@@ -1690,8 +1748,43 @@ class AsyncEdgeGuard:
                         pass
         if self._thread is not None and self._thread.is_alive():
             self._thread.join(timeout=max(0.0, float(grace)) + 5.0)
+        reaped = self._stop_workers(grace)
         return {"ok": True, "stopped": True, "drained": remaining,
-                "metrics": dict(self.metrics)}
+                "workers_stopped": reaped, "metrics": dict(self.metrics)}
+
+    def _stop_workers(self, grace: float = 0.0) -> int:
+        """--cluster で fork したワーカーを確実に終わらせる。
+        旧実装は子 pid を集めるだけで誰も止めておらず、親へ SIGTERM を送ると
+        *親だけが死んで子が待受ポートを握ったまま生き残った*(実測: 13 ワーカー全残存・
+        前衛ポートも管理ポートも開いたまま)。SIGTERM → 猶予 → SIGKILL で刈り取る。"""
+        pids, self._workers = list(self._workers), []
+        if not pids or not hasattr(os, "kill"):
+            return 0
+        import signal as _sig
+        for pid in pids:
+            try:
+                os.kill(pid, _sig.SIGTERM)
+            except OSError:
+                pass
+        deadline = time.monotonic() + max(1.0, float(grace) + 2.0)
+        alive = list(pids)
+        while alive and time.monotonic() < deadline:
+            for pid in list(alive):
+                try:
+                    done, _ = os.waitpid(pid, os.WNOHANG)
+                except OSError:
+                    done = pid                # 既に回収済み/存在しない
+                if done:
+                    alive.remove(pid)
+            if alive:
+                time.sleep(0.05)
+        for pid in alive:                     # 猶予を過ぎても残るものは強制終了
+            try:
+                os.kill(pid, getattr(_sig, "SIGKILL", _sig.SIGTERM))
+                os.waitpid(pid, 0)
+            except OSError:
+                pass
+        return len(pids)
 
     def serve_forever(self) -> None:
         info = self.start()
@@ -1711,7 +1804,17 @@ class AsyncEdgeGuard:
 
     # ── マルチコア(SO_REUSEPORT + fork)。可用OSのみ・Windowsは正直に単一へ降格 ──
     def _reuseport_socket(self):
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        # AF_INET 固定だと --host に IPv6(:: 等)を指定したクラスタ起動が必ず失敗する。
+        # 単一プロセス経路は asyncio が解決してくれるので、ここだけ取り残されていた。
+        fam = socket.AF_INET
+        try:
+            infos = socket.getaddrinfo(self.listen_host or None, self.listen_port,
+                                       type=socket.SOCK_STREAM)
+            if infos:
+                fam = infos[0][0]
+        except OSError:
+            pass
+        s = socket.socket(fam, socket.SOCK_STREAM)
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         if hasattr(socket, "SO_REUSEPORT"):
             s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
@@ -1756,14 +1859,45 @@ class AsyncEdgeGuard:
         for _ in range(max(0, n - 1)):
             pid = os.fork()
             if pid == 0:                      # 子ワーカー: 自分のループで待受(戻らない)
-                self._worker_blocking()
-                os._exit(0)
+                # 親から継承したシグナル配線を既定へ戻す。親のハンドラは親の
+                # threading.Event を叩くだけで子には効かず、SIGTERM を無視する
+                # ワーカーが残る原因になる。
+                try:
+                    import signal as _sig
+                    for _s in ("SIGTERM", "SIGINT", "SIGBREAK"):
+                        _h = getattr(_sig, _s, None)
+                        if _h is not None:
+                            _sig.signal(_h, _sig.SIG_DFL)
+                except Exception:
+                    pass
+                self._workers = []            # 子は孫を持たない
+                try:
+                    self._worker_blocking()
+                finally:
+                    os._exit(0)
             pids.append(pid)
-        # 親も1ワーカーを担う(ブロッキング=常駐)
-        return_info = {"ok": True, "mode": "cluster", "workers": n,
-                       "child_pids": pids, "capabilities": caps,
-                       "rate_limit_scope": "per-worker",
-                       "note": "各ワーカーは独立レートカウンタ=IP単位上限は実効で約"
-                               " threshold×workers。厳密なグローバル制限は共有KVS継ぎ目へ委譲。"}
-        self._worker_blocking()
-        return return_info
+        self._workers = pids
+        # 親も 1 ワーカーを担うが、*ブロックせずに戻る*。旧実装はここで
+        # _worker_blocking() を呼んで戻らなかったため、呼び出し側の停止処理
+        # (SIGTERM ハンドラ・ドレイン・状態 flush)へ一度も到達しなかった。
+        try:
+            self._listen_sock = self._reuseport_socket()   # 子と同じ条件で待受ける
+        except OSError as e:
+            self._stop_workers(0.0)
+            return {"ok": False, "mode": "cluster", "workers": n,
+                    "child_pids": [], "capabilities": caps,
+                    "error": f"{type(e).__name__}: {e}"}
+        info = self.start()
+        if not info.get("ok"):
+            try:
+                self._listen_sock.close()
+            except Exception:
+                pass
+            self._listen_sock = None
+            self._stop_workers(0.0)
+        return {"ok": bool(info.get("ok")), "mode": "cluster", "workers": n,
+                "child_pids": pids, "capabilities": caps,
+                "error": info.get("error", ""),
+                "rate_limit_scope": "per-worker",
+                "note": "各ワーカーは独立レートカウンタ=IP単位上限は実効で約"
+                        " threshold×workers。厳密なグローバル制限は共有KVS継ぎ目へ委譲。"}

@@ -31,7 +31,10 @@ def _load_native():
     nd = os.path.join(os.path.dirname(os.path.abspath(__file__)), "native")
     if os.path.isdir(nd):
         if nd not in sys.path:
-            sys.path.insert(0, nd)
+            # 先頭へ入れると、この配下に置かれたモジュールが標準ライブラリまで
+            # 覆い隠せてしまう(自己完全性監視の対象外の経路で挙動を差し替えられる)。
+            # 探索は最後で十分なので末尾へ足す。
+            sys.path.append(nd)
         try:
             import ducknet_accel
             return ducknet_accel

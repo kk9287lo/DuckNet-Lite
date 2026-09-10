@@ -84,6 +84,8 @@ class AppFirewall:
     # ── 永続化 ───────────────────────────────────────────────────
     def _load(self):
         d = safe_read_json(self.path, {}) or {}
+        if not isinstance(d, dict):       # 壊れた/型違いの acl.json で落ちない
+            d = {}
         self.enabled = bool(d.get("enabled", False))         # 既定OFF
         self.policy = dict(_DEFAULT_POLICY)
         for z, a in (d.get("policy") or {}).items():

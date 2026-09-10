@@ -37,4 +37,9 @@ packages = [
   "dataplane.engine.core",
   "dataplane.engine.lifeform",
   "dataplane.engine.services",
+  "dataplane.gui",
 ]
+
+# トレイのアイコンは同梱しないと `ducknet-lite gui` が既定アイコンを出せない。
+[tool.setuptools.package-data]
+"dataplane.gui" = ["assets/*.ico", "assets/*.png"]

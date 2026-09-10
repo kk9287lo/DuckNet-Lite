@@ -65,7 +65,7 @@ def install_windows_task(name, command, *, trigger="onlogon", run=None) -> dict:
     run = run or subprocess.run
     args = schtasks_create_args(name, _quote(command), trigger)
     try:
-        r = run(args, capture_output=True, text=True)
+        r = run(args, capture_output=True, stdin=subprocess.DEVNULL, timeout=30, text=True)
         return {"ok": getattr(r, "returncode", 1) == 0, "method": "schtasks",
                 "name": name, "trigger": trigger,
                 "detail": (getattr(r, "stdout", "") or getattr(r, "stderr", "")).strip()}
@@ -77,7 +77,7 @@ def uninstall_windows_task(name, *, run=None) -> dict:
     import subprocess
     run = run or subprocess.run
     try:
-        r = run(schtasks_delete_args(name), capture_output=True, text=True)
+        r = run(schtasks_delete_args(name), capture_output=True, stdin=subprocess.DEVNULL, timeout=30, text=True)
         return {"ok": getattr(r, "returncode", 1) == 0, "method": "schtasks", "name": name}
     except Exception as e:
         return {"ok": False, "error": str(e)}

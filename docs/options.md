@@ -13,6 +13,17 @@ DuckNet の挙動は CLI 引数・環境変数・設定キー(cfg)で制御し�
 | `DUCKNET_STATE_KEY` | (生成) | 状態ファイル署名の HMAC 鍵。外部鍵を推奨(未設定時は state_dir に 0600 で生成するため、同ディスクの root には弱い)。 |
 | `DUCKNET_DRAIN_TIMEOUT` | `60` | 応答転送の書込み(drain)デッドライン秒(#9 slow-read/zero-window 対策)。 |
 | `DUCKNET_HEALTH_PATH` | (空) | LB 死活監視用に即 200 を返す予約パス(WAF/バックエンド非経由)。 |
+| `DUCKNET_ADMIN_ALLOWED_HOSTS` | (空) | 管理面で許可する追加ホスト名(カンマ区切り)。DNS リバインディング対策の例外指定。IP リテラルと localhost は常に許可。 |
+| `DUCKNET_ADMIN_TOKEN` | (生成) | 管理トークン。`--token` より env が推奨(argv は他ユーザーから読める)。 |
+| `DUCKNET_ADMIN_URL` | `http://127.0.0.1:8081` | トレイ/GUI が開く管理ダッシュボードの URL。 |
+| `DUCKNET_BACKEND` | `127.0.0.1:8080` | トレイから本体を起動するときの保護対象(HOST:PORT)。 |
+| `DUCKNET_CONFIG` | (空) | 起動時に適用する宣言的設定 JSON のパス(`--config` と同じ)。 |
+| `DUCKNET_COVER` | (空) | ステルス運用の偽装名。管理画面/遮断ページ/Server ヘッダの表示名を差し替える。 |
+| `DUCKNET_DECEPTION` | (空) | 動的デセプション(偽 Server バナー)の有効化。`1`/`true`/`yes`/`on` で ON。 |
+| `DUCKNET_DRAIN_GRACE` | `5` | 停止時に進行中リクエストを捌く最大秒数(`--drain-grace` と同じ)。数値として読めない値は警告して既定へ。 |
+| `DUCKNET_ICON_DIR` | (空) | トレイアイコンの探索ディレクトリ(同梱 assets より優先)。 |
+| `DUCKNET_LISTEN` | `8443` | トレイから本体を起動するときの前衛ガード待受ポート。 |
+| `DUCKNET_ORIGIN_KEY` | (生成) | バックエンド・バイパス防止トークン(エッジ経由を証明する時間有界トークン)の鍵。バックエンド側と揃える。 |
 
 ## 主な設定キー(cfg)
 
