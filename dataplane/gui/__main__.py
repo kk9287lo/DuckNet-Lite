@@ -192,7 +192,13 @@ def _stop_child(child):
 def main(argv=None) -> int:
     # GUI から起動したときも app.env を効かせる(以前はシェルのランチャだけが
     # 読んでおり、ダブルクリック起動では DUCKNET_BACKEND 等が黙って無視された)。
-    from ..service import load_env_file
+    from ..service import load_env_file, _force_utf8_stdio
+    # `python -m dataplane.gui` は service.main() を通らないため、ここでも標準出力を
+    # UTF-8 に寄せる。以前はこれが無く、非 UTF-8 コンソール(英語版 Windows の cp1252 等)
+    # では下の日本語警告を出そうとした瞬間に UnicodeEncodeError で落ちていた ――
+    # よりによって「別プロセスがポートを占有しており保護が動作していない」と
+    # 伝えようとしている、いちばん落ちてはいけない場面で。
+    _force_utf8_stdio()
     load_env_file()
     if not tray.available():
         print("トレイ常駐は Windows 専用です(他 OS では非対応)。"

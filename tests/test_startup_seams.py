@@ -445,6 +445,159 @@ def test_flush_state_also_forces_traffic_and_usage():
         assert os.path.exists(sh._usage_path), "usage が書き出されていない"
 
 
+# ── 言語判定(env → UI/遮断ページの言語) ──
+def test_c_locale_is_not_mistaken_for_english():
+    """ロケール未設定(C/POSIX)は『英語』ではなく『不明』。既定の ja に落ちること。
+
+    Python 3.11 以前の locale.getlocale() は C ロケールを ('en_US', ...) と *報告する*
+    ため、ロケールを設定しないサーバ(systemd ユニット・コンテナ・cron の既定)では
+    同じ日本語環境が Python のバージョン差だけで英語 UI に化けていた
+    (実測: 同一コンテナで 3.10=en / 3.13=ja。遮断ページや通知の言語まで変わる)。
+    """
+    from dataplane.engine.core import i18n
+    keys = ("DUCKNET_LANG", "LC_ALL", "LC_MESSAGES", "LC_CTYPE", "LANG", "LANGUAGE")
+    old = {k: os.environ.get(k) for k in keys}
+    try:
+        for env, expect in (
+                ({}, "ja"),                              # 何も指定なし
+                ({"LANG": "C"}, "ja"),                   # ロケール未設定の代表例
+                ({"LANG": "C.UTF-8"}, "ja"),             # Docker 公式イメージの既定
+                ({"LANG": "POSIX"}, "ja"),
+                ({"LC_ALL": "C.UTF-8", "LANG": "ja_JP.UTF-8"}, "ja"),
+                ({"LC_CTYPE": "en_US.UTF-8", "LANG": "ja_JP.UTF-8"}, "ja"),  # 文字種は言語ではない
+                ({"LC_MESSAGES": "en_US.UTF-8", "LANG": "ja_JP.UTF-8"}, "en"),
+                ({"LANG": "ja_JP.UTF-8"}, "ja"),
+                ({"LANG": "en_US.UTF-8"}, "en"),         # 明示された英語は従来どおり
+                ({"LC_ALL": "en_GB.UTF-8"}, "en"),
+                ({"LANGUAGE": "en"}, "en"),
+                ({"DUCKNET_LANG": "en", "LANG": "ja_JP.UTF-8"}, "en"),   # 明示指定が最優先
+                ({"DUCKNET_LANG": "ja", "LANG": "en_US.UTF-8"}, "ja"),
+        ):
+            for k in keys:
+                os.environ.pop(k, None)
+            os.environ.update(env)
+            got = i18n.lang()
+            assert got == expect, f"{env or '(指定なし)'} → {got}(期待 {expect})"
+    finally:
+        for k, v in old.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
+# ── サービスとして動かしたときのログ ──
+def test_startup_banner_reaches_a_redirected_log_while_still_running():
+    """標準出力がパイプ/ファイル(= systemd・docker・nohup、つまり実運用の全部)だと
+    Python はブロックバッファにする。そのため **起動して数秒経ってもログが 0 バイト**
+    という状態になっていた ―― 内容が出るのは *プロセスが止まったとき*。
+    起動バナーには **管理トークン** が載るので、運用者は「起動したか」も
+    「どのトークンで管理画面へ入るか」も分からない。
+    実際に子プロセスとして起動し、*動いている間に* バナーが読めることを確かめる。"""
+    import subprocess
+
+    def _free():
+        s = socket.socket()
+        s.bind(("127.0.0.1", 0))
+        p = s.getsockname()[1]
+        s.close()
+        return p
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    with tempfile.TemporaryDirectory() as d:
+        logp = os.path.join(d, "svc.log")
+        env = dict(os.environ)
+        env.update({"DUCKNET_OFFLINE": "1", "DUCKNET_STATE_DIR": os.path.join(d, "state"),
+                    "DUCKNET_SELF_DEFENSE": "0", "PYTHONPATH": root})
+        env.pop("PYTHONUNBUFFERED", None)          # -u 相当が効いていては検証にならない
+        cmd = [sys.executable, "-m", "dataplane",
+               "--host", "127.0.0.1", "--listen", str(_free()),
+               "--admin", str(_free()), "--backend", "127.0.0.1:9"]
+        with open(logp, "wb") as out:
+            proc = subprocess.Popen(cmd, cwd=root, stdout=out, stderr=subprocess.STDOUT,
+                                    stdin=subprocess.DEVNULL, env=env)
+        try:
+            seen = ""
+            for _ in range(150):                   # 最大 15 秒
+                if proc.poll() is not None:
+                    break
+                with open(logp, encoding="utf-8", errors="replace") as f:
+                    seen = f.read()
+                if "管理トークン" in seen or "アクセスキー" in seen:
+                    break
+                time.sleep(0.1)
+            assert proc.poll() is None, (
+                "子プロセスが落ちた(exit=%r)。ログ: %r" % (proc.poll(), seen[-400:]))
+            assert "管理トークン" in seen or "アクセスキー" in seen, (
+                "稼働中なのにバナーがログへ出てこない(ブロックバッファに滞留している)。"
+                "ログ %d バイト: %r" % (len(seen), seen[-400:]))
+        finally:
+            proc.terminate()
+            try:
+                proc.wait(timeout=10)
+            except Exception:
+                proc.kill()
+                try:
+                    proc.wait(timeout=5)
+                except Exception:
+                    pass
+
+
+# ── 非 UTF-8 コンソールでの出力(英語版 Windows・ASCII ロケール) ──
+def test_force_utf8_stdio_survives_a_cp1252_console():
+    """本製品のメッセージは日本語なので、非 UTF-8 の標準出力へそのまま書くと落ちる。
+    _force_utf8_stdio() を通した後は書けること。"""
+    old_out, old_err = sys.stdout, sys.stderr
+    try:
+        sys.stdout = io.TextIOWrapper(io.BytesIO(), encoding="cp1252", errors="strict")
+        sys.stderr = io.TextIOWrapper(io.BytesIO(), encoding="cp1252", errors="strict")
+        try:
+            print("警告")                        # 素の cp1252 では書けない
+            raise AssertionError("cp1252 に日本語が書けてしまった(前提が崩れている)")
+        except UnicodeEncodeError:
+            pass
+        service._force_utf8_stdio()
+        print("警告: 保護は動作していません")     # 寄せた後は書ける
+        print("警告", file=sys.stderr)
+    finally:
+        sys.stdout, sys.stderr = old_out, old_err
+
+
+def test_every_module_entry_point_normalizes_stdio_before_printing():
+    """`python -m <pkg>` で直接起動できる入口は、日本語を出す前に必ず標準出力を
+    UTF-8 へ寄せること。
+
+    `python -m dataplane.gui` は service.main() を通らないためこれが抜けており、
+    非 UTF-8 コンソールでは『別プロセスがポートを占有していて保護が動作していない』
+    という *いちばん落ちてはいけない警告* を出そうとした瞬間に UnicodeEncodeError で
+    落ちていた(cp1252 の stderr で再現済み)。
+    """
+    import ast
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    pkg = os.path.join(root, "dataplane")
+    entries = []
+    for dirpath, dirnames, filenames in os.walk(pkg):
+        dirnames[:] = [d for d in dirnames if d != "__pycache__"]
+        if "__main__.py" in filenames:
+            entries.append(os.path.join(dirpath, "__main__.py"))
+    assert entries, "python -m の入口が1つも見つからない(探索が壊れている)"
+
+    for path in entries:
+        src = open(path, encoding="utf-8").read()
+        tree = ast.parse(src)
+        prints_non_ascii = any(
+            isinstance(n, ast.Constant) and isinstance(n.value, str)
+            and not n.value.isascii()
+            for c in ast.walk(tree)
+            if isinstance(c, ast.Call) and getattr(c.func, "id", "") == "print"
+            for n in ast.walk(c))
+        if not prints_non_ascii:
+            continue        # 自分では非ASCIIを出さない入口(委譲するだけ)は対象外
+        assert "_force_utf8_stdio" in src, (
+            "%s が標準出力を UTF-8 へ寄せていない(非 UTF-8 端末で落ちる)"
+            % os.path.relpath(path, root))
+
+
 # ── app.env の読み込み(全入口で同じ挙動) ──
 def test_env_file_loader_is_forgiving_and_caller_wins():
     """設定ファイルの読み込みは製品本体が行う。以前はシェルのランチャ 3 本が各々の
@@ -480,6 +633,30 @@ def test_env_file_loader_is_forgiving_and_caller_wins():
                     os.environ.pop(k, None)
                 else:
                     os.environ[k] = v
+
+
+def test_unwritable_state_dir_is_detected_not_silently_ignored():
+    """状態ディレクトリに書けないまま起動しても、見た目は完全に正常に動く。
+    BAN・累犯記録・ライセンス・完全性ベースラインだけが *毎回の再起動で黙って消える*
+    (ハードニングした systemd ユニットや読取専用ボリュームで普通に起こる)。
+    モードビットではなく実書き込みで判定すること。"""
+    with tempfile.TemporaryDirectory() as d:
+        assert service.state_dir_writable(d) is True
+
+        blocker = os.path.join(d, "iam-a-file")     # ファイルの下にはディレクトリを作れない
+        with open(blocker, "w", encoding="utf-8") as f:
+            f.write("x")
+        assert service.state_dir_writable(os.path.join(blocker, "state")) is False
+
+        # POSIX の書込不可ディレクトリ(root は権限を無視できるので対象外)
+        if os.name == "posix" and getattr(os, "geteuid", lambda: 0)() != 0:
+            ro = os.path.join(d, "ro")
+            os.mkdir(ro)
+            os.chmod(ro, 0o555)
+            try:
+                assert service.state_dir_writable(ro) is False
+            finally:
+                os.chmod(ro, 0o755)
 
 
 def test_env_file_missing_is_not_an_error():

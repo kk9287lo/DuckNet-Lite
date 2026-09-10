@@ -20,17 +20,27 @@ import sys
 
 
 def _force_utf8_stdio() -> None:
-    """標準出力/エラーを UTF-8 へ。Windows の cp932/cp1252 コンソールで
-    ヘルプや起動メッセージ中の非ASCII文字(— や日本語)が
-    UnicodeEncodeError でクラッシュするのを防ぐ。失敗しても無害に継続。"""
+    """標準出力/エラーを UTF-8 かつ行バッファへ。失敗しても無害に継続。
+
+    · UTF-8 化: Windows の cp932/cp1252 コンソールで、ヘルプや起動メッセージ中の
+      非ASCII文字(— や日本語)が UnicodeEncodeError でクラッシュするのを防ぐ。
+    · 行バッファ化: サービスとして動かすと標準出力はパイプ/ファイルになり、Python は
+      ブロックバッファにする。その結果 **起動して数秒経ってもログが 0 バイト** という
+      状態になっていた(実測: systemd/docker 相当の環境で 4 秒後も空。内容が出るのは
+      *プロセスが止まったとき*)。起動バナーには **管理トークン** が載るので、
+      運用者は「起動したか」も「どのトークンで入るか」も分からない。
+      データ経路は print しない(通知は数えるほど)ので、行ごとの flush で構わない。"""
     for stream in (sys.stdout, sys.stderr):
         reconfig = getattr(stream, "reconfigure", None)
         if reconfig is None:
             continue
         try:
-            reconfig(encoding="utf-8", errors="backslashreplace")
+            reconfig(encoding="utf-8", errors="backslashreplace", line_buffering=True)
         except Exception:
-            pass
+            try:                              # line_buffering 非対応の実装向け
+                reconfig(encoding="utf-8", errors="backslashreplace")
+            except Exception:
+                pass
 
 from dataplane.engine.services.proxy import AsyncEdgeGuard
 from dataplane.engine.lifeform.policy import app_firewall
@@ -79,6 +89,24 @@ def _split_hostport(spec: str, default_port: int):
     if not (1 <= p <= 65535):
         raise SystemExit(f"ポート番号が範囲外です: {p}(1-65535)")
     return (host or "127.0.0.1"), p
+
+
+def state_dir_writable(path: str = "") -> bool:
+    """状態ディレクトリに *実際に書けるか* を書き込みで確かめる(モードビットは当てにならない:
+    ACL・読取専用マウント・systemd の ProtectSystem/ReadOnlyPaths では権限ビットが書込可でも
+    失敗する)。書けない場所を掴んだまま起動すると、BAN・累犯記録・ライセンス・完全性
+    ベースラインが *毎回の再起動で黙って消える*。"""
+    import tempfile
+    from .engine.core.atomic_io import default_state_dir
+    path = path or default_state_dir()
+    try:
+        os.makedirs(path, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(prefix=".probe.", dir=path)
+        os.close(fd)
+        os.unlink(tmp)
+        return True
+    except OSError:
+        return False
 
 
 def load_env_file(path: str = "") -> int:
@@ -243,9 +271,22 @@ def run(backend: str = "127.0.0.1:8080", listen: int = 8443,
               " トークンを認証なしで配布します=到達できる相手に管理権限が漏れます。")
         print("        ネットワークへ直接公開しないでください(SSHトンネル/リバースプロキシ/"
               "ホストの127.0.0.1へのみポート公開を推奨)。")
-    print(f" 防御中(前衛)       : {host}:{listen}  →  バックエンド {bhost}:{bport}")
+    # IPv6 リテラルは [] で囲って表示する(`::1:8443` は読めないし URL にもならない)
+    from .engine.core.netaddr import hostport as _hp
+    print(f" 防御中(前衛)       : {_hp(host, listen)}  →  バックエンド {_hp(bhost, bport)}")
     print("=" * 64)
 
+    # 状態ディレクトリに書けないまま起動すると、BAN も累犯記録もライセンスも
+    # 再起動のたびに消える。しかも見た目は完全に正常に動くので気づけない。
+    # (ハードニングした systemd ユニットや読取専用ボリュームで普通に起こる)
+    from .engine.core.atomic_io import default_state_dir as _dsd
+    _sd = _dsd()
+    if not state_dir_writable(_sd):
+        print(f" 状態保存           : [警告] {_sd} へ書き込めません。BAN・累犯記録・"
+              "ライセンス・完全性ベースラインは再起動で全て失われます", file=sys.stderr)
+        print("        DUCKNET_STATE_DIR に書き込める場所を指定してください"
+              "(systemd の ProtectSystem/ReadOnlyPaths や読取専用マウントが原因のことが多い)",
+              file=sys.stderr)
     if drain_grace > 0:
         print(f" 停止時ドレイン     : 最大 {drain_grace:g}s(進行中リクエストを捌いてから停止)")
     # SIGTERM(コンテナ/k8s の停止シグナル)/ SIGINT で graceful 停止。

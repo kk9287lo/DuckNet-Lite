@@ -10,18 +10,42 @@ from __future__ import annotations
 import os
 
 
+# 「ロケール未設定」を表す値。C/POSIX は *英語ではなく* 「指定なし」であり、
+# サーバ(systemd ユニット・コンテナ・cron)の既定はほぼこれ。
+_NEUTRAL_LOCALES = {"c", "posix", "c.utf-8", "c.utf8", "posix.utf-8", "posix.utf8",
+                    "c.iso-8859-1", "c.iso8859-1"}
+
+
+def _meaningful_locale(s) -> bool:
+    """そのロケール文字列が実際に言語を語っているか(空・C・POSIX は語っていない)。"""
+    s = (s or "").strip().lower()
+    return bool(s) and s not in _NEUTRAL_LOCALES
+
+
 def _locale_lang() -> str:
     """OS ロケール/環境から推定した言語(evolution #84)。英語ロケールなら 'en'、それ以外/不明は ''。
     日本語環境を主としつつ、英語環境では env 設定なしでも自動で英語にするための判定。"""
     try:
         import locale
-        srcs = [os.environ.get("LC_ALL"), os.environ.get("LANG"), os.environ.get("LANGUAGE")]
-        try:
-            srcs.append(locale.getlocale()[0] or "")   # Windows/mac の OS ロケールも見る
-        except Exception:
-            pass
+        # *表示言語* を決める変数だけを見る。LC_CTYPE は文字種の扱いを決める変数で、
+        # 「日本語 UI のまま LC_CTYPE だけ en_US」という設定は珍しくないため入れない。
+        srcs = [os.environ.get("LC_ALL"), os.environ.get("LC_MESSAGES"),
+                os.environ.get("LANG"), os.environ.get("LANGUAGE")]
+        if not any(_meaningful_locale(s) for s in srcs):
+            # env が何も言っていない場合だけ OS ロケールを見る(Windows/mac 用)。
+            # ただし現在のロケールが C/POSIX のままなら *聞かない*: Python 3.11 以前の
+            # locale.getlocale() は C ロケールを ('en_US', ...) と報告するため、
+            # ロケール未設定の日本語サーバが Python のバージョン差だけで英語 UI に
+            # 化けていた(実測: 同じコンテナで 3.10=en / 3.13=ja)。
+            try:
+                if _meaningful_locale(locale.setlocale(locale.LC_CTYPE)):   # 問い合わせのみ
+                    srcs.append(locale.getlocale()[0] or "")
+            except Exception:
+                pass
         for s in srcs:
-            s = (s or "").lower()
+            s = (s or "").strip().lower()
+            if not _meaningful_locale(s):
+                continue                               # C/POSIX/空 = 不明(英語ではない)
             if s.startswith("en") or "english" in s or "_us" in s or "_gb" in s:
                 return "en"
     except Exception:
