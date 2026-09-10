@@ -446,6 +446,25 @@ def test_flush_state_also_forces_traffic_and_usage():
 
 
 # ── 言語判定(env → UI/遮断ページの言語) ──
+def _with_os_locale(name):
+    """OS 側のロケール報告を差し替えるコンテキスト(テストをホスト非依存にする)。
+    name=None は「ロケール未設定(C)」、文字列はその設定値を報告する。"""
+    import contextlib
+    import locale as _loc
+
+    @contextlib.contextmanager
+    def _ctx():
+        o_set, o_get = _loc.setlocale, _loc.getlocale
+        _loc.setlocale = lambda *a, **k: (name or "C")
+        _loc.getlocale = lambda *a, **k: ((name.split(".")[0], None) if name
+                                          else ("C", "UTF-8"))
+        try:
+            yield
+        finally:
+            _loc.setlocale, _loc.getlocale = o_set, o_get
+    return _ctx()
+
+
 def test_c_locale_is_not_mistaken_for_english():
     """ロケール未設定(C/POSIX)は『英語』ではなく『不明』。既定の ja に落ちること。
 
@@ -453,11 +472,17 @@ def test_c_locale_is_not_mistaken_for_english():
     ため、ロケールを設定しないサーバ(systemd ユニット・コンテナ・cron の既定)では
     同じ日本語環境が Python のバージョン差だけで英語 UI に化けていた
     (実測: 同一コンテナで 3.10=en / 3.13=ja。遮断ページや通知の言語まで変わる)。
+
+    OS 側のロケールは明示的に模す。ホストのロケールに依存させると、日本語 Windows では
+    通って英語 Windows では落ちる(実際 CI の windows-latest で落ちた)。
+    env が何も言っていないときに OS を見るのは設計どおり(#84)なので、
+    『OS も未設定なら ja』と『OS が英語なら en』の両方を固定する。
     """
     from dataplane.engine.core import i18n
     keys = ("DUCKNET_LANG", "LC_ALL", "LC_MESSAGES", "LC_CTYPE", "LANG", "LANGUAGE")
     old = {k: os.environ.get(k) for k in keys}
     try:
+      with _with_os_locale(None):                    # OS もロケール未設定(C)
         for env, expect in (
                 ({}, "ja"),                              # 何も指定なし
                 ({"LANG": "C"}, "ja"),                   # ロケール未設定の代表例
@@ -478,6 +503,18 @@ def test_c_locale_is_not_mistaken_for_english():
             os.environ.update(env)
             got = i18n.lang()
             assert got == expect, f"{env or '(指定なし)'} → {got}(期待 {expect})"
+      with _with_os_locale("English_United States.1252"):   # 英語 Windows 相当
+        for env, expect in (
+                ({}, "en"),                                  # #84: env 無しでも英語になる
+                ({"LANG": "C"}, "en"),                       # env が何も言っていない=OS を見る
+                ({"LANG": "ja_JP.UTF-8"}, "ja"),             # 明示指定は OS より優先
+                ({"DUCKNET_LANG": "ja"}, "ja"),
+        ):
+            for k in keys:
+                os.environ.pop(k, None)
+            os.environ.update(env)
+            got = i18n.lang()
+            assert got == expect, f"[英語OS] {env or '(指定なし)'} → {got}(期待 {expect})"
     finally:
         for k, v in old.items():
             if v is None:
