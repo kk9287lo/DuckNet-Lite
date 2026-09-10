@@ -103,6 +103,206 @@ def test_start_still_reports_ok_on_a_free_port():
         g.stop(grace=0.0)
 
 
+def test_cluster_forks_workers_and_stop_reaps_every_one():
+    """--cluster の実プロセス回帰。旧実装では stop() が子を一切止めず、親だけ死んで
+    ワーカーが待受ポートを握ったまま残った(実測 13 個残存)。fork して立ち上げ、
+    停止後に (1) 子 pid が全滅していること (2) 待受が完全に消えていること を確かめる。
+    fork/SO_REUSEPORT を持たない OS(Windows)は対象外なので明示的に SKIP する。"""
+    if not (hasattr(os, "fork") and hasattr(socket, "SO_REUSEPORT")):
+        raise SkipTest("fork/SO_REUSEPORT 非対応の OS(単一プロセスへ降格する経路)")
+
+    probe = socket.socket()
+    probe.bind(("127.0.0.1", 0))
+    port = probe.getsockname()[1]
+    probe.close()                                    # 直後に同じ番号を掴み直す
+
+    g = AsyncEdgeGuard(backend_host="127.0.0.1", backend_port=9,
+                       listen_host="127.0.0.1", listen_port=port)
+    info = g.serve_cluster(workers=3)
+    try:
+        assert info.get("mode") == "cluster", info
+        assert info.get("ok") is True, info
+        pids = list(info.get("child_pids") or [])
+        assert len(pids) == 2, info                  # 親も 1 ワーカーを担うので n-1 個
+        for pid in pids:
+            os.kill(pid, 0)                          # 生きている(死んでいれば OSError)
+        socket.create_connection(("127.0.0.1", port), timeout=2.0).close()  # 実際に待受
+    finally:
+        g.stop(grace=0.0)
+
+    for pid in pids:
+        for _ in range(100):                         # 刈り取りは同期だが念のため待つ
+            try:
+                os.kill(pid, 0)
+            except OSError:
+                break
+            time.sleep(0.05)
+        else:
+            raise AssertionError(f"ワーカー {pid} が停止後も生き残っている")
+
+    # 「解放された」の判定は *待受が消えたか* で行う。空きポートへの bind 可否で見ると、
+    # 同時に走る他テストのループバック通信が同じ番号を TIME_WAIT に残すだけで
+    # EADDRINUSE になり、製品と無関係に落ちる(実測: 3.10/3.14 の一括実行でのみ再現)。
+    for _ in range(100):
+        try:
+            socket.create_connection(("127.0.0.1", port), timeout=0.5).close()
+        except OSError:
+            break                                    # 誰も待受けていない=解放済み
+        time.sleep(0.05)
+    else:
+        raise AssertionError(f"停止後もポート {port} で待受けが続いている(ワーカー残存)")
+
+
+def test_cluster_restart_rebinds_instead_of_reusing_a_closed_listener():
+    """--cluster で上げた親は、停止時に閉じた listener を持ち越してはいけない。
+    持ち越すと次の start() が **閉じたソケット** を asyncio へ渡し、以後どうやっても
+    起動しない。自己防衛 watchdog の restart() は stop()→start() なので、クラスタ運用では
+    『一度でも再起動が要る状況になったら二度と復帰しない』という壊れ方をしていた。"""
+    if not (hasattr(os, "fork") and hasattr(socket, "SO_REUSEPORT")):
+        raise SkipTest("fork/SO_REUSEPORT 非対応の OS(単一プロセスへ降格する経路)")
+
+    probe = socket.socket()
+    probe.bind(("127.0.0.1", 0))
+    port = probe.getsockname()[1]
+    probe.close()
+
+    g = AsyncEdgeGuard(backend_host="127.0.0.1", backend_port=9,
+                       listen_host="127.0.0.1", listen_port=port)
+    assert g.serve_cluster(workers=2).get("ok") is True
+    g.stop(grace=0.0)
+    assert g._listen_sock is None, "停止後も listener を握ったまま(次回 start が閉じた fd を使う)"
+
+    info = g.restart()                               # watchdog がやるのと同じ経路
+    try:
+        assert info.get("ok") is True, info
+        socket.create_connection(("127.0.0.1", g.listen_port), timeout=2.0).close()
+    finally:
+        g.stop(grace=0.0)
+
+
+def _fd_count():
+    try:
+        return len(os.listdir("/proc/self/fd"))
+    except OSError:
+        return -1                                    # /proc の無い OS(Windows 等)
+
+
+def test_stop_releases_sockets_without_waiting_for_the_gc():
+    """停止しても FD が GC 任せで開いたまま残っていた(実測: 高負荷停止の直後に 31 本、
+    gc.collect() でようやく 5 本)。asyncio のトランスポートは循環参照を作るので、
+    参照カウントだけでは解放されない。watchdog の restart() は stop()→start() なので、
+    長寿命プロセスでは再起動のたびにこれが積み上がる。"""
+    base = _fd_count()
+    if base < 0:
+        raise SkipTest("/proc/self/fd が無い環境では FD を数えられない")
+
+    back = socket.socket()
+    back.bind(("127.0.0.1", 0))
+    back.listen(64)
+    bport = back.getsockname()[1]
+    held = []
+
+    def accept_and_hold():                           # 応答しない=接続が in-flight のまま残る
+        while True:
+            try:
+                c, _ = back.accept()
+            except OSError:
+                return
+            held.append(c)
+
+    th = threading.Thread(target=accept_and_hold, daemon=True)
+    th.start()
+
+    g = AsyncEdgeGuard(backend_host="127.0.0.1", backend_port=bport,
+                       listen_host="127.0.0.1", listen_port=0)
+    assert g.start().get("ok") is True
+    clients = []
+    try:
+        for i in range(20):
+            c = socket.socket()
+            c.settimeout(3.0)
+            try:
+                c.connect(("127.0.0.1", g.listen_port))
+                c.sendall(b"GET /hold%d HTTP/1.1\r\nHost: h\r\n\r\n" % i)
+            except OSError:
+                c.close()
+                continue
+            clients.append(c)
+        time.sleep(0.3)                              # 接続を確立させる
+        assert _fd_count() > base, "接続が張られていない(前提が崩れている)"
+        g.stop(grace=0.2)
+        for c in clients:                            # テスト側が持つ FD を先に手放す
+            try:
+                c.close()
+            except OSError:
+                pass
+        clients = []
+        for c in held:
+            try:
+                c.close()
+            except OSError:
+                pass
+        held[:] = []
+        time.sleep(0.2)
+        after = _fd_count()                          # 残っていればガード側の取りこぼし
+        assert after <= base + 6, (
+            "停止後もガード側の FD が %d 本残っている(base=%d, now=%d)"
+            % (after - base, base, after))
+    finally:
+        for c in clients:
+            try:
+                c.close()
+            except OSError:
+                pass
+        try:
+            g.stop(grace=0.0)
+        except Exception:
+            pass
+        back.close()
+        for c in held:
+            try:
+                c.close()
+            except OSError:
+                pass
+
+
+def test_stop_makes_the_server_wakeup_safe_to_re_enter():
+    """停止のたびに `Exception ignored in _SelectorTransport.__del__` が数十本、
+    ログへ流れていた(実測 10 回に 3 回、1 回あたり 30 本)。
+
+    原因は CPython の asyncio.Server._wakeup が *再入不可* なこと ―― 2 回目は
+    self._waiters が None のまま反復して TypeError になる。一方 Server._clients は
+    WeakSet なので、放置されたトランスポートが GC でまとめて回収されると _detach が
+    「残り 0 件」を何度も観測し、_wakeup を連打してしまう。
+    セキュリティ製品が停止のたびにクラッシュしたようなログを出すのは通らないので、
+    stop() は閉じ終えた Server の wakeup を無効化する(誰も待っていないので無害)。
+    """
+    # まず「素の CPython は 2 回目で落ちる」ことを確認する(将来 CPython 側が直したら
+    # このテストは SKIP になり、余計な細工を残していると気づける)。
+    probe = AsyncEdgeGuard(backend_host="127.0.0.1", backend_port=9,
+                           listen_host="127.0.0.1", listen_port=0)
+    assert probe.start().get("ok") is True
+    raw = probe._server
+    try:
+        raw._wakeup()                                # 1 回目は正常
+        try:
+            raw._wakeup()                            # 2 回目
+        except TypeError:
+            pass
+        else:
+            raise SkipTest("この Python では Server._wakeup が再入可能(上流で修正済み)")
+    finally:
+        probe.stop(grace=0.0)
+
+    g = AsyncEdgeGuard(backend_host="127.0.0.1", backend_port=9,
+                       listen_host="127.0.0.1", listen_port=0)
+    assert g.start().get("ok") is True
+    srv = g._server
+    g.stop(grace=0.0)
+    for _ in range(3):                               # GC が何度 _detach しても落ちない
+        srv._wakeup()
+
+
 def test_stop_workers_is_a_noop_without_cluster():
     g = AsyncEdgeGuard(listen_host="127.0.0.1", listen_port=0)
     assert g._workers == []

@@ -638,6 +638,7 @@ class AsyncEdgeGuard:
         self._defense_warned = set()  # 防御を用意できなかった理由(重複表示を避ける)
         self._stop_event = None       # ループ内 asyncio.Event(graceful drain の停止合図)
         self._active = 0              # 進行中の接続ハンドラ数(ループスレッドのみが触る=ロック不要)
+        self._live = set()            # 進行中の writer(同上・停止時に確実に閉じるため)
         self._conn_per_ip: dict = {}  # ip -> 同時接続数(limit_conn 用・ループスレッドのみ=ロック不要)
         self._conn_rate: dict = {}    # ip -> [窓開始, 件数](接続レート=RST/churn フラッド対策・#10)
         self._pool = _BufferPool()
@@ -696,6 +697,11 @@ class AsyncEdgeGuard:
         さらに per-IP 同時接続上限(limit_conn・evolution #30): cfg max_conn_per_ip>0 のとき、
         同一IPが既に上限本数を保持していれば head 解析前に即切断(接続枯渇/slowloris 増幅対策)。"""
         self._active += 1
+        # 進行中の writer を握っておく。stop(grace) の猶予を過ぎて残った接続を
+        # *明示的に閉じる* ために要る。以前は放置しており、stop() から戻った時点でも
+        # ソケットが開いたまま GC 待ちになっていた(実測: 高負荷停止の直後に 25 本)。
+        # 長寿命プロセスの restart(watchdog)では再起動のたびにこれが積み上がる。
+        self._live.add(writer)
         ip = ""
         try:
             peer = writer.get_extra_info("peername")
@@ -738,6 +744,7 @@ class AsyncEdgeGuard:
                     self._conn_per_ip.pop(ip, None)       # 0本になったIPは破棄(辞書を有界に保つ)
                 else:
                     self._conn_per_ip[ip] = v
+            self._live.discard(writer)
             self._active -= 1
 
     def _defense_unavailable(self, what: str, exc) -> None:
@@ -1683,9 +1690,29 @@ class AsyncEdgeGuard:
         while self._active > 0 and self._loop.time() < deadline:
             await asyncio.sleep(0.05)
         remaining = self._active
+        if remaining:
+            # 猶予を過ぎても捌けなかった接続は、ここで確実に閉じる。graceful shutdown の
+            # 約束は「grace 秒までは待つ」であって「いつまでも放置する」ではない。
+            for _w in list(self._live):
+                try:
+                    _w.close()
+                except Exception:
+                    pass
+            self._live.clear()
+            await asyncio.sleep(0)                # close を1度まわしてから listener を畳む
         if self._server is not None:
             try:
                 self._server.close()              # in-flight 捌け後なら安全(全バージョン共通の後片付け)
+            except Exception:
+                pass
+            try:
+                # ループが生きているうちに後片付けを終わらせる。ここを待たずにループを
+                # 閉じると、残ったトランスポートが Server より後に GC され、asyncio 内部で
+                # `Exception ignored in _SelectorTransport.__del__` → Server._wakeup が
+                # 二度呼ばれて TypeError、というトレースが大量に出る(実測: 高負荷時の停止
+                # 5 回に 1 回、1 回あたり 30 本)。製品としては「停止のたびにログが
+                # クラッシュしたように見える」ので、ここで確実に畳む。
+                await asyncio.wait_for(self._server.wait_closed(), timeout=2.0)
             except Exception:
                 pass
         if self._stop_event is not None:
@@ -1767,7 +1794,38 @@ class AsyncEdgeGuard:
                         pass
         if self._thread is not None and self._thread.is_alive():
             self._thread.join(timeout=max(0.0, float(grace)) + 5.0)
+        # --cluster 用の listener は *持ち越さない*。ループ側で既に閉じられているため、
+        # 残しておくと次の start()(watchdog の restart など)が **閉じたソケット** を
+        # asyncio へ渡して二度と起動できなくなる。次回は素の bind でやり直す
+        # (ワーカーは下で刈り取るので SO_REUSEPORT を共有する相手はもう居ない)。
+        ls, self._listen_sock = self._listen_sock, None
+        if ls is not None:
+            try:
+                ls.close()
+            except Exception:
+                pass
         reaped = self._stop_workers(grace)
+        # asyncio のトランスポート/プロトコルは循環参照を作るため、参照カウントだけでは
+        # 解放されない。stop() から戻った時点でソケットの FD が世代別 GC 任せで開いたまま
+        # 残り(実測: 高負荷停止の直後に 31 本。gc.collect() で 5 本まで落ちる)、
+        # 遅れて回収されるときに asyncio 内部が停止済みの Server を触って
+        # `Exception ignored in _SelectorTransport.__del__` を撒き散らす。
+        # stop() は毎秒走る経路ではない(停止/再起動時のみ)ので、ここで確実に回収する。
+        # CPython の asyncio.Server._wakeup は *再入不可* (2 回目は self._waiters が None の
+        # まま反復して TypeError)。一方 Server._clients は WeakSet なので、放置された
+        # トランスポートが GC でまとめて回収されると、_detach が「残り 0 件」を何度も観測して
+        # _wakeup を連打する ―― 結果 `Exception ignored in _SelectorTransport.__del__` の
+        # トレースが 1 回の停止で数十本、ログへ流れる(実測 10 回に 3 回)。
+        # ここまで来た Server は閉じ済みで、もう誰も wait_closed() で待っていないので、
+        # このインスタンスの wakeup だけ無効化して黙らせる(挙動には影響しない)。
+        srv = self._server
+        if srv is not None:
+            try:
+                srv._wakeup = lambda: None
+            except Exception:
+                pass
+        import gc
+        gc.collect()
         return {"ok": True, "stopped": True, "drained": remaining,
                 "workers_stopped": reaped, "metrics": dict(self.metrics)}
 
