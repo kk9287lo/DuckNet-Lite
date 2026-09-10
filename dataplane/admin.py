@@ -702,13 +702,18 @@ def _make_handler(app: AdminDashboard):
                 else:
                     self._send(404, _j({"ok": False, "error": "not found"}))
                     return
-                self._send(200, _j(r))
+                # 監査は **応答より先** に書く。逆順だと「実行された・呼び出し元には成功が
+                # 返った・しかし記録は無い」窓が開き、そこでプロセスが落ちれば監査記録だけが
+                # 消える(監査ログの外し方として最悪の向き)。実測でも、変更直後に
+                # /api/admin_audit を読むと最新1件が入っていないことがあった(10回中4回)。
+                # record_audit は内部で例外を握り潰すので、先に呼んでも応答は妨げない。
                 # set_paranoia() は paranoia_status() をそのまま返すため "ok" キーを持たない
                 # (エラー系は明示的に "ok": False を返す) — 単純に r.get("ok") だけで判定すると
                 # paranoia 変更が監査ログに一切残らない。「"ok" が明示的に False でなければ成功」
                 # として扱う(sig_test は _audit_entry が None を返すため二重に安全)。
                 if isinstance(r, dict) and r.get("ok", True) is not False:
                     app.record_audit(path, b, r, pre_cfg, pre_fw)
+                self._send(200, _j(r))
             except Exception as e:
                 self._send(200, _j({"ok": False, "error": str(e)}))
     return H

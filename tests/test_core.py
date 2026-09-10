@@ -332,6 +332,41 @@ def test_dashboard_ops_policy_wiring():
             FW._FW, ND._SHIELD = ofw, osh
 
 
+def test_audit_is_written_before_the_success_response():
+    """監査ログは **応答より先** に書く。逆順だと「実行された・呼び出し元には成功が返った・
+    しかし記録は無い」窓が開き、そこでプロセスが落ちれば監査記録だけが消える(監査ログの
+    外し方として最悪の向き)。実測でも、変更直後に /api/admin_audit を読むと最新の1件が
+    入っていないことがあった(10回中4回。一括実行が Python 3.14 でだけ落ちて発覚した)。
+
+    record_audit をわざと遅くして、*応答が返った時点で既に記録済み* であることを確かめる。
+    応答が先に返る実装なら、この待ち時間の間に読まれて 0 件になる。"""
+    import tempfile
+    import time as _time
+    with tempfile.TemporaryDirectory() as tmp:
+        ofw, osh = FW._FW, ND._SHIELD
+        adm, url, token = _admin_with_temp(tmp)
+        adm._state_dir = tmp
+        orig = adm.record_audit
+
+        def slow(*a, **kw):
+            _time.sleep(0.3)
+            return orig(*a, **kw)
+
+        adm.record_audit = slow                      # インスタンス側だけ差し替える
+        try:
+            t0 = _time.perf_counter()
+            code, _ = _req(url + "/api/shield/toggle", token=token, body={"on": True})
+            took = _time.perf_counter() - t0
+            assert code == 200
+            d = json.loads(_req(url + "/api/admin_audit", token=token)[1])
+            assert len(d["entries"]) == 1, "応答が返った時点で監査が未記録(応答を先に返している)"
+            assert took >= 0.25, "record_audit の差し替えが効いていない=テストが素通りしている"
+        finally:
+            adm.record_audit = orig
+            adm.stop()
+            FW._FW, ND._SHIELD = ofw, osh
+
+
 def test_dashboard_admin_audit_wiring():
     # 管理アクション監査ログ: mutating POST が成功すると admin_audit.jsonl に1件残り、
     # GET /api/admin_audit で新しい順に取得できる。単純なスカラー設定は revert 情報を持つ。
