@@ -87,6 +87,11 @@ def main() -> int:
             except Exception as e:  # noqa: BLE001 (テストランナー)
                 print(f"FAIL {name}.{fn.__name__} -> {e!r}")
                 traceback.print_exc()
+                if os.environ.get("GITHUB_ACTIONS") == "true":
+                    # CI では失敗を注釈として出す。ログを開かなくても、どのテストが
+                    # どう落ちたかが run の一覧から分かる(ログは権限が要る)。
+                    _d = " ".join(repr(e).split())[:400]   # 注釈は 1 行に畳む
+                    print(f"::error title={name}.{fn.__name__}::{_d}", flush=True)
     failed = total - passed - len(skipped)
     tail = f" ({len(skipped)} skipped)" if skipped else ""
     print(f"\n=== {passed}/{total} passed{tail} ===")
