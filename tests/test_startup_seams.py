@@ -618,8 +618,15 @@ def test_every_module_entry_point_normalizes_stdio_before_printing():
         if "__main__.py" in filenames:
             entries.append(os.path.join(dirpath, "__main__.py"))
     assert entries, "python -m の入口が1つも見つからない(探索が壊れている)"
+    entries = [(p, False) for p in entries]
+    # テストランナー自身も「直接起動される入口」。しかも *無条件* に検査する:
+    # ここが出す日本語は SkipTest や例外のメッセージ ―― つまりリテラルではなく
+    # **実行時の値** なので、下の「非ASCIIリテラルを print しているか」では拾えない。
+    # 実際その穴で漏らし、英語版 Windows の CI が結果表示の途中で
+    # UnicodeEncodeError を起こし、要約すら出ないまま exit 1 になっていた。
+    entries.append((os.path.join(root, "tests", "run_all.py"), True))
 
-    for path in entries:
+    for path, always in entries:
         src = open(path, encoding="utf-8").read()
         tree = ast.parse(src)
         prints_non_ascii = any(
@@ -628,9 +635,12 @@ def test_every_module_entry_point_normalizes_stdio_before_printing():
             for c in ast.walk(tree)
             if isinstance(c, ast.Call) and getattr(c.func, "id", "") == "print"
             for n in ast.walk(c))
-        if not prints_non_ascii:
+        if not (always or prints_non_ascii):
             continue        # 自分では非ASCIIを出さない入口(委譲するだけ)は対象外
-        assert "_force_utf8_stdio" in src, (
+        called = any(isinstance(n, ast.Call)
+                     and getattr(n.func, "id", "") == "_force_utf8_stdio"
+                     for n in ast.walk(tree))
+        assert called, (                      # 定義があるだけでは足りない。呼ぶこと。
             "%s が標準出力を UTF-8 へ寄せていない(非 UTF-8 端末で落ちる)"
             % os.path.relpath(path, root))
 

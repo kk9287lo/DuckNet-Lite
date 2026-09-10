@@ -12,6 +12,32 @@ import sys
 import traceback
 from unittest import SkipTest     # 環境依存テストの明示スキップ(標準ライブラリのみ)
 
+
+def _force_utf8_stdio() -> None:
+    """ランナー自身の出力を UTF-8 かつ行バッファへ(失敗しても無害に継続)。
+
+    SKIP/FAIL の説明文は日本語なので、非 UTF-8 コンソール(英語版 Windows の cp1252
+    や ASCII ロケール)では print した瞬間に UnicodeEncodeError で落ちる。しかも
+    落ちる場所が結果表示なので、**要約行すら出ないまま exit 1** になり、
+    「何が失敗したのか分からない」という最悪の壊れ方をする(実際 CI の
+    windows-latest がこれで落ちていた)。
+    製品側(dataplane.service)にも同じ処理があるが、ランナーは製品が壊れていても
+    動けるべきなので import せずここで完結させる。"""
+    for stream in (sys.stdout, sys.stderr):
+        reconfig = getattr(stream, "reconfigure", None)
+        if reconfig is None:
+            continue
+        try:
+            reconfig(encoding="utf-8", errors="backslashreplace", line_buffering=True)
+        except Exception:
+            try:
+                reconfig(encoding="utf-8", errors="backslashreplace")
+            except Exception:
+                pass
+
+
+_force_utf8_stdio()
+
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.dirname(_HERE)
 sys.path.insert(0, _ROOT)   # dataplane / dataplane.engine を import 可能に
