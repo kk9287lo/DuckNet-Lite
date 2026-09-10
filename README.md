@@ -68,8 +68,25 @@ AGPL-3.0-or-later です([LICENSE.txt](LICENSE.txt))。ネットワーク越し�
 ## 開発
 
 ```bash
-python tests/run_all.py     # テスト(依存ゼロ)
-python -m build             # sdist + wheel
+python tests/run_all.py              # テスト(依存ゼロ)
+python tools/verify_env_matrix.py    # 環境を変えて繰り返し検証(下記)
+python -m build                      # sdist + wheel
 ```
 
-CI は Linux(3.10–3.13)と Windows で回しています(`.github/workflows/ci.yml`)。
+CI は Linux(3.10–3.14)と Windows で回しています(`.github/workflows/ci.yml`)。
+
+### 環境マトリクス検証
+
+バグの多くは *コードではなく環境* で出る。`tools/verify_env_matrix.py` は OS ロケールの
+報告と端末のエンコーディングを差し替えながらテスト一式を繰り返し実行する。とくに次の
+2 つは「日本語 Windows」や「C ロケールの Linux」だけで確認していると永久に見つからない:
+
+| プロファイル | 何を模すか |
+|---|---|
+| `en-cp1252` | 英語版 Windows のコンソール。非 UTF-8 端末で日本語を出すと落ちる系 |
+| `en-utf8` | 英語ロケールの Linux/mac。言語判定が OS ロケールに追随する系 |
+| `c-utf8` | ロケール未設定(systemd/コンテナ/cron の既定) |
+| `ja-cp932` | 日本語版 Windows のコンソール |
+| `ascii` | 非ASCIIを一切書けない端末(最も厳しい) |
+
+`python tools/verify_env_matrix.py en-cp1252` のように 1 つだけ指定もできる。
