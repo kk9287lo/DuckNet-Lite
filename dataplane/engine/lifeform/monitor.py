@@ -45,18 +45,23 @@ _SENSITIVE_QUERY = {
 # キー名分断によるアンチ検出回避を無効化(制御文字/空白/Unicodeフィラー/プラスを除去)
 _QUERY_NAME_SEP_RE = re.compile(r"[\s\x00-\x1f\u115f\u1160\u3164\uffa0\u200b-\u200f\u202a-\u202e\ufeff+\-]+")
 
+# 照合は『区切り(- と _)を全部落とした形』同士で行う。以前は '-' を分断文字として先に消した後で
+# '-'→'_' していたため置換が働かず、access-token→accesstoken・X-Amz-Signature→xamzsignature が
+# アンダースコア表記の集合と一致せず、S3 署名付き URL の秘密がログへ素通りしていた。
+_SENSITIVE_QUERY_NORM = {s.replace("_", "") for s in _SENSITIVE_QUERY}
+
 _REDACTED = "[REDACTED]"
 
 
 def _norm_query_name(name: str) -> str:
-    """クエリ名を正規化(小文字化+分断文字除去+ -/_ 統一)して機微判定に使う。"""
+    """クエリ名を正規化(小文字化+分断文字除去+ '-'/'_' 除去)して機微判定に使う。
+    比較相手は _SENSITIVE_QUERY_NORM(同じく '_' を除いた形)。"""
     import urllib.parse as _up
     try:
         n = _up.unquote(name)
     except Exception:
         n = name
-    n = _QUERY_NAME_SEP_RE.sub("", n).lower()
-    return n.replace("-", "_")
+    return _QUERY_NAME_SEP_RE.sub("", n).lower().replace("_", "")
 
 
 # ══ IP 分類 ══════════════════════════════════════════════════════════════════
@@ -160,9 +165,9 @@ def strip_userinfo(url: str) -> str:
         parts = urlsplit(url)
         if not parts.username and not parts.password:
             return url
-        host = parts.hostname or ""
-        if parts.port:
-            host = f"{host}:{parts.port}"
+        # '@' より後ろ(host[:port])をそのまま残す。hostname から組み直すと IPv6 の角括弧が
+        # 落ちて 'https://::1:8080/' という不正 URL になっていた。
+        host = parts.netloc.rpartition("@")[2]
         return urlunsplit((parts.scheme, host, parts.path, parts.query, parts.fragment))
     except Exception:
         return url
@@ -176,7 +181,7 @@ def redact_url(url: str) -> str:
             return urlunsplit(parts)
         out = []
         for k, v in parse_qsl(parts.query, keep_blank_values=True):
-            out.append((k, _REDACTED if _norm_query_name(k) in _SENSITIVE_QUERY else v))
+            out.append((k, _REDACTED if _norm_query_name(k) in _SENSITIVE_QUERY_NORM else v))
         return urlunsplit((parts.scheme, parts.netloc, parts.path,
                            urlencode(out, doseq=True, safe="[]"), parts.fragment))
     except Exception:

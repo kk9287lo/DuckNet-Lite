@@ -53,7 +53,8 @@ DuckNet 経由のトラフィックが、直近まで busy だったのに突然
 ## 3. 資源枯渇ハードニング(#79 + OS 層)
 
 アプリ内蔵(既定有効): グローバル接続上限 `max_total_conn`(既定 20000)、per-IP 上限 `max_conn_per_ip`、
-クラッシュループ遮断、slow-body/header タイムアウト。OS 層で必ず併用してください。
+slow-body/header タイムアウト。クラッシュからの再起動とクラッシュループ遮断は OS 層の役目です(Lite は
+自動再起動ロジックを持ちません)。OS 層で必ず併用してください。
 ```ini
 # systemd unit(抜粋)。詳細は docs/hardening.md
 [Service]

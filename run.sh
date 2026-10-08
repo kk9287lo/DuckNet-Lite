@@ -36,7 +36,10 @@ if [ -f "$ENV_FILE" ]; then
     key="${key%"${key##*[![:space:]]}"}"        # キー末尾の空白
     val="${val#"${val%%[![:space:]]*}"}"        # 値先頭の空白
     val="${val%"${val##*[![:space:]]}"}"        # 値末尾の空白
-    case "$key" in ''|*[!A-Za-z0-9_]*) continue ;; esac   # 不正キーは飛ばす
+    # 値を囲む引用符は外す(load_env_file と同じ規則)。ここで export した値が製品側の解釈に
+    # 勝つので、引用符ごと渡すと状態dirやトークンに引用符が混ざっていた。
+    case "$val" in \"*\"|\'*\') val="${val:1:${#val}-2}" ;; esac
+    case "$key" in ''|[0-9]*|*[!A-Za-z0-9_]*) continue ;; esac   # 不正キーは飛ばす(export 失敗=set -e で即死)
     [ -n "${!key+x}" ] && continue              # 呼び出し時の指定を優先
     export "$key=$val"
   done < "$ENV_FILE"

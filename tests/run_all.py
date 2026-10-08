@@ -38,6 +38,30 @@ def _force_utf8_stdio() -> None:
 
 _force_utf8_stdio()
 
+def _isolate_state_dir() -> str:
+    """テストが **利用者の本物の状態ディレクトリ**(~/.cache/dataplane)に一切触れないよう、
+    使い捨ての一時ディレクトリへ向ける。製品コードを import する *前* に行うこと。
+
+    以前はこれが無く、テストを回すたびに実際の DuckNet の BAN リスト・管理監査ログ・
+    使用量・ACL へ書き込んでいた(実測: 127.0.0.1 の BAN が実 blocklist.json へ入り、
+    実 admin_audit.jsonl にはテストの操作が 1449 行溜まっていた)。さらに、そこに残った
+    状態(acl.json の有効化)を次の実行が読み込み、テスト 3 件が決定的に落ちる、という
+    *自己汚染* にもなっていた。この機で製品を実際に使っている利用者ほど壊れる。
+    DUCKNET_KEEP_TEST_STATE=1 なら終了後も消さずに場所を表示する(調査用)。"""
+    import atexit
+    import shutil
+    import tempfile
+    d = tempfile.mkdtemp(prefix="ducknet-test-state-")
+    os.environ["DUCKNET_STATE_DIR"] = d
+    if os.environ.get("DUCKNET_KEEP_TEST_STATE") == "1":
+        atexit.register(lambda: print("test state kept at: " + d))
+    else:
+        atexit.register(shutil.rmtree, d, True)
+    return d
+
+
+_TEST_STATE_DIR = _isolate_state_dir()
+
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.dirname(_HERE)
 sys.path.insert(0, _ROOT)   # dataplane / dataplane.engine を import 可能に
@@ -91,6 +115,22 @@ MODULES = [
     "test_vulnfix",             # 脆弱性修正の回帰(CSRF/トークン配布/署名束縛)
     "test_complexity",          # 二次コスト(O(N^2))の再発防止(間引きの低水位・走査量削減の非回帰)
     "test_startup_seams",       # 起動部と繋ぎ目の潜在バグ(設定ミス耐性/起動診断/停止経路/fail-closed)
+    # 2026-10 細心のバグ総点検(95 候補)の回帰テスト。どれも修正を外すと落ちることを確認済み。
+    "test_sweep_admin_ui",      # 管理画面: inline JS へのデータ埋込/不正本文/CSRF のポート
+    "test_sweep_config",        # 設定検証: 構造キー・非有限値・設定変更とロック
+    "test_sweep_bans",          # BAN: 恒久BANの短縮/追い出し/IP 正規化/永続化の取りこぼし
+    "test_sweep_proxy_request", # 要求/応答: 重複ヘッダ/パイプライン/多重 gzip/1xx/DLP/リダイレクト
+    "test_sweep_proxy_lifecycle",  # 停止/ドレイン
+    "test_sweep_core",          # 自己防衛の基盤: 署名状態/原子的書込/ReDoS lint/ロケール
+    "test_sweep_ldap_edge",     # エッジ設定出力
+    "test_sweep_enterprise",    # 監視 URL の秘匿
+    "test_sweep_service_gui",   # サービス/トレイ/自動起動/起動スクリプト
+    "test_sweep_r2_ipsource",   # 取込時点の IP 正規化(XFF/接続元)・複数クレデンシャルのレート
+    "test_sweep_r2_misc",       # 非 ASCII トークン比較/使用量ログ/応答 JSON の非有限値/一時承認の既定
+    "test_sweep_r3_proxy",      # 使用量の宛先記録
+    "test_sweep_r3_net",        # IPv4-mapped の CIDR 照合
+    "test_sweep_followups",     # XFF のゾーンID/使用量の IPv6 Host/FW の IPv4-mapped
+    "test_sweep_r4_site_whitelist",  # 空の site_whitelist を whitelist モードにする設定を拒否
 ]
 
 

@@ -24,6 +24,7 @@ import hashlib
 import hmac
 import json
 import os
+import tempfile
 import time
 
 from .atomic_io import atomic_write_json, safe_read_json
@@ -82,36 +83,144 @@ def persistent_key(state_dir: str, env_var: str = "DUCKNET_STATE_KEY",
                    filename: str = ".statekey") -> bytes:
     """状態署名用の永続鍵。env_var があればそれを使う(最も安全=外部鍵)。無ければ
     state_dir/filename を 0600 で生成保存して再利用する(再起動を跨いで検証できるように)。
-    生成は os.O_CREAT|O_EXCL で原子的に行う(#111: 旧来の open→chmod は、作成〜権限設定の
-    間に他ユーザーから読める窓があった。O_EXCL は他プロセスとの初回生成競合も検出し、
-    その場合は相手が書いた鍵を読む)。Windows は os.chmod が実効的なACL制限にならない点に
-    注意(ファイル属性のみ)=真に外部から守るには env_var を使うこと。"""
+    生成は 0600 の一時ファイルに書き切ってから排他的に公開する(#111: 旧来の open→chmod は、
+    作成〜権限設定の間に他ユーザーから読める窓があった。排他作成は他プロセスとの初回生成
+    競合も検出し、その場合は相手が書いた鍵を読む。詳細は load_or_create_key)。
+    Windows は os.chmod が実効的なACL制限にならない点に注意(ファイル属性のみ)=真に外部から
+    守るには env_var を使うこと。"""
     env = os.environ.get(env_var, "")
     if env:
         return env.encode("utf-8")
-    key_path = os.path.join(state_dir, filename)
+    return load_or_create_key(os.path.join(state_dir, filename))
+
+
+# 0 バイトの鍵ファイルがこれより古ければ『他プロセスが作成直後で書込中』ではなく、旧版が
+# 作成〜書込の間でクラッシュ/ENOSPC した残骸とみなす。
+_EMPTY_KEY_STALE_SEC = 2.0
+
+
+def _write_all(fd: int, data: bytes) -> None:
+    view = memoryview(data)
+    while view:
+        n = os.write(fd, view)
+        if n <= 0:
+            raise OSError(28, "short write")      # ENOSPC 相当
+        view = view[n:]
+
+
+def _fsync_quiet(fd: int) -> None:
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+
+
+def _write_key_tmp(d: str, k: bytes) -> str:
+    """同じディレクトリの mkstemp(0600・O_EXCL・Windows は O_BINARY)へ鍵を全部書いて
+    fsync した一時ファイルのパスを返す。失敗したら一時ファイルは残さない。"""
+    fd, tmp = tempfile.mkstemp(prefix=".key.", dir=d)
+    try:
+        try:
+            _write_all(fd, k)
+            _fsync_quiet(fd)
+        finally:
+            os.close(fd)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    return tmp
+
+
+def _create_key_file(key_path: str, k: bytes) -> None:
+    """鍵ファイルを『全部書けた時だけ名前が現れる』形で新規作成する(既存なら FileExistsError)。
+    旧実装は O_CREAT|O_EXCL で名前を先に作ってから書いていたため、書込失敗(ENOSPC)や電源断で
+    0 バイトの鍵が残り、以後の起動は毎回『空=鍵なし→新しい一時鍵』に落ちて、前回署名した
+    状態がすべて改竄扱いで初期化され続けた。完成済みの一時ファイルを os.link で排他的に
+    公開する(リンクは既存名を上書きしない=初回生成の競合も従来どおり検出できる)。"""
+    d = os.path.dirname(key_path) or "."
+    tmp = _write_key_tmp(d, k)
+    try:
+        try:
+            os.link(tmp, key_path)
+            return
+        except FileExistsError:
+            raise
+        except (OSError, AttributeError, NotImplementedError):
+            pass                                  # ハードリンク非対応の FS(FAT 等)→ 下へ
+        fd = os.open(key_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY | _O_BIN, 0o600)
+        try:
+            try:
+                _write_all(fd, k)
+                _fsync_quiet(fd)
+            finally:
+                os.close(fd)
+        except BaseException:
+            try:
+                os.unlink(key_path)               # 空/半端な鍵を残さない(次回起動で作り直せる)
+            except OSError:
+                pass
+            raise
+    finally:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+
+def _replace_stale_empty_key(key_path: str, k: bytes) -> bool:
+    """旧版が残した 0 バイトの鍵ファイルを k で原子的に置き換える。作成直後(書込中かもしれない)
+    の空ファイルには触らない。置き換えたら True。"""
+    import stat as _stat
+    try:
+        st = os.lstat(key_path)
+        if not _stat.S_ISREG(st.st_mode) or st.st_size != 0:
+            return False
+        if abs(time.time() - st.st_mtime) < _EMPTY_KEY_STALE_SEC:
+            return False
+        tmp = _write_key_tmp(os.path.dirname(key_path) or ".", k)
+        try:
+            os.replace(tmp, key_path)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+        return True
+    except Exception:
+        return False
+
+
+def load_or_create_key(key_path: str) -> bytes:
+    """鍵ファイルを読む。無ければ 32 バイトの乱数鍵を生成して永続化する。永続化できなかった
+    場合は未永続化の鍵を返す(起動は止めない)。"""
     k0 = _read_key_file(key_path)             # symlink 非追従・通常ファイルのみ(#symlink-key)
     if k0:
         return k0
     import secrets as _s
     k = _s.token_bytes(32)
     try:
-        os.makedirs(state_dir, exist_ok=True)
-        fd = os.open(key_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY | _O_BIN, 0o600)
-        try:
-            os.write(fd, k)
-        finally:
-            os.close(fd)
+        os.makedirs(os.path.dirname(key_path) or ".", exist_ok=True)
+        _create_key_file(key_path, k)
     except FileExistsError:
-        # 他プロセスと初回生成が競合=相手の鍵を読む。O_EXCL 成功〜書き込み完了までの
-        # 短い窓に当たると空/未完了で読める可能性があるため、諦める前に数回リトライする
+        # 他プロセスと初回生成が競合=相手の鍵を読む。旧版のプロセスが O_EXCL 作成〜書込の
+        # 窓にいると空で読める可能性があるため、諦める前に数回リトライする
         # (ここで諦めて未永続化の自前鍵 k を返すと、次回起動時にディスクの鍵と食い違い、
         # 自分が署名した状態を自分で検証できなくなる)。
+        k2 = None
         for _attempt in range(5):
             k2 = _read_key_file(key_path)
             if k2:
                 return k2
             time.sleep(0.01 * (_attempt + 1))
+        # それでも空(自分所有の通常ファイルで 0 バイト)=旧版のクラッシュ残骸。置き換えて回復する。
+        if k2 == b"" and _replace_stale_empty_key(key_path, k):
+            k3 = _read_key_file(key_path)
+            if k3:
+                return k3
     except Exception:
         pass
     return k
@@ -127,8 +236,25 @@ def sign_payload(obj, key: bytes) -> str:
     return hmac.new(key, _canon(obj), hashlib.sha256).hexdigest()
 
 
+def _sig_eq(expected: str, sig) -> bool:
+    """署名(hex)の定数時間比較。hmac.compare_digest は非 ASCII の str で TypeError を投げる
+    ため、攻撃者が "_sig": "é" や非文字列を置くと『例外は投げない』はずの読込から例外が漏れ、
+    NetShield の起動や以後の保存が丸ごと落ちていた。正規の署名は常に ASCII の hex 文字列
+    なので、それ以外は比較せず不一致(=改竄)とする。"""
+    return isinstance(sig, str) and sig.isascii() and bool(sig) \
+        and hmac.compare_digest(expected, sig)
+
+
+def _int_or(v, default: int = 0) -> int:
+    """int() 変換。JSON の Infinity/NaN(OverflowError/ValueError)や型違いは default。"""
+    try:
+        return int(v)
+    except (TypeError, ValueError, OverflowError):
+        return default
+
+
 def verify_payload(obj, sig: str, key: bytes) -> bool:
-    return bool(sig) and hmac.compare_digest(sign_payload(obj, key), str(sig))
+    return _sig_eq(sign_payload(obj, key), sig)
 
 
 def _hw_path(path: str) -> str:
@@ -146,20 +272,20 @@ def _read_file_hw(path: str, key: bytes) -> int:
     raw = safe_read_json(_hw_path(path), None)
     if isinstance(raw, dict) and verify_payload(_hw_payload(path, raw.get("_ver", 0)),
                                                 raw.get("_sig", ""), key):
-        try:
-            return int(raw.get("_ver", 0))
-        except (TypeError, ValueError):
-            return 0
+        return _int_or(raw.get("_ver", 0))
     return 0
+
+
+def has_signed_history(path: str, key: bytes) -> bool:
+    """path を *この鍵で署名して保存した実績* があるか(正しく署名されたサイドカー .hw が残って
+    いるか)。本体が『欠損』や『無署名』で読めたのに実績がある=削除/平文すり替えの疑い。
+    初回起動や署名導入前のレガシー移行では .hw が無いので False(誤警報を出さない)。"""
+    return _read_file_hw(path, key) > 0
 
 
 def _hw_payload(path: str, ver) -> dict:
     """.hw の署名対象。basename で束縛して別 state への移植を無効化する。"""
-    try:
-        ver = int(ver)
-    except (TypeError, ValueError):
-        ver = 0
-    return {"_hw": 1, "_ver": ver, "_for": os.path.basename(path)}
+    return {"_hw": 1, "_ver": _int_or(ver), "_for": os.path.basename(path)}
 
 
 def _write_file_hw(path: str, ver: int, key: bytes) -> None:
@@ -175,14 +301,11 @@ def _next_version(path: str, prev_hint: int = 0) -> int:
     prev_hint>0(=このプロセスが既に書いた版)を渡せばディスクを読まない: 旧実装は保存の
     たびに対象ファイルを全文読み直して JSON 解析しており、状態が育つほど 1 保存あたりの
     固定費が増えていた(実測 3.2MB で 21.9ms/保存)。初回だけディスクから拾えば十分。"""
-    prev = int(prev_hint or 0)
+    prev = _int_or(prev_hint or 0)
     if prev <= 0:
         raw = safe_read_json(path, None)
         if isinstance(raw, dict):
-            try:
-                prev = int(raw.get("_ver", 0))
-            except (TypeError, ValueError):
-                prev = 0
+            prev = _int_or(raw.get("_ver", 0))     # Infinity 等で保存が永久に落ちないように
     return max(prev + 1, int(time.time() * 1000))
 
 
@@ -215,8 +338,8 @@ def read_signed_json(path: str, key: bytes, default=None, *, check_rollback: boo
     if isinstance(raw, dict) and "_sig" in raw and "_payload" in raw:
         try:
             _sv = int(raw.get("_sv", 1) or 1)
-        except (TypeError, ValueError):
-            return ("tampered", default)     # _sv が非数値=エンベロープ破損→フェイルセーフ(#111)
+        except (TypeError, ValueError, OverflowError):
+            return ("tampered", default)     # _sv が非数値/Infinity=エンベロープ破損→フェイルセーフ(#111)
         if _sv >= 3:
             # purpose 束縛版(#3): basename が一致し、かつ {_ver,_purpose,_payload} の署名が正しいこと。
             purpose = os.path.basename(path)
@@ -226,10 +349,7 @@ def read_signed_json(path: str, key: bytes, default=None, *, check_rollback: boo
             if not verify_payload({"_ver": ver, "_purpose": purpose,
                                    "_payload": raw["_payload"]}, raw["_sig"], key):
                 return ("tampered", default)     # 署名不一致(ver/purpose/payload 改竄)
-            try:
-                v = int(ver)
-            except (TypeError, ValueError):
-                v = 0
+            v = _int_or(ver)
             if check_rollback:
                 hw = max(_read_file_hw(path, key), _MEM_HW.get(path, 0))
                 if v < hw:
@@ -242,10 +362,7 @@ def read_signed_json(path: str, key: bytes, default=None, *, check_rollback: boo
             if not verify_payload({"_ver": ver, "_payload": raw["_payload"]},
                                   raw["_sig"], key):
                 return ("tampered", default)     # 署名不一致(ver/payload 改竄)
-            try:
-                v = int(ver)
-            except (TypeError, ValueError):
-                v = 0
+            v = _int_or(ver)
             if check_rollback:
                 hw = max(_read_file_hw(path, key), _MEM_HW.get(path, 0))
                 if v < hw:

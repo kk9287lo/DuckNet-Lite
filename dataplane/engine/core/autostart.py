@@ -37,12 +37,47 @@ def build_command(args) -> list:
     return cmd
 
 
+def package_root() -> str:
+    """dataplane パッケージの親ディレクトリ(ソースツリー配置ならリポジトリ直下=app.env の場所)。"""
+    here = os.path.abspath(__file__)                   # …/dataplane/engine/core/autostart.py
+    for _ in range(4):
+        here = os.path.dirname(here)
+    return here
+
+
+def windows_command(command, workdir: str = "") -> list:
+    """Windows 用に `python -m dataplane …` を作業ディレクトリ非依存の形へ置き換える。
+    タスクスケジューラ(/tr)と Run キーは『開始位置』を持たず %windir%\\System32 で起動するため、
+    pip install 不要のソースツリー配置では `-m dataplane` が import できず即死していた
+    (登録自体は ok:true)。起動直後に配置先へ chdir してから同じモジュールを実行する
+    (app.env も CWD で見つかる)。"""
+    cmd = [str(a) for a in command]
+    if len(cmd) >= 3 and cmd[1] == "-m" and cmd[2] == "dataplane":
+        boot = ("import os,runpy;os.chdir(%r);runpy.run_module('dataplane',run_name='__main__')"
+                % (workdir or package_root()))
+        cmd = [cmd[0], "-c", boot] + cmd[3:]
+    return cmd
+
+
 def _quote(cmd) -> str:
-    """argv を1本のコマンド文字列へ(空白を含む要素は二重引用符で囲う)。"""
+    """argv を1本のコマンド行へ(Windows: CreateProcess / CommandLineToArgvW の規則)。
+    以前は空白を含む要素を "" で囲むだけで、空の要素は消え、埋め込みの " は落ち、
+    `C:\\x y\\` の末尾 \\ が閉じ引用符を壊して後続の引数まで飲み込んでいた。"""
+    import subprocess
+    return subprocess.list2cmdline([str(a) for a in cmd])
+
+
+def _quote_systemd(cmd) -> str:
+    """systemd の ExecStart= 用のコマンド行。C 風エスケープ(\\ と ")を施し、必要なら "" で囲む。
+    % は指定子、$ は環境変数として展開されるので %% / $$ にする。空の要素も "" で残す。"""
     out = []
     for a in cmd:
         a = str(a)
-        out.append(f'"{a}"' if (" " in a or "\t" in a) else a)
+        e = (a.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+             .replace("%", "%%").replace("$", "$$"))
+        if not a or any(ch in a for ch in " \t\n\"'\\;"):
+            e = f'"{e}"'
+        out.append(e)
     return " ".join(out)
 
 
@@ -63,7 +98,7 @@ def install_windows_task(name, command, *, trigger="onlogon", run=None) -> dict:
     """タスクスケジューラへ登録(明示名=Task Scheduler で可視)。run は subprocess.run を注入可能。"""
     import subprocess
     run = run or subprocess.run
-    args = schtasks_create_args(name, _quote(command), trigger)
+    args = schtasks_create_args(name, _quote(windows_command(command)), trigger)
     try:
         r = run(args, capture_output=True, stdin=subprocess.DEVNULL, timeout=30, text=True)
         return {"ok": getattr(r, "returncode", 1) == 0, "method": "schtasks",
@@ -97,7 +132,7 @@ def install_windows_runkey(name, command, *, winreg_mod=None) -> dict:
     try:
         key = wr.CreateKey(wr.HKEY_CURRENT_USER, _RUNKEY_SUBPATH)
         try:
-            wr.SetValueEx(key, name, 0, wr.REG_SZ, _quote(command))
+            wr.SetValueEx(key, name, 0, wr.REG_SZ, _quote(windows_command(command)))
         finally:
             wr.CloseKey(key)
         return {"ok": True, "method": "runkey",
@@ -113,7 +148,7 @@ def systemd_unit_text(command, *, user: str = "ducknet",
     """systemd unit を生成する。生成物には環境の受け渡しが無く、app.env に置いた設定が
     systemd 経由の起動でだけ効かなかった(手動起動や run.sh とは挙動が食い違う)。
     作業ディレクトリと EnvironmentFile を明示する(ファイルが無ければ '-' で無視される)。"""
-    exec_start = _quote(command)
+    exec_start = _quote_systemd(command)
     workdir = workdir or os.getcwd()
     return (
         "[Unit]\n"
@@ -129,14 +164,21 @@ def systemd_unit_text(command, *, user: str = "ducknet",
         "[Install]\nWantedBy=multi-user.target\n")
 
 
-def launchd_plist_text(label, command) -> str:
-    args = "".join(f"    <string>{a}</string>\n" for a in command)
+def launchd_plist_text(label, command, *, workdir: str = "") -> str:
+    """launchd plist を生成する。値は XML エスケープする(以前は & や < を含む引数で不正な XML に
+    なり launchctl load が失敗した)。WorkingDirectory を明示しないと launchd は / で起動し、
+    ソースツリー配置の `-m dataplane` が import できない。"""
+    def _x(s):   # xml.sax.saxutils は import 時に urllib.request を引き込む(プラットフォーム依存)ので自前で
+        return str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    args = "".join(f"    <string>{_x(a)}</string>\n" for a in command)
+    wd = workdir or package_root()
     return (
         '<?xml version="1.0" encoding="UTF-8"?>\n'
         '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" '
         '"http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
         '<plist version="1.0"><dict>\n'
-        f"  <key>Label</key><string>{label}</string>\n"
+        f"  <key>Label</key><string>{_x(str(label))}</string>\n"
+        f"  <key>WorkingDirectory</key><string>{_x(wd)}</string>\n"
         "  <key>ProgramArguments</key>\n  <array>\n" + args + "  </array>\n"
         "  <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>\n"
         "  <key>RunAtLoad</key><true/>\n"

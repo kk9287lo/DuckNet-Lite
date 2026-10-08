@@ -40,6 +40,19 @@ _DEFAULT_POLICY = {"loopback": "allow", "private": "prompt",
 _LOG_MAX = 2000
 
 
+def _unmap_v4(ip: str) -> str:
+    """dual-stack 待受で届く IPv4-mapped(::ffff:a.b.c.d)を純 IPv4 に戻す。それ以外は不変。
+    戻さないと _match_rule は版(v4/v6)違いの IPv4 ルールを照合せず deny を素通りし、ゾーン判定
+    (loopback/private)も外れていた。呼び出し側の正規化に頼らず判定の入口で揃える。"""
+    if not ip or ":" not in ip:
+        return ip                                   # 純 IPv4/空は即返し(接続ごとの固定費ゼロ)
+    try:
+        m = ipaddress.ip_address(ip).ipv4_mapped
+    except ValueError:
+        return ip
+    return str(m) if m is not None else ip
+
+
 def _zone_of(ip: str) -> str:
     c = classify_ip(ip)
     if not c.get("ok"):
@@ -189,6 +202,7 @@ class AppFirewall:
 
     # ── 判定(サーバ等が接続受理前に呼ぶ) ──────────────────────────
     def evaluate(self, ip: str, port: int = None, meta: dict = None) -> dict:
+        ip = _unmap_v4(ip)
         zone = _zone_of(ip)
         if not self.enabled:
             return self._record(ip, port, zone, "allow",
@@ -241,10 +255,13 @@ class AppFirewall:
         with self._lock:
             return list(self._pending.values())
 
-    def approve(self, pid: str, remember: bool = True) -> dict:
+    # remember の既定は False=この接続だけの一時許可/拒否(#111: 1 回の操作で恒久ルールを黙って
+    # acl.json へ書かない)。旧既定 True では remember を渡し忘れた呼び出しが /32 の恒久 allow/deny を
+    # 積み得た。恒久化は remember=True の明示のみ。
+    def approve(self, pid: str, remember: bool = False) -> dict:
         return self._resolve(pid, "allow", remember)
 
-    def deny_pending(self, pid: str, remember: bool = True) -> dict:
+    def deny_pending(self, pid: str, remember: bool = False) -> dict:
         return self._resolve(pid, "deny", remember)
 
     def _resolve(self, pid: str, action: str, remember: bool) -> dict:

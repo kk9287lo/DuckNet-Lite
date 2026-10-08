@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
   DuckNet L7 Security 起動ランチャ (Windows / PowerShell 5+ ・ pwsh)
 .DESCRIPTION
@@ -26,15 +26,22 @@ function Die([string] $msg) { [Console]::Error.WriteLine("DuckNet: $msg"); exit 
 # 1) 任意の設定ファイル(KEY=VALUE / # はコメント)
 $envFile = if ($env:DUCKNET_ENV_FILE) { $env:DUCKNET_ENV_FILE } else { Join-Path $self 'app.env' }
 if (Test-Path -LiteralPath $envFile) {
-  foreach ($line in Get-Content -LiteralPath $envFile) {
+  # app.env は UTF-8。5.1 の Get-Content は既定で ANSI(日本語版は cp932)として読み、非 ASCII が化ける。
+  foreach ($line in Get-Content -LiteralPath $envFile -Encoding UTF8) {
     $t = $line.Trim()
     if ($t -and -not $t.StartsWith('#') -and $t.Contains('=')) {
       $k, $v = $t -split '=', 2
       $k = $k.Trim()
+      $v = $v.Trim()
+      # 値を囲む引用符は外す(load_env_file と同じ規則)。ここで先に環境へ入れた値が製品側の
+      # 解釈に勝つので、引用符ごと渡すと状態dirやトークンに引用符が混ざっていた。
+      if ($v.Length -ge 2 -and $v[0] -eq $v[$v.Length - 1] -and ($v[0] -eq [char]34 -or $v[0] -eq [char]39)) {
+        $v = $v.Substring(1, $v.Length - 2)
+      }
       # 呼び出し時の指定を優先(ファイルは既定値)。旧実装は無条件に上書きしていた。
       if ($k -match '^[A-Za-z_][A-Za-z0-9_]*$' -and
           -not (Test-Path -LiteralPath ("env:" + $k))) {
-        Set-Item -Path ("env:" + $k) -Value $v.Trim()
+        Set-Item -Path ("env:" + $k) -Value $v
       }
     }
   }

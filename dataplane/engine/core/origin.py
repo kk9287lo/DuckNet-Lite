@@ -34,9 +34,13 @@ def origin_token(key, now: float = None, window: float = 30.0) -> str:
 def verify_origin_token(token: str, key, now: float = None,
                         window: float = 30.0, skew: int = 1) -> bool:
     """トークンを検証する(バックエンドが呼ぶ)。現在バケット ± skew を許容して時計ずれを吸収。
-    定数時間比較。token 空/不正は False。"""
+    定数時間比較。token 空/不正は False。生ヘッダの bytes(ASGI 等)も受ける。"""
+    if isinstance(token, (bytes, bytearray)):
+        token = bytes(token).decode("latin-1")   # str(b"..") は "b'..'" になり常に不一致だった
     tok = str(token or "")
-    if not tok:
+    # hmac.compare_digest は非 ASCII の str で TypeError を投げる。ヘッダ値は latin-1 復号なので
+    # é 等が来得る=拒否ではなく例外になっていた。正規のトークンは常に ASCII hex=それ以外は不一致。
+    if not tok or not tok.isascii():
         return False
     now = time.time() if now is None else now
     win = max(1.0, float(window))

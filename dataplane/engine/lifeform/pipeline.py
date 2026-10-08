@@ -36,6 +36,7 @@ import heapq
 import hmac
 import ipaddress
 import json
+import math
 import os
 import re
 import secrets
@@ -381,7 +382,57 @@ def _subnet_key(ip: str):
         return str(ipaddress.ip_network(f"{ip}/{24 if ver == 4 else 64}", strict=False))
     except Exception:
         return None
+
+
+@functools.lru_cache(maxsize=4096)
+def _canon_ip_str(s: str) -> str:
+    try:
+        a = ipaddress.ip_address(s)
+    except ValueError:
+        return ""
+    if a.version == 6:
+        if a.scope_id:                    # ゾーンID付き(fe80::1%eth0)は peer と一致し得ない
+            return ""
+        if a.ipv4_mapped:                 # ::ffff:192.0.2.1 は proxy 同様に純IPv4へ
+            return str(a.ipv4_mapped)
+    return str(a)
+
+
+def _canon_ip(ip) -> str:
+    """単一IPを照合用の正規形へ(前後空白除去・小文字/圧縮表記・IPv4-mapped は純IPv4)。
+    単一IPでない(CIDR/ゾーンID付き/不正/非文字列)なら ""。peer IP は正規形で届くため、
+    BAN の鍵や白/黒リストを生文字列で比べると '2001:DB8::1' 等の別表記が一致しなかった(#25/#45)。"""
+    return _canon_ip_str(ip.strip()) if isinstance(ip, str) else ""
+
+
+@functools.lru_cache(maxsize=16)
+def _compile_ip_list(entries: tuple):
+    """IP 白/黒リスト -> (正規形の単一IP集合, CIDR ネット列)。設定は滅多に変わらないので
+    タプルをキーにキャッシュし、リクエストごとの全件パースを避ける。"""
+    singles, nets = set(), []
+    for e in entries:
+        e = str(e).strip()
+        if "/" in e:
+            net = _cidr_net(e)
+            if net is not None:
+                nets.append(net)
+        else:
+            c = _canon_ip(e)
+            if c:
+                singles.add(c)
+    return frozenset(singles), tuple(nets)
 _CRED_RATE_CAP = 50000   # クレデンシャル単位レート集計マップの上限(#70・メモリ有界)
+_CRED_IDS_MAX = 4        # 1 要求で計上するクレデンシャル識別子の上限(proxy は Bearer/X-API-Key の 2 つ)
+
+
+def _cred_ids(cred) -> tuple:
+    """inspect(cred=...) を計上対象の識別子タプルへ。単一 str(従来の呼び出し)か str の列を受け、
+    空・非文字列・重複(Bearer と X-API-Key に同じ値)を除く。重複を除かないと 1 要求で 2 回数える。"""
+    if isinstance(cred, str):
+        return (cred,) if cred else ()
+    if not isinstance(cred, (list, tuple, set, frozenset)):
+        return ()
+    return tuple(dict.fromkeys(c for c in cred if isinstance(c, str) and c))[:_CRED_IDS_MAX]
 # 重複(挙動同値)検知用の小コーパス(攻撃片+良性)。新旧パターンの一致集合を比較する。
 _DEDUP_CORPUS = [
     "", "/api/health", "/index.html", "page=2&sort=name", "hello world",
@@ -415,7 +466,10 @@ def _open_state_write(path: str, mode: str):
     flags = os.O_WRONLY | os.O_CREAT | _O_NOFOLLOW
     flags |= os.O_APPEND if mode == "a" else os.O_TRUNC
     fd = os.open(path, flags, 0o600)
-    return os.fdopen(fd, mode, encoding="utf-8")
+    # backslashreplace: 厳格な UTF-8 だと host/path の孤立サロゲート('\udc80' 等)1 文字で
+    # UnicodeEncodeError になり、その行(=その接続の記録)が黙って捨てられていた。書くのは
+    # json.dumps の行なので \udXXX 表記は JSON の正しいエスケープ=読み戻すと同じ値(atomic_io と同じ)。
+    return os.fdopen(fd, mode, encoding="utf-8", errors="backslashreplace")
 _MAX_SCAN_FIELDS = 96       # 独立走査するフィールド数の上限(path?query+UA + Host + 各ヘッダ値
                             # (最大64個別+結合末尾)・CPU有界)。_scan_header_values の 64+1 と
                             # Host/primary を全て走査面に収めるため 64→96(head は 16KB 上限ゆえ
@@ -896,6 +950,101 @@ def _xss_event_handler_suspect(blob: str) -> bool:
     return _XSS_HANDLER_RE.search(blob) is not None
 
 
+# ── 設定値の検証(set_config / _load / 専用セッターが共有する唯一の入口) ──
+_SIG_WEIGHT_MAX = 1000.0   # カスタムシグネチャ weight の上限(組込は 30〜65)
+# cred_rate_limit / resp_error_threshold の上限。窓内の件数は時刻の deque の長さで数えるので、
+# deque が閾値ぶんの長さを持てないと永久に発火しない(旧: 8192/1024 固定で黙って無効だった)。
+_RATE_COUNT_MAX = 1 << 20
+_RATE_COUNT_KEYS = frozenset({"cred_rate_limit", "resp_error_threshold"})
+
+
+def _finite_number(v) -> bool:
+    """有限の実数か。NaN/±inf と、float に直せない巨大 int(JSON で書ける)を弾く。
+    NaN は比較が常に偽になり閾値判定を黙って無効化し、巨大 int は float() で例外になる。"""
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        return False
+    try:
+        return math.isfinite(float(v))
+    except OverflowError:
+        return False
+
+
+def _sig_weight(w):
+    """カスタムシグネチャ weight を検証して float で返す(不正は None)。NaN はスコアを永久に
+    NaN にし(閾値比較が常に偽=その IP は BAN されない)、負値は他の検知の加点を打ち消す。"""
+    if isinstance(w, bool):
+        return None
+    try:
+        w = float(w)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return w if math.isfinite(w) and 0 <= w <= _SIG_WEIGHT_MAX else None
+
+
+def _norm_path_limits(rules, default_rate: float):
+    """パス別レート制限ルールを正規化したリストを返す。受理できない入力は None
+    (配列以外、または非空なのに有効ルールが 0 件=入力ミス。既存ルールを黙って消さない)。"""
+    if not isinstance(rules, (list, tuple)):
+        return None
+    norm = []
+    for r in rules:
+        if not isinstance(r, dict):
+            continue
+        p = str(r.get("path", "")).strip()
+        if not p:
+            continue
+        try:
+            rate = float(r.get("rate", default_rate))
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if not math.isfinite(rate) or rate <= 0:     # NaN/inf はバケツが空にならない
+            continue
+        try:
+            burst = float(r.get("burst", rate))
+        except (TypeError, ValueError, OverflowError):
+            burst = rate
+        if not math.isfinite(burst):
+            burst = rate
+        norm.append({"path": p, "rate": rate, "burst": max(1.0, burst)})
+        if len(norm) >= _PATH_LIMIT_MAX:
+            break
+    if rules and not norm:
+        return None
+    return norm
+
+
+def _norm_blocked_methods(methods):
+    """遮断メソッドを正規化して (norm, rejected) を返す。英字のみ・大文字化・重複除去。
+    "TRACE,CONNECT" のような文字列は分解して受理し、それ以外の型は None。"""
+    if isinstance(methods, str):
+        methods = [m for m in methods.replace(",", " ").split() if m]
+    elif not isinstance(methods, (list, tuple)):
+        return None
+    norm, rejected = [], []
+    for m in methods:
+        m = str(m).strip().upper()
+        if m and m.isalpha() and len(m) <= 16 and m not in norm:
+            norm.append(m)
+        elif m:
+            rejected.append(m[:16])
+    return norm, rejected
+
+
+# site_mode="whitelist" の許可リスト(#85 r4)。_site_block は空の許可リストを評価しない=*全 Host
+# 許可*(fail-open。ip/geo の許可リストは空=全遮断)。設定の入口では結果がこの組になる変更を拒否し、
+# 旧版が保存した state だけは締め出さないよう従来どおり読み込んで status の warnings で知らせる。
+_SITE_KEYS = ("site_mode", "site_whitelist")
+_SITE_WL_EMPTY_CODE = "site_whitelist_empty"
+_SITE_WL_EMPTY_ERR = ("site_mode=whitelist には site_whitelist が 1 件以上必要です"
+                      "(空の許可リストは全 Host を許可してしまうため、この変更は適用していません)")
+
+
+def _site_wl_empty(wl) -> bool:
+    """許可リストが実質空か(_domain_match と同じ正規化で、照合に使える項目が 1 件も無い)。
+    空白だけ/"." だけの項目も空とみなす(どの Host にも一致しない=設定ミス)。"""
+    return not any(str(p).lower().strip().rstrip(".") for p in (wl or ()))
+
+
 # ── 出口DLP(evolution #6): 応答に混入した *秘密情報の漏洩* を検出 ──
 # 入口の侵入検知だけでなく、バックエンドが誤って鍵/トークン/カード番号を返していないかを
 # 出口で見張る。高確度の接頭辞を持つ資格情報のみ対象=低誤検知。クレカは Luhn 検証で絞る。
@@ -986,6 +1135,7 @@ class NetShield:
         self._subnet_hot_ts = 0.0
         self._bloom_dirty = False       # 間引きで未反映の解除が残っているか
         self._bans_dirty = False        # 間引きで未書込の変更が残っているか
+        self._bans_flush_timer = None   # 間引いた BAN 保存を後で書く一発タイマー(#48・高々1本)
         # ネットワーク使用量リスト(誰が/どのサイトと/どれだけ)+ 見返せるログ
         self._usage_path = os.path.join(base, "usage.json")
         self._usage_log_path = os.path.join(base, "usage_log.jsonl")
@@ -1029,6 +1179,10 @@ class NetShield:
             self._traffic, self._usage = {}, {}
         self._mark_state_signed()                     # 以降、無署名出現は改竄として弾く
         self._refresh_cfg_mac()                       # #85: 起動時 cfg の整合基準を確定
+        # 保存済みの要注意設定(旧版が保存し得た site_mode=whitelist + 空リスト等)は挙動を変えずに
+        # 読み込み、起動時に 1 回だけ system イベントで知らせる(以後は status の warnings・#85 r4)。
+        for w in self.config_warnings():
+            self._event("system", w["code"], {"note": w["message"]})
 
     # ── 永続化 ───────────────────────────────────────────────────
     def _read_state(self, path: str, default, what: str):
@@ -1036,20 +1190,32 @@ class NetShield:
         フェイルセーフし system イベントで警報。無署名(旧来)は生値を使いつつ migrate=True を返し、
         呼び出し側が再保存で署名済みへ移行する。攻撃者が書き換えた状態を *信頼しない* のが要点。"""
         status, val = read_signed_json(path, self._state_key, default)
+        seen = status
+        if status in ("missing", "unsigned"):
+            # 署名運用後の無署名出現=平文すり替えの疑い→改竄扱い(#53)。加えて #44: マーカー
+            # (.state_signed)も状態ファイルも同じ書込可能ディレクトリにあり、消すだけで『初回起動/
+            # レガシー移行』に見せかけられた(BAN 全消し・平文 cfg の受理が警報ゼロ)。この鍵で署名
+            # 保存した実績(署名付きサイドカー .hw)が残っているのに欠損/無署名なら改竄とみなす。
+            # 初回起動・署名導入前の移行には .hw が無いので従来どおり(誤警報なし)。正直な残余:
+            # .hw まで含めて全部消されると初回起動と区別できない(外部の単調カウンタが要る)。
+            from ..core.signed_state import has_signed_history
+            if ((status == "unsigned" and self._state_signed_before)
+                    or has_signed_history(path, self._state_key)):
+                status, val = "tampered", default
         # 署名は「改竄されていない」ことしか保証しない。正しく署名された壊れた JSON や
         # 無署名の旧形式が配列/文字列/None でも呼び出し側は mapping 前提で .get() する。
         # 期待した形でなければ安全側の default に倒す(呼び出し側を全部守る)。
         if val is not None and not isinstance(val, type(default)):
             return default, False
-        if status == "unsigned" and self._state_signed_before:
-            status = "tampered"      # 署名運用後の無署名出現=平文すり替えの疑い→改竄扱い
         if status in ("tampered", "rolled_back"):
             # rolled_back = 古い正署名ファイルへの巻き戻し(#102)。署名は正しいが版が後退=拒否。
             reason = ("rollback(古い正署名への巻き戻し)" if status == "rolled_back"
                       else "fail-safe(default)")
+            extra = {"file": os.path.basename(path), "status": status}
+            if seen != status:
+                extra["seen"] = seen          # missing=削除 / unsigned=平文すり替え
             try:
-                self.report_tamper("state_tamper", what, reason,
-                                   {"file": os.path.basename(path), "status": status})
+                self.report_tamper("state_tamper", what, reason, extra)
             except Exception:
                 pass
             return default, False
@@ -1071,7 +1237,10 @@ class NetShield:
         d, migrate = self._read_state(self.path, {}, "config")
         d = d or {}
         for k, v in (d.get("cfg") or {}).items():
-            if k in self.cfg and isinstance(v, type(self.cfg[k])):
+            # 署名が正しくても値が壊れている場合がある(旧版の set_config は構造/NaN を素通しで
+            # 保存していた)。API と同じ検証を通し、壊れた保存値で起動直後から全断させない。
+            ok, v = self._coerce_cfg(k, v, strict=False) if k in self.cfg else (False, None)
+            if ok:
                 self.cfg[k] = v
         # BANは安全側で揮発(再起動でリセット)・設定のみ永続
         if migrate:                               # 旧来の無署名→署名済みへ移行
@@ -1119,10 +1288,13 @@ class NetShield:
         d = d or {}
         # pattern が文字列であることも長さも見ずに再コンパイルへ渡していた。数値や巨大な
         # 文字列が入っていると _compile_custom で例外/過大コストになる。入口で弾く。
+        # weight も同様: 旧版は NaN/負値を保存できた(スコアが永久に NaN=BAN 不能、かつ一覧 API が
+        # NaN を返して管理画面から消せない)。不正な weight の規則は読み込まない。
         self._custom = [s for s in (d.get("signatures") or [])
                         if isinstance(s, dict)
                         and isinstance(s.get("pattern"), str)
-                        and 0 < len(s["pattern"]) <= 2000]
+                        and 0 < len(s["pattern"]) <= 2000
+                        and _sig_weight(s.get("weight", 40)) is not None]
         self._compile_custom()
         if migrate:
             self._save_sigs()
@@ -1141,15 +1313,15 @@ class NetShield:
         for s in self._custom:
             if not s.get("enabled", True):
                 continue
-            if self.validate_pattern(s.get("pattern", "")):     # 危険(ReDoS等)/不正は載せない
+            w = _sig_weight(s.get("weight", 40))
+            if self.validate_pattern(s.get("pattern", "")) or w is None:  # 危険(ReDoS等)/不正は載せない
                 blocked += 1
                 continue
             try:
                 rgx = re.compile(s["pattern"])
             except re.error:
                 continue
-            out.append((s["name"], s.get("category", "custom"), rgx,
-                        float(s.get("weight", 40))))
+            out.append((s["name"], s.get("category", "custom"), rgx, w))
         self._custom_re = out
         self._custom_blocked = blocked
 
@@ -1195,6 +1367,9 @@ class NetShield:
         すること=多層防御(#111)。"""
         if not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", name or ""):
             return {"ok": False, "error": "name は英数・._- のみ、1〜64文字"}
+        w = _sig_weight(weight)
+        if w is None:
+            return {"ok": False, "error": f"weight は 0〜{_SIG_WEIGHT_MAX:g} の有限の数値"}
         err = self.validate_pattern(pattern)
         if err:
             return {"ok": False, "error": err}
@@ -1203,7 +1378,7 @@ class NetShield:
         with self._lock:
             self._custom = [s for s in self._custom if s.get("name") != name]
             self._custom.append({"name": name, "category": category,
-                                 "pattern": pattern, "weight": float(weight),
+                                 "pattern": pattern, "weight": w,
                                  "enabled": True, "source": source})
             self._save_sigs()
             self._compile_custom()
@@ -1272,48 +1447,134 @@ class NetShield:
         return {"ok": True, "enabled": True}
 
     def disable(self) -> dict:
-        self.cfg["enabled"] = False; self._save(); return {"ok": True, "enabled": False}
+        # 書換と _save(MAC 更新)の間を整合チェック(verify_cfg_integrity・定期チェックループ)に
+        # 覗かれると「改竄」と誤認されて enabled=True へ巻き戻され、偽の memory_tamper まで出る。
+        with self._lock:
+            self.cfg["enabled"] = False
+            self._save()
+        return {"ok": True, "enabled": False}
+
+    def _coerce_cfg(self, k: str, v, strict: bool = True):
+        """設定 1 キーの値を検証・正規化して (受理可否, 値) を返す。管理 API(/api/shield/config)・
+        宣言的設定(apply_config)・保存済み state の読込(_load)は *すべて* ここを通る
+        (入口ごとに検証が違うと、緩い入口から壊れた値が入って inspect() が毎回例外=全断になる)。
+        構造キーは専用セッターと同じ正規化関数に回し、数値は有限値のみ受理する(NaN/inf は
+        レート制限を黙って無効化し、管理画面の JSON も壊す)。strict=False(_load)はリストの
+        不正要素だけ捨てて残りを生かす。"""
+        if k not in _DEFAULTS or v is None:
+            return False, None
+        dflt = _DEFAULTS[k]
+        if k == "path_limits":
+            n = _norm_path_limits(v, float(self.cfg.get("rate_per_sec", 20.0)))
+            return n is not None, n
+        if k == "blocked_methods":
+            n = _norm_blocked_methods(v)
+            return n is not None, (n[0] if n is not None else None)
+        if isinstance(dflt, bool):          # bool は int の部分型。数値枠と相互に入らないよう先に判定
+            return isinstance(v, bool), v
+        if isinstance(dflt, (int, float)):
+            if not _finite_number(v) or (isinstance(dflt, int) and not isinstance(v, int)):
+                return False, None
+            v = float(v) if isinstance(dflt, float) else v   # int→float は許容(GB/秒/日数)
+            if k == "paranoia":
+                v = max(1, min(4, v))                         # set_paranoia と同じ範囲
+            elif k in _RATE_COUNT_KEYS and v > _RATE_COUNT_MAX:
+                return False, None
+            return True, v
+        if isinstance(dflt, str):
+            return isinstance(v, str), v
+        if isinstance(dflt, list):          # path_limits 以外のリストは文字列の配列
+            if not isinstance(v, list):
+                return False, None
+            good = [e for e in v if isinstance(e, str)]
+            return (len(good) == len(v) or not strict), good
+        if isinstance(dflt, dict):          # optional_sigs / sec_headers_extra: 文字列キー→スカラー
+            if not isinstance(v, dict):
+                return False, None
+            good = {a: b for a, b in v.items() if isinstance(a, str)
+                    and (isinstance(b, (str, bool)) or _finite_number(b))}
+            return (len(good) == len(v) or not strict), good
+        return False, None
 
     def set_config(self, **kw) -> dict:
-        changed = {}
+        changed, rejected, new = {}, [], {}
         with self._lock:
+            old_paranoia = self.cfg.get("paranoia")
             for k, v in kw.items():
                 if k not in self.cfg or v is None:
                     continue
-                exp = type(self.cfg[k])
-                if exp is float and isinstance(v, int) and not isinstance(v, bool):
-                    v = float(v)                # int→float を許容(GB/秒/日数を int で渡せる)
-                if isinstance(v, bool) is not isinstance(self.cfg[k], bool):
-                    continue      # bool は int の部分型。true/false が数値枠へ入るのを防ぐ
-                if isinstance(v, exp):
-                    self.cfg[k] = v; changed[k] = v
+                ok, v = self._coerce_cfg(k, v)
+                if not ok:
+                    rejected.append(k)      # 型/範囲/要素が不正=現状を保つ(黙って壊さない)
+                    continue
+                new[k] = v
+            # 結果が site_mode=whitelist + 空の site_whitelist(全 Host 許可=fail-open)になる変更は、
+            # 同じ呼び出しの他キーも含めて丸ごと拒否する(#85 r4・何も適用しない)。site 系に触れない
+            # 変更は、旧版が保存した同じ組(互換で維持)に巻き込まない。
+            if (any(k in new for k in _SITE_KEYS)
+                    and new.get("site_mode", self.cfg.get("site_mode")) == "whitelist"
+                    and _site_wl_empty(new.get("site_whitelist", self.cfg.get("site_whitelist")))):
+                return {"ok": False, "changed": {}, "cfg": dict(self.cfg),
+                        "rejected": [k for k in kw if k in self.cfg and kw[k] is not None],
+                        "error": _SITE_WL_EMPTY_ERR}
+            for k, v in new.items():
+                self.cfg[k] = v; changed[k] = v
+            # paranoia は set_paranoia と同じく段階プリセットも当てる(数値だけ変わって任意
+            # シグネチャが連動しない食い違いを防ぐ)。optional_sigs を同時に明示したらそちら優先。
+            p = changed.get("paranoia")
+            if p is not None and p != old_paranoia and "optional_sigs" not in changed:
+                self.cfg["optional_sigs"] = {n: True for n in _PARANOIA_TIERS[p]}
             self._save()
             if "geo_cidrs" in changed or "geo_mode" in changed:
                 self._compile_geo()
-        return {"ok": True, "changed": changed, "cfg": dict(self.cfg)}
+        out = {"ok": bool(changed) or not rejected, "changed": changed, "cfg": dict(self.cfg)}
+        if rejected:
+            out["rejected"] = rejected
+            if not changed:
+                out["error"] = "不正な値のため拒否: " + ", ".join(rejected)
+        return out
 
     # ── 宣言的設定ブートストラップ(evolution #27) ──
     def apply_config(self, d: dict) -> dict:
         """運用者が宣言した設定辞書(ファイル/ConfigMap)を *既存の検証済みセッター経由* で適用する。
         宣言的デプロイ(GitOps/k8s の immutable infra)向け。構造/段階キーは専用バリデータに回し、
-        残りは set_config(既存キー・型一致のみ通す)。未知キーは無視。適用できたキー一覧を返す。"""
+        残りは set_config(既存キー・型一致のみ通す)。未知キーは無視。適用できたキー一覧(applied)と、
+        不正値/誤設定で適用しなかったキー(rejected)・理由(errors)を返す。"""
         if not isinstance(d, dict):
             return {"ok": False, "error": "config is not an object", "applied": []}
         routed = {"path_limits": self.set_path_limits,
                   "blocked_methods": self.set_blocked_methods,
                   "paranoia": self.set_paranoia}
-        applied, rest = set(), {}
+        applied, rest, rejected, errors = set(), {}, [], []
         for k, v in d.items():
             if k in routed:
                 try:
-                    routed[k](v); applied.add(k)
+                    r = routed[k](v)
+                    # セッターが拒否(ok:False=現状維持)したキーを applied と報告しない
+                    if not (isinstance(r, dict) and r.get("ok") is False):
+                        applied.add(k)
+                    else:
+                        rejected.append(k)
                 except Exception:
-                    pass                          # 不正値は黙って捨てる(起動を止めない)
+                    rejected.append(k)            # 不正値は捨てる(起動を止めない)
             elif k in self.cfg:
                 rest[k] = v
-        if rest:
-            applied.update(self.set_config(**rest).get("changed", {}).keys())
-        return {"ok": True, "applied": sorted(applied)}
+        # site_mode/site_whitelist は別の呼び出しで適用する。結果が whitelist+空 になる宣言は
+        # set_config が呼び出しごと拒否するので、同居させると無関係なキーまで落ちる(#85 r4)。
+        site = {k: rest.pop(k) for k in _SITE_KEYS if k in rest}
+        for part in (rest, site):
+            if part:
+                r = self.set_config(**part)
+                applied.update(r.get("changed", {}).keys())
+                rejected.extend(r.get("rejected") or [])
+                if r.get("ok") is False and r.get("error"):
+                    errors.append(r["error"])
+        out = {"ok": True, "applied": sorted(applied)}
+        if rejected:                              # 起動は止めず、適用しなかったキーと理由を返す
+            out["rejected"] = sorted(set(rejected))
+        if errors:
+            out["errors"] = errors
+        return out
 
     def apply_config_file(self, path: str) -> dict:
         """JSON 設定ファイルを読み込んで apply_config。空パス=no-op。読めない/JSON不正=エラー。
@@ -1355,8 +1616,14 @@ class NetShield:
                         key=lambda kv: kv[1]["seen"])
         for ip, _ in nonban[:target]:
             self._ips.pop(ip, None)
-        if len(self._ips) >= _MAX_IPS:           # 非BANだけで足りない時のみ最古BANも間引く
-            rest = sorted(self._ips.items(), key=lambda kv: kv[1]["seen"])
+        if len(self._ips) >= _MAX_IPS:           # 非BANだけで足りない時のみ時限BANも間引く
+            # (#8) 運用者の永続BANは決して捨てず、時限BANは *期限の近い順* に捨てる(失うBAN残り
+            # 時間を最小に)。旧実装は最古 seen 順で、BAN 中は seen が更新されないため永続BANや
+            # 長期制限が真っ先に消え、blocklist.json からも落ちていた(=表を埋めるだけで解ける)。
+            inf = float("inf")
+            rest = sorted((kv for kv in self._ips.items()
+                           if kv[1]["ban_until"] != inf and not kv[1].get("permanent")),
+                          key=lambda kv: kv[1]["ban_until"])
             for ip, _ in rest[:target]:
                 self._ips.pop(ip, None)
 
@@ -1382,11 +1649,15 @@ class NetShield:
         h = hashlib.sha256(cred.encode("utf-8", "replace")).digest()[:12]
         now = _now()
         win = float(self.cfg.get("cred_rate_window_sec", 60))
+        # deque の長さ=数えられる上限。固定 8192 だと cred_rate_limit>8192 が永久に不発だった。
+        cap = max(8192, min(int(self.cfg.get("cred_rate_limit", 600)), _RATE_COUNT_MAX))
         dq = self._cred_rate.get(h)
         if dq is None:
             if len(self._cred_rate) >= _CRED_RATE_CAP:    # 有界化: 最古挿入を1件落とす
                 self._cred_rate.pop(next(iter(self._cred_rate)), None)
-            dq = self._cred_rate[h] = deque(maxlen=8192)
+            dq = self._cred_rate[h] = deque(maxlen=cap)
+        elif dq.maxlen < cap:                              # 閾値を引き上げた後の既存キー
+            dq = self._cred_rate[h] = deque(dq, maxlen=cap)
         dq.append(now)
         cutoff = now - win
         while dq and dq[0] < cutoff:
@@ -1447,6 +1718,8 @@ class NetShield:
         mode = self.cfg.get("site_mode", "off")
         if mode == "whitelist":
             wl = self.cfg.get("site_whitelist") or []
+            # 空の許可リストは評価しない=全許可(旧来挙動)。設定の入口では whitelist+空 を拒否し、
+            # ここへ来るのは旧版が保存した state だけ(締め出さない・warnings で通知・#85 r4)。
             if wl and not self._domain_match(host, wl):
                 return f"ホワイトリスト外サイト: {host}"
         elif mode == "blacklist":
@@ -1461,22 +1734,19 @@ class NetShield:
             return ""
 
         def _match(entries) -> bool:
-            try:
-                addr = ipaddress.ip_address(ip)
-            except Exception:
+            # 単一IPエントリは *正規形同士* で比べる(#45): 生文字列比較では '2001:DB8::1' や
+            # 非圧縮表記のエントリが正規形の peer と一致せず、黒リストは素通り・白リストは締め出し。
+            cip = _canon_ip(ip)
+            if not cip:
                 return False
-            for e in entries or []:
-                e = str(e).strip()
-                try:
-                    if "/" in e:
-                        net = _cidr_net(e)   # 事前コンパイル(毎リクエストのパースを避ける)
-                        if net is not None and addr.version == net.version and addr in net:
-                            return True
-                    elif e == ip:
-                        return True
-                except Exception:
-                    continue
-            return False
+            addr = ipaddress.ip_address(cip)
+            try:
+                singles, nets = _compile_ip_list(tuple(entries or ()))
+            except TypeError:                # 設定に unhashable(dict 等)が混入していても照合は続ける
+                singles, nets = _compile_ip_list(tuple(str(e) for e in entries or ()))
+            if cip in singles:
+                return True
+            return any(addr.version == net.version and addr in net for net in nets)
         if mode == "whitelist" and not _match(self.cfg.get("ip_whitelist")):
             return f"IP許可リスト外: {ip}"
         if mode == "blacklist" and _match(self.cfg.get("ip_blacklist")):
@@ -1510,6 +1780,12 @@ class NetShield:
         else:
             return {"ok": False, "error": "op は add/remove/set/clear"}
         r = self.set_config(**{key: cur})
+        if r.get("ok") is False:
+            # 拒否(whitelist 運用中に許可リストを空にする等・#85 r4)=何も変えていない。結果を
+            # 見ずに ok:True を返すと、運用者は消せた/空にできたと誤解する。
+            return {"ok": False, "list": key, "op": op,
+                    "error": r.get("error") or "設定を拒否しました",
+                    "entries": list(self.cfg.get(key) or [])}
         return {"ok": True, "list": key, "op": op, "count": len(cur),
                 "entries": cur}
 
@@ -1567,10 +1843,12 @@ class NetShield:
         elif max_sec > 0 and sec >= max_sec:
             exceeded = f"接続時間超過 {int(sec)}s/{self.cfg['quota_window_days']}日"
         if exceeded:
+            # BAN 決定は他の全経路と同じくロック下で(#82)。ロック外だと _save_bans の _ips 走査が
+            # 管理スレッドの並行 ban() と衝突して RuntimeError になり、保存ごと失っていた。
             with self._lock:
                 st = self._state(ip)
-            self._enforce_or_audit(ip, "block", st, "クォータ: " + exceeded,
-                                   kind="quota_exceeded", do_ban=True)
+                self._enforce_or_audit(ip, "block", st, "クォータ: " + exceeded,
+                                       kind="quota_exceeded", do_ban=True)
             return {"counted": True, "exceeded": exceeded, "gb": round(gb, 3),
                     "conn_sec": round(sec, 1)}
         return {"counted": True, "gb": round(gb, 3), "conn_sec": round(sec, 1)}
@@ -1608,7 +1886,13 @@ class NetShield:
     def _record_usage(self, ip, out_bytes, in_bytes, conn_sec, host, method, path):
         if not self.cfg.get("usage_record"):
             return
-        host = (host or "").split(":")[0].lower()
+        # Host から :port を外して宛先名にする。':' で単純に切ると IPv6 の Host
+        # ('[2001:db8::1]:443' や素の '2001:db8::1')が '[2001' / '2001' に潰れていた。
+        host = (host or "").strip().lower()
+        if host.startswith("["):                       # [v6] / [v6]:port
+            host = host[1:].partition("]")[0]
+        elif host.count(":") == 1:                     # name:port(素の IPv6 はコロンが複数)
+            host = host.partition(":")[0]
         with self._lock:
             if len(self._usage) >= _MAX_IPS:           # メモリ有界(古い順に間引き)
                 for k in list(self._usage)[:_MAX_IPS // 10]:
@@ -1778,7 +2062,7 @@ class NetShield:
     def inspect(self, ip: str, *, path: str = "", method: str = "GET",
                 user_agent: str = "", query: str = "", zone: str = "",
                 tls: bool = True, host: str = "", headers: str = "",
-                header_names=None, auth: str = "", cred: str = "",
+                header_names=None, auth: str = "", cred="",
                 override_method: str = "", override_path: str = "",
                 range_header: str = "") -> dict:
         if not self.is_enabled():
@@ -1893,8 +2177,11 @@ class NetShield:
                 reasons.append("ua-header不整合(ブラウザ偽装の疑い)")
             # 1.28) クレデンシャル単位レート(evolution #70): Bearer トークン/API キーの識別子単位で
             #       レートを集計。IP をローテーションしても同一キーの濫用は絞る。超過で加点。
-            if self.cfg.get("cred_rate_enabled") and cred:
-                cr = self._credential_rate(cred)
+            #       cred は単一の識別子(str)か、要求に載った識別子の列。列なら *各々に* 計上し
+            #       最大値で判定する(1 つだけ数えると、捨て値の Bearer を毎回変えて盗んだ
+            #       X-API-Key で認証させる手口で識別子がローテーションし、上限が発動しなかった)。
+            if self.cfg.get("cred_rate_enabled") and (_creds := _cred_ids(cred)):
+                cr = max(self._credential_rate(c) for c in _creds)
                 if cr >= int(self.cfg.get("cred_rate_limit", 600)):
                     self._metrics["cred_rate_hit"] = self._metrics.get("cred_rate_hit", 0) + 1
                     # カウンタは *クレデンシャル共有* なのに、加点先は要求元 IP だった。
@@ -2013,8 +2300,9 @@ class NetShield:
             thr = int(self.cfg.get("resp_error_threshold", 50))
             st = self._state(ip)
             dq = st.get("resp_err")
-            if dq is None:
-                dq = st["resp_err"] = deque(maxlen=1024)
+            cap = max(1024, min(thr, _RATE_COUNT_MAX))   # 固定 1024 だと閾値>1024 が永久に不発
+            if dq is None or dq.maxlen < cap:
+                dq = st["resp_err"] = deque(dq or (), maxlen=cap)
             dq.append(now)
             while dq and dq[0] < now - win:
                 dq.popleft()
@@ -2151,27 +2439,14 @@ class NetShield:
         path=前方一致prefix(リテラル・ReDoSなし)/ rate=毎秒許容 / burst=瞬間許容(既定=rate)。
         認証/高コスト経路をグローバル(rate_per_sec)より厳格に絞る。不正項目は捨て、最大
         _PATH_LIMIT_MAX 件に丸める。空配列=無効。in-place 変更せず新リストを代入(既定共有回避)。"""
-        norm = []
-        if isinstance(rules, (list, tuple)):
-            for r in rules:
-                if not isinstance(r, dict):
-                    continue
-                p = str(r.get("path", "")).strip()
-                if not p:
-                    continue
-                try:
-                    rate = float(r.get("rate", self.cfg["rate_per_sec"]))
-                except (TypeError, ValueError):
-                    continue
-                if rate <= 0:
-                    continue
-                try:
-                    burst = float(r.get("burst", rate))
-                except (TypeError, ValueError):
-                    burst = rate
-                norm.append({"path": p, "rate": rate, "burst": max(1.0, burst)})
-                if len(norm) >= _PATH_LIMIT_MAX:
-                    break
+        # 配列以外(オブジェクト/文字列/None)や有効ルール 0 件の非空配列を [] に *置換* すると、
+        # /login 等の既存ルールが ok:True のまま黙って消える。拒否して現状を保つ
+        # (set_blocked_methods と同じ方針。正規化は set_config と共通=入口で食い違わない)。
+        norm = _norm_path_limits(rules, float(self.cfg["rate_per_sec"]))
+        if norm is None:
+            return {"ok": False,
+                    "error": "path_limits は {path, rate[, burst]} の配列で指定してください",
+                    "path_limits": list(self.cfg.get("path_limits") or [])}
         with self._lock:
             self.cfg["path_limits"] = norm
             self._save()
@@ -2184,18 +2459,12 @@ class NetShield:
         # 型が違う入力(宣言的設定の JSON で "TRACE,CONNECT" のような文字列を書いた等)を
         # 黙って [] として *置換* すると、遮断メソッドの設定が消えたまま ok:True が返り、
         # 運用者は防御が効いていると誤解する。受理できない型は拒否して現状を保つ。
-        if isinstance(methods, str):
-            methods = [m for m in methods.replace(",", " ").split() if m]
-        elif not isinstance(methods, (list, tuple)):
+        # 正規化は set_config と共通(/api/shield/config 経由の小文字が素通りしない)。
+        n = _norm_blocked_methods(methods)
+        if n is None:
             return {"ok": False, "error": "blocked_methods は配列で指定してください",
                     "blocked_methods": list(self.cfg.get("blocked_methods") or [])}
-        norm, rejected = [], []
-        for m in methods:
-            m = str(m).strip().upper()
-            if m and m.isalpha() and len(m) <= 16 and m not in norm:
-                norm.append(m)
-            elif m:
-                rejected.append(m[:16])
+        norm, rejected = n
         with self._lock:
             self.cfg["blocked_methods"] = norm
             self._save()
@@ -2232,16 +2501,24 @@ class NetShield:
             return self._out(ip, "allow", st, f"AUDIT(would {action}): {reason}")
         if do_ban:
             st["ban_count"] = st.get("ban_count", 0) + 1       # 累犯回数(エスカレーション用)
-            if ban_perm:
-                st["ban_until"] = float("inf")
+            now = _now()
+            cur = st.get("ban_until", 0.0)
+            # 既存のより長いBAN(運用者の永続BAN・restrict の長期制限・エスカレーション済み)を
+            # 短い自動BANで *上書きしない*(#7)。penalize/note_response/record_traffic 等は BAN 中の
+            # IP からも呼ばれ、旧実装は永続BANを ban_ttl_sec に縮めて blocklist へも書いていた。
+            perm = bool(ban_perm) or cur == float("inf") or (bool(st.get("permanent")) and cur > now)
+            if perm:
+                new_until = float("inf")
             else:
                 ttl = float(self.cfg["ban_ttl_sec"])
                 if self.cfg.get("ban_escalation", True):       # 累犯ほど長く(初回 n=1 は据置)
                     cap = int(self.cfg.get("ban_escalation_cap", 64) or 1)
                     ttl *= min(max(1, cap), 2 ** min(st["ban_count"] - 1, 30))
-                st["ban_until"] = _now() + ttl
-            st["ban_started"] = _now()
-            st["permanent"] = bool(ban_perm)
+                new_until = now + ttl
+            if new_until > cur:                  # 新規/延長のときだけ BAN 期間と開始時刻を更新
+                st["ban_until"] = new_until
+                st["ban_started"] = now
+            st["permanent"] = perm
             self._ban_bloom.add(ip)
             self._save_bans()
             if self.cfg.get("subnet_defense"):       # 分散攻撃の集約検知(#25): サブネットにBANを記録
@@ -2445,6 +2722,13 @@ class NetShield:
 
     def ban(self, ip: str, ttl_sec: float = None, permanent: bool = False) -> dict:
         """手動BAN。permanent=True で無期限BAN、ttl_sec で時限BAN(既定は cfg のTTL)。"""
+        key = _canon_ip(ip)
+        if not key:
+            # 生文字列を鍵にすると空白付き/大文字/非圧縮 IPv6 は正規形の peer と一致せず、一覧に
+            # 載るのに何も遮断しない BAN になっていた(#25/#45)。単一IP以外(CIDR 等)は拒否する。
+            return {"ok": False,
+                    "error": "単一のIPアドレスを指定してください(範囲/CIDR はファイアウォールのルールで遮断)"}
+        ip = key
         with self._lock:
             st = self._state(ip)
             st["ban_until"] = (float("inf") if permanent
@@ -2459,7 +2743,10 @@ class NetShield:
     # ── 一時制限(状況報告書→管理者アラート→双方合意で解除) ──
     def restrict(self, ip: str, ttl_sec: float = None) -> dict:
         """一時制限をかける。解除には『状況報告書(ユーザー)』+『管理者承認』の双方合意が要る。"""
-        self.ban(ip, ttl_sec=ttl_sec)
+        r = self.ban(ip, ttl_sec=ttl_sec)
+        if not r.get("ok"):
+            return r
+        ip = r["banned"]                  # 正規形で記録(遮断ページの申告は peer=正規形で引く)
         with self._lock:
             self._restrictions[ip] = {"ts": _now(), "report": "", "user_ok": False,
                                       "admin_ok": False, "status": "restricted"}
@@ -2469,6 +2756,7 @@ class NetShield:
 
     def submit_report(self, ip: str, report: str) -> dict:
         """ユーザー側: 状況報告書を提出する→管理者へアラート。"""
+        ip = _canon_ip(ip) or ip              # restrict は正規形で記録する(#45)
         r = self._restrictions.get(ip)
         if not r:
             return {"ok": False, "error": "一時制限の対象ではありません"}
@@ -2481,6 +2769,7 @@ class NetShield:
 
     def admin_confirm(self, ip: str, agree: bool, note: str = "") -> dict:
         """管理者側: 報告書を確認して合意/不合意。双方合意なら解除。"""
+        ip = _canon_ip(ip) or ip              # restrict は正規形で記録する(#45)
         r = self._restrictions.get(ip)
         if not r:
             return {"ok": False, "error": "一時制限の対象ではありません"}
@@ -2517,14 +2806,31 @@ class NetShield:
             return [{"ip": ip, **v} for ip, v in self._restrictions.items()]
 
     def unban(self, ip: str) -> dict:
+        # 表記ゆれでも同じIPを解除する(#45)。旧版が生の綴りで保存した IP でない鍵(CIDR 等)も
+        # 一覧の綴りそのままで解除できるよう、正規形と生文字列の両方を引く。
+        key = _canon_ip(ip)
+        raw = ip if isinstance(ip, str) else ""
+        hit = False
         with self._lock:
-            st = self._ips.get(ip)
-            if st:
-                st["ban_until"] = 0.0; st["score"] = 0.0; st["permanent"] = False
+            for k in {key, raw, raw.strip()} - {""}:
+                st = self._ips.get(k)
+                if st:
+                    hit = True
+                    st["ban_until"] = 0.0; st["score"] = 0.0; st["permanent"] = False
+                # 解除=運用者が誤BANと判断 → サブネット hot 集計からも外す(#84)。残すと同じ /24・/64 の
+                # 新規ユーザに subnet:hot の加点が窓(既定1時間)のあいだ付き続けた。
+                sk = _subnet_key(k)
+                rec = self._subnets.get(sk) if sk else None
+                if rec is not None and rec.pop(k, None) is not None:
+                    if not rec:
+                        self._subnets.pop(sk, None)
+                    self._subnet_hot_ts = 0.0       # hot 数の短命キャッシュも捨てる
+            if not key and not hit:
+                return {"ok": False, "error": "単一のIPアドレスを指定してください"}
             self._save_bans()
         # ブルームは単一ビット削除不可→現役BANから作り直して陳腐ビットを落とす(偽陽性率を保つ)
         self.rebuild_ban_bloom()
-        return {"ok": True, "unbanned": ip}
+        return {"ok": True, "unbanned": key or raw}
 
     # ── 遮断ページ / 解除リクエスト(異議申立) ──
     def ban_info(self, ip: str) -> dict:
@@ -2717,17 +3023,27 @@ class NetShield:
         now = _now()
         retain = float(self.cfg.get("ban_escalation_retain_sec", 86400) or 0)
         raw = d.get("bans")
+        merged = set()                            # この読込で既に復元したアクティブBAN(別綴りの合流用)
         for ip, b in (raw.items() if isinstance(raw, dict) else ()):
             # 1 エントリでも壊れていると、以前は起動時に例外で落ちて *防御が上がらなかった*。
             # 壊れた行だけ捨てて残りを復元する(BAN 表全体を失わない)。
             if not isinstance(b, dict) or not isinstance(ip, str):
                 continue
+            # 旧版は手動BANの生の綴り(大文字/非圧縮 IPv6・空白付き)を鍵に保存していた(#45)。
+            # 正規形へ寄せて実際の peer と一致させる。IP でない旧鍵(CIDR 等)はそのまま読む
+            # (一覧に出して解除できるように)。
+            ip = _canon_ip(ip) or ip
             try:
                 until = float("inf") if b.get("permanent") else float(b.get("until") or 0)
                 cnt = int(b.get("count") or 0)
                 started = float(b.get("started") or now)
             except (TypeError, ValueError):
                 continue
+            if ip in merged:                      # 同じIPの別綴り: 長い方の BAN を残す
+                st = self._ips.get(ip)
+                if st is not None and st["ban_until"] >= until:
+                    st["ban_count"] = max(int(st.get("ban_count", 0)), cnt)
+                    continue
             if not b.get("permanent") and until <= now:
                 # 期限切れBAN: 累犯回数だけ保持窓内なら復元(エスカレーションを再起動越しに継続)。
                 if cnt > 0 and retain > 0 and (now - started) <= retain:
@@ -2736,6 +3052,9 @@ class NetShield:
                     st["ban_started"] = started
                 continue                          # BAN自体は復元しない(掃除)
             st = self._state(ip)
+            if ip in merged:
+                cnt = max(int(st.get("ban_count", 0)), cnt)
+            merged.add(ip)
             st["ban_until"] = until
             st["ban_started"] = started
             st["permanent"] = bool(b.get("permanent"))
@@ -2758,6 +3077,10 @@ class NetShield:
         iv = float(self.cfg.get("ban_persist_min_interval_sec", 2.0) or 0)
         big = len(self._ips) >= int(self.cfg.get("ban_persist_debounce_from", 512) or 0)
         if not force and big and iv > 0 and (now - self._bans_last_save) < iv:
+            # 間引いた変更は残り間隔の経過後に *必ず* 書く(#48)。以後 BAN/解除が来ないと誰も
+            # _bans_dirty を拾わず、クラッシュ/強制終了で直近の BAN(永続含む)や解除が消えていた。
+            # 遅延は最大 iv(時計の巻き戻しで now-last が負になっても間引きが長引かない)。
+            self._schedule_bans_flush(min(iv, iv - (now - self._bans_last_save)))
             return                      # 表が小さいうちは従来どおり即時保存(耐久性優先)
         self._bans_last_save = now
         self._bans_dirty = False
@@ -2773,7 +3096,31 @@ class NetShield:
                 # 期限切れだが累犯履歴あり: 保持窓内なら回数のみ残す(BANは付与しない)。
                 bans[ip] = {"until": 0, "started": s.get("ban_started", now),
                             "permanent": False, "count": cnt}
-        write_signed_json(self._bans_path, {"bans": bans, "saved": now}, self._state_key)
+        if not write_signed_json(self._bans_path, {"bans": bans, "saved": now}, self._state_key):
+            self._bans_dirty = True     # 書けなかった=未書込のまま(次の保存/flush_state で再試行)
+
+    def _schedule_bans_flush(self, delay: float):
+        """間引いた BAN 保存を delay 秒後に 1 回だけ書く一発タイマー(#48)。保留中は張り直さない
+        (スレッドは高々 1 本)。state_dir が消えていれば書かない(作り直さない)。ロック内から呼ぶ。"""
+        if self._bans_flush_timer is not None:
+            return
+
+        def _fire():
+            try:
+                with self._lock:
+                    self._bans_flush_timer = None
+                    if self._bans_dirty and os.path.isdir(os.path.dirname(self._bans_path)):
+                        self._save_bans(force=True)
+            except Exception:
+                pass
+
+        t = threading.Timer(max(0.0, delay) + 0.05, _fire)
+        t.daemon = True
+        self._bans_flush_timer = t
+        try:
+            t.start()
+        except RuntimeError:            # スレッドを起こせない(資源枯渇)=次の保存/flush_state に委ねる
+            self._bans_flush_timer = None
 
     def reload_bans(self) -> dict:
         """共有BANファイルを再読込(クラスタの各ワーカーが定期的に呼べば疎結合で同期)。"""
@@ -2919,11 +3266,25 @@ class NetShield:
                if e.get("kind") in ("state_tamper", "memory_tamper")]
         return {"summary": summary, "events": evs[:50]}
 
+    def config_warnings(self) -> list:
+        """壊れてはいないが運用者が直すべき設定の一覧([{code, keys, message}]・無ければ空)。
+        · site_whitelist_empty(#85 r4): site_mode=whitelist なのに site_whitelist が空=全 Host を
+          許可している。設定の入口では拒否するが、旧版が保存した state は締め出し回避のため維持。"""
+        out = []
+        if self.cfg.get("site_mode") == "whitelist" and not self.cfg.get("site_whitelist"):
+            out.append({"code": _SITE_WL_EMPTY_CODE, "keys": list(_SITE_KEYS),
+                        "message": "site_mode=whitelist ですが site_whitelist が空のため、全 Host を"
+                                   "許可しています(以前の版で保存された設定を互換のため維持)。"
+                                   "許可する Host を site_whitelist に追加するか、site_mode を off に"
+                                   "してください。"})
+        return out
+
     def status(self) -> dict:
         from ..core.i18n import t as _t
         return {"cfg": dict(self.cfg), "metrics": self.metrics(),
                 "bans": self.bans(),
                 "optional_signatures": sorted(_OPTIONAL_SIGS),  # 任意(高FP)シグネチャ名一覧
+                "warnings": self.config_warnings(),             # 要注意の設定(#85 r4)
                 "note": _t("status.note")}
 
 

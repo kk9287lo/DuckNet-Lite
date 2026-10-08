@@ -70,6 +70,8 @@ Restart=on-failure
 RestartSec=2
 StartLimitIntervalSec=60
 StartLimitBurst=5            # クラッシュループ遮断
+# --cluster で起動するなら有効に: SIGTERM を親だけへ送り、親が drain 猶予をワーカーへ渡す（下記の注）
+#KillMode=mixed
 
 # --- サンドボックス（攻撃者が本体を触れる面を削る）---
 NoNewPrivileges=yes
@@ -102,6 +104,12 @@ sudo systemctl stop ducknet      # 管理者は正規に停止できる（透明
 
 > クラッシュからの自動再起動はアプリ自身では行いません(watchdog や親プロセス監督は持ちません)。systemd 配下では
 > `Restart=` が、それ以外の環境ではタスクスケジューラ/nssm/launchd の回復設定(下記 §3・§4)がこの役目を担います。
+
+> `--cluster`(fork したワーカーで全コア待受)を systemd で動かすときは `KillMode=mixed` にしてください。既定の
+> `KillMode=control-group` は `systemctl stop` の SIGTERM を親と全ワーカーへ *同時に* 送るため、親が drain 猶予
+> (`--drain-grace` / `DUCKNET_DRAIN_GRACE`)をワーカーへ渡す前にワーカーが猶予 0 で止まり、進行中のリクエストが切れます。
+> `mixed` なら SIGTERM は親だけに届き、親が猶予を渡してからワーカーへ合図し、猶予を過ぎて残ったものを刈り取ります。
+> `TimeoutStopSec`(既定 90 秒)は drain 猶予より数秒以上長くしてください。
 
 ### 2.2 本体コードを不変属性に(ファイルすり替え防止の OS 層)
 ```bash

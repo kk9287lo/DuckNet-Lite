@@ -2,6 +2,27 @@
 
 本プロジェクトの主要な変更点。日付は概ねの目安。詳細は各コミット(`evolution #N`)を参照。
 
+## [Unreleased] — 細心のバグ総点検(2026-10)
+
+フル版と Lite を横断した総点検で挙がった候補のうち、Lite に該当するものを修正した。すべて回帰
+テスト付きで、修正を外すとそのテストが落ちることを 1 本ずつ確認している(`tests/test_sweep_*.py`)。
+
+### 運用者に見える挙動の変化
+- **管理 API**: Cookie 認証の POST は `Content-Type: application/json` 必須(それ以外は 415)。
+  Origin/Referer はホストに加えて **ポートも** 照合する(Host をポート抜きに書き換えるリバース
+  プロキシは `DUCKNET_ADMIN_ALLOWED_HOSTS` へ登録)。読めない本文(chunked・上限超・途中切れ・
+  JSON object 以外)は 400 でルートを実行しない。`on` / `approve` は真偽値必須。
+- **承認待ちの `approve()` / `deny_pending()` の既定は一時扱い**。恒久ルールは `remember: true` を
+  明示したときだけ書く。
+- **重複した単一値ヘッダは 400**(`Authorization` / `X-API-Key` / `X-HTTP-Method-Override` 系など)。
+  重複を `, ` で連結して読むと JWT 検査やメソッド制限をすり抜けられた。
+- **空の `site_whitelist` で `site_mode=whitelist` にする設定は拒否**(管理 API・リスト編集・
+  宣言的設定のすべて)。旧版が保存した whitelist+空 は締め出さないよう全 Host 許可のまま維持し、
+  status の `warnings`・起動表示・ダッシュボードで警告する。
+- **署名付き状態ファイルの手動削除**: 署名済みサイドカー(`.hw`)が残っていると改竄警報を 1 回出す。
+  警報なしで初期化するときは `.hw` も消す。
+- **`--cluster` を systemd で使う場合は `KillMode=mixed` を推奨**([docs/hardening.md](docs/hardening.md))。
+
 ## [Lite] — ライセンスを GNU AGPL-3.0-or-later に変更
 
 DuckNet-Lite 自体のライセンスを、従来のテンプレート的な商用ライセンス文言(「評価利用のみ許諾・

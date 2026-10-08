@@ -173,6 +173,31 @@ def _install_shutdown_handlers(ev) -> list:
     return installed
 
 
+def _watch_stdin_stop(ev) -> bool:
+    """トレイが子として起動した本体(env DUCKNET_STDIN_STOP=1)だけ、標準入力の 'stop' 行で
+    graceful 停止を受け付ける。トレイ側の終了は以前 terminate() だけで、Windows では
+    TerminateProcess=即死(ドレイン・BAN の flush が走らない)。子は CREATE_NO_WINDOW なので
+    CTRL_BREAK も届かない。パイプの書き口は起動した親だけが持つ。
+    EOF(親の異常終了等)では止めない=トレイが落ちても防御は続ける。"""
+    if os.environ.get("DUCKNET_STDIN_STOP", "").strip() != "1":
+        return False
+    stream = sys.stdin
+    if stream is None:
+        return False
+    import threading
+
+    def _reader():
+        try:
+            for line in stream:
+                if line.strip().lower() == "stop":
+                    ev.set()
+                    return
+        except Exception:
+            pass
+    threading.Thread(target=_reader, name="stdin-stop", daemon=True).start()
+    return True
+
+
 def _block_until_shutdown(*stop_fns, _event=None) -> None:
     """SIGTERM / SIGINT で graceful 停止するまでブロックし、停止時に `stop_fns` を順に呼ぶ。
     各 stop_fn は独立に try で囲む(片方が失敗してももう片方=状態 flush 等を必ず走らせる)。
@@ -182,6 +207,7 @@ def _block_until_shutdown(*stop_fns, _event=None) -> None:
     ev = _event if _event is not None else threading.Event()
     if _event is None:
         _install_shutdown_handlers(ev)
+        _watch_stdin_stop(ev)                 # トレイが起動した子だけ(env で明示)
     try:
         while not ev.wait(1.0):   # タイムアウト付き待機=シグナル処理の機会を挟む(Win も即応)
             pass
@@ -228,8 +254,21 @@ def run(backend: str = "127.0.0.1:8080", listen: int = 8443,
         _res = net_shield().apply_config_file(_cfg_path)
         if _res.get("ok"):
             print(f" 宣言的設定         : {_cfg_path} 適用 → {', '.join(_res.get('applied') or []) or '(変更なし)'}")
+            # 拒否されたキーは『適用一覧に無い』ことでしか分からなかった(例: 空の site_whitelist
+            # での whitelist)。理由と一緒に明示する。
+            if _res.get("rejected"):
+                _why = "; ".join(str(e) for e in (_res.get("errors") or []))
+                print(f" 宣言的設定         : [警告] 拒否 → {', '.join(_res['rejected'])}"
+                      + (f"({_why})" if _why else ""))
         else:
             print(f" 宣言的設定         : [警告] {_res.get('error')}")
+    # 壊れてはいないが直すべき設定(旧版が保存した whitelist+空 など)。status の warnings と
+    # イベントにしか出ず、コンソールで起動した運用者には見えなかった。
+    try:
+        for _w in net_shield().config_warnings():
+            print(f" 設定               : [警告] {_w.get('message')}")
+    except Exception:
+        pass
 
     # guard オブジェクトは admin より先に *生成のみ*(start() はまだ呼ばない=起動順は
     # 従来どおり admin が先)。こうすると AdminDashboard に edge_guard 参照を渡せて、
@@ -300,20 +339,24 @@ def run(backend: str = "127.0.0.1:8080", listen: int = 8443,
 def _strip_autostart_flags(raw) -> list:
     """raw argv から自動起動関連フラグを取り除いた serve コマンドを返す(自動起動に登録する対象)。
     --install-autostart は省略可能な値(onlogon/onstart/runkey)を取り得るので消費を判定する。
-    `--flag=value` 形式にも対応。"""
+    `--flag=value` 形式にも対応。argparse は曖昧でない *略記*(--install / --install-auto /
+    --autostart-n)も受理するので、略記も同一視する。完全一致だけで消していた頃は略記が
+    登録コマンドに残り、ログオン/起動のたびに『自動起動を再登録して終了』するだけで
+    ゲートウェイが一度も起動しなかった(登録は ok:true と報告される)。"""
     out, i = [], 0
-    valued = {"--autostart-name"}                 # 別トークンで値を取る
-    skip_flags = {"--uninstall-autostart"}        # 値なし
     choices = {"onlogon", "onstart", "runkey"}
+
+    def _is(base, flag):                          # 完全一致または曖昧でない略記
+        return base.startswith("--") and len(base) > 2 and flag.startswith(base)
     while i < len(raw):
         x = raw[i]
         base = x.split("=", 1)[0]
-        if base in skip_flags:
+        if _is(base, "--uninstall-autostart"):    # 値なし
             i += 1; continue
-        if base in valued:
+        if _is(base, "--autostart-name"):         # 別トークンで値を取る
             i += 1 if "=" in x else 2             # =形式は1トークン、別形式は値も飛ばす
             continue
-        if base == "--install-autostart":
+        if _is(base, "--install-autostart"):
             i += 1
             if "=" not in x and i < len(raw) and raw[i] in choices:
                 i += 1                            # 省略可能な値を消費(あれば)

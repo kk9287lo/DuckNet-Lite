@@ -33,6 +33,15 @@ _BOUND_THEN_STAR = re.compile(r"\)\s*\{\d+,\}\s*[*+]")
 # (曖昧な交代+反復)で、上の2つでは検出できない。中の "|" の有無だけを見る安全側のヒューリスティック。
 _ALTERNATION_QUANT = re.compile(
     r"\((?:[^()\\]|\\.)*\|(?:[^()\\]|\\.)*\)\s*(?:[*+]|\{\d+,)")
+# 同じ原子に非有界量化子が直に続く \s*\s* / .*.* / a+a* : 入力の分け方が O(n^k) 通りになり
+# (k=連続数)、入力上限 8192 でも事実上終わらない(^\s*\s*\s*\s*x$ は 400 文字で 1.7 秒)。
+# 書き手にとっては 1 個と同じ意味=弾いても失うものが無い。
+_ADJ_SAME_QUANT = re.compile(
+    r"(\\.|\[(?:\\.|[^\]\\])*\]|\.|[^\\()\[\]{}|*+?^$])[*+]\??\1[*+]")
+# 外側が有界反復 {n} / {m,n} でも、回数がこれを超え本体が可変長なら非有界と同じく扱う。
+# (a|aa){24}b は 36 文字で 1.2 秒、(a|a?){18}b は 20 文字で 156 秒(指数)。3 回までは
+# IPv4 の (\d{1,3}\.){3} のような実用形を通すための上限(3 回なら本体の揺れ^3 で有界)。
+_BOUNDED_REPEAT_MAX = 3
 
 
 def _body_has_unbounded_or_alt(body: str) -> bool:
@@ -77,10 +86,35 @@ def _body_has_unbounded_or_alt(body: str) -> bool:
     return False
 
 
+def _outer_repeats(pattern: str, q: int) -> bool:
+    """pattern[q] から始まる量化子が、直前のグループを *何度も* 繰り返すか:
+    * + {n,} と、回数の上限が _BOUNDED_REPEAT_MAX を超える {n} / {m,n}。"""
+    n = len(pattern)
+    if q >= n:
+        return False
+    if pattern[q] in "*+":
+        return True
+    if pattern[q] != "{":
+        return False
+    j = pattern.find("}", q)
+    if j == -1:
+        return False
+    inner = pattern[q + 1:j]
+    hi = inner.split(",", 1)[1] if "," in inner else inner
+    hi = hi.strip()
+    if "," in inner and hi == "":
+        return True                          # {n,} = 上限なし
+    try:
+        return int(hi) > _BOUNDED_REPEAT_MAX
+    except ValueError:
+        return False                         # 量化子ではない(リテラルの {…})
+
+
 def _has_nested_evil_quant(pattern: str) -> bool:
-    """非有界量化(* + {n,})されたグループの本体に、さらに非有界量化子か交代が『任意の深さ』で
-    含まれるか。(a+)+ / ((a+))+ / (a{2,})+ / ((a|a))+ 等の指数的バックトラックを、ネストを跨いで
-    検出する(平坦な _NESTED_QUANT/_ALTERNATION_QUANT はネスト内の量化子を見逃す)。"""
+    """反復(* + {n,}、または上限 > _BOUNDED_REPEAT_MAX の {n}/{m,n})されたグループの本体に、
+    さらに非有界量化子か交代が『任意の深さ』で含まれるか。(a+)+ / ((a+))+ / (a{2,})+ / ((a|a))+ /
+    (a|aa){24} 等の指数的バックトラックを、ネストを跨いで検出する(平坦な _NESTED_QUANT/
+    _ALTERNATION_QUANT はネスト内の量化子を見逃す)。"""
     i, n = 0, len(pattern)
     in_class = False
     stack = []
@@ -105,22 +139,54 @@ def _has_nested_evil_quant(pattern: str) -> bool:
         if c == ")":
             if stack:
                 start = stack.pop()
-                q = i + 1
-                outer_unbounded = False
-                if q < n and pattern[q] in "*+":
-                    outer_unbounded = True
-                elif q < n and pattern[q] == "{":
-                    j = pattern.find("}", q)
-                    if j != -1:
-                        inner = pattern[q + 1:j]
-                        if "," in inner and inner.split(",", 1)[1].strip() == "":
-                            outer_unbounded = True
-                if outer_unbounded and _body_has_unbounded_or_alt(pattern[start + 1:i]):
+                if (_outer_repeats(pattern, i + 1)
+                        and _body_has_unbounded_or_alt(pattern[start + 1:i])):
                     return True
             i += 1
             continue
         i += 1
     return False
+
+
+try:                                   # 標準 re の構文木(3.11+ は re._parser、3.10 は sre_parse)
+    from re import _parser as _sre_parse
+except ImportError:                    # pragma: no cover - Python 3.10
+    import sre_parse as _sre_parse     # type: ignore[no-redef]
+
+_REPEAT_OPS = tuple(getattr(_sre_parse, n) for n in
+                    ("MAX_REPEAT", "MIN_REPEAT", "POSSESSIVE_REPEAT")
+                    if hasattr(_sre_parse, n))
+
+
+def _has_nullable_repeat(pattern: str) -> bool:
+    """*空にも一致し得る* 本体を反復しているか: (a?){26} / (a?a?)+ / (?:x?y?){30} 等。
+    各回が『空 or 1 文字』を選べるため分け方が 2^回数 通りになり、(a?){26}a{26} は 26 文字で
+    1.4 秒、(a?a?)+b は 24 文字で 60 秒を超える。文字列走査では ? の意味(省略/グループ構文/
+    遅延)や入れ子を正しく追えないため、標準 re 自身の構文木で各反復の本体の最小幅を見る。
+    本体が空に一致し得る反復は書き手にとって無意味(a{0,26} 等で書ける)=弾いても失うものが無い。"""
+    try:
+        tree = _sre_parse.parse(pattern)
+    except Exception:
+        return False                    # 不正な正規表現は lint 本体の re.compile が理由を返す
+
+    def _walk(sp, depth=0) -> bool:
+        if depth > 100:
+            return False
+        for op, av in sp:
+            if op in _REPEAT_OPS:
+                _lo, hi, item = av
+                if hi > _BOUNDED_REPEAT_MAX and item.getwidth()[0] == 0:
+                    return True
+            for x in (av if isinstance(av, (tuple, list)) else (av,)):
+                subs = x if isinstance(x, (tuple, list)) else (x,)
+                for y in subs:
+                    if isinstance(y, _sre_parse.SubPattern) and _walk(y, depth + 1):
+                        return True
+        return False
+    try:
+        return _walk(tree)
+    except Exception:
+        return False
 
 
 def lint(pattern: str) -> str:
@@ -131,7 +197,9 @@ def lint(pattern: str) -> str:
         return f"パターンが長すぎ(<= {MAX_PATTERN_LEN})"
     if (_NESTED_QUANT.search(pattern) or _BOUND_THEN_STAR.search(pattern)
             or _ALTERNATION_QUANT.search(pattern)
-            or _has_nested_evil_quant(pattern)):
+            or _has_nested_evil_quant(pattern)
+            or _ADJ_SAME_QUANT.search(pattern)
+            or _has_nullable_repeat(pattern)):
         return "ネスト量化子/交代の反復の疑い(ReDoS 危険)"
     try:
         re.compile(pattern)

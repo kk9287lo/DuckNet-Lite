@@ -52,7 +52,19 @@ DuckNet L7 の防御と、それを制御する設定キーの一覧です(`NetS
 | 防御 | 主な設定キー | 既定 | 概要 |
 |---|---|---|---|
 | 信頼 proxy / 実IP | `trusted_proxies` | opt-in | 背後構成で XFF/XFP を信頼(未設定=一切信頼しない) |
-| サイト allowlist | `site_mode`, `site_whitelist` | opt-in | Host(ドメイン)許可。Host インジェクション対策 |
+| サイト allowlist | `site_mode`, `site_whitelist` | opt-in | Host(ドメイン)許可。Host インジェクション対策。`site_mode` は `off` / `whitelist` / `blacklist`。`whitelist` には `site_whitelist` が 1 件以上必要(下の注記) |
+
+> **サイト allowlist の空リスト**: `site_mode=whitelist` で `site_whitelist` が空になる変更(リストが空のまま
+> `whitelist` に切り替える・`whitelist` 運用中に最後の 1 件を消す/`[]` にする/全消去する)は、管理 API
+> (`/api/shield/config`)・リスト編集(`NetShield.edit_list`)・宣言的設定(`--config` / `DUCKNET_CONFIG`)の
+> どこからでも拒否され、何も適用されません(`ok:false` と理由を返します。宣言的設定では site 系のキーだけが
+> `rejected` に入り、他のキーは通常どおり適用されます)。空白だけの項目は空とみなします。非空のリストと
+> `site_mode=whitelist` を同じ変更で指定すれば受理されます。
+> 以前の版で保存済みの「`whitelist` + 空リスト」は、更新で締め出さないよう従来どおり **全 Host を許可** したまま
+> 動作します(`ip_mode=whitelist` / `geo_mode=allow` の空リストは全遮断なので、ここだけ逆です)。この状態は
+> `/api/state` の `shield.warnings`(`code: site_whitelist_empty`)と、起動時 1 回のシステムイベント
+> (`site_whitelist_empty`)で通知されます。許可する Host を `site_whitelist` に追加するか、`site_mode` を `off`
+> にしてください。
 
 ## 自己防衛 / 改竄耐性
 
@@ -102,10 +114,10 @@ DuckNet L7 の防御と、それを制御する設定キーの一覧です(`NetS
 | `geo_cidrs` | `(空)` | 地域判定に使う CIDR 一覧(GeoIP DB 不要) |
 | `quota_enabled` | `False` | 送出量/接続時間クォータの集計と超過判定を有効化 |
 | `quota_window_days` | `1` | 集計窓(1〜N日) |
-| `site_blacklist` | `(空)` | `site_mode=block` のときに拒否する Host(ドメイン)の一覧 |
-| `ip_mode` | `"off"` | `off` / `allow` / `block` — IP/CIDR リストの動作 |
-| `ip_whitelist` | `(空)` | `ip_mode=allow` のときに通す IP/CIDR の一覧 |
-| `ip_blacklist` | `(空)` | `ip_mode=block` のときに拒否する IP/CIDR の一覧 |
+| `site_blacklist` | `(空)` | `site_mode=blacklist` のときに拒否する Host(ドメイン)の一覧 |
+| `ip_mode` | `"off"` | `off` / `whitelist` / `blacklist` — IP/CIDR リストの動作 |
+| `ip_whitelist` | `(空)` | `ip_mode=whitelist` のときに通す IP/CIDR の一覧(空=全遮断) |
+| `ip_blacklist` | `(空)` | `ip_mode=blacklist` のときに拒否する IP/CIDR の一覧 |
 | `usage_record` | `True` | ホスト別の利用状況(リクエスト数等)を記録する |
 | `score_halflife_sec` | `30.0` | スコア半減期 |
 | `cadence_score` | `35` | 機械的規則性を検知した時の加点 |

@@ -27,8 +27,15 @@ from urllib.parse import urlparse
 
 from . import tray, ASSET_ICO
 
-_ADMIN_URL = os.environ.get("DUCKNET_ADMIN_URL", "http://127.0.0.1:8081")
-_BRAND = os.environ.get("DUCKNET_COVER", "").strip() or "DuckNet-Lite"
+# 接続先・表示名は main() の中で(app.env の取り込み後に)読む。import 時に固めていた頃は
+# `python -m dataplane.gui` で app.env の DUCKNET_ADMIN_URL / DUCKNET_COVER が効かなかった。
+def _admin_url() -> str:
+    return os.environ.get("DUCKNET_ADMIN_URL", "http://127.0.0.1:8081")
+
+
+def _brand() -> str:
+    return os.environ.get("DUCKNET_COVER", "").strip() or "DuckNet-Lite"
+
 
 _ABOUT_TEXT = (
     "{brand}\n\n"
@@ -36,7 +43,7 @@ _ABOUT_TEXT = (
     "外部依存ゼロ(Python 標準ライブラリのみ)・OS 非侵襲・防御専用。\n\n"
     "コアの L7 WAF/DDoS リバースプロキシと Web 管理ダッシュボードを提供します。\n"
     "詳細は README.md / docs、ダッシュボード右上の ❓ ヘルプを参照してください。"
-).format(brand=_BRAND)
+)                                                  # {brand} は表示時に埋める
 
 _CAPS_TEXT = (
     "無料版(DuckNet-Lite)でできること:\n\n"
@@ -103,20 +110,23 @@ def _gateway_up(host: str, port: int, timeout: float = 0.5) -> bool:
         return False
 
 
-def _spawn_gateway(admin_port: int, token: str):
+def _spawn_gateway(admin_port: int, token: str, admin_host: str = "127.0.0.1"):
     """本体(ゲートウェイ)を子プロセスで起動する。コンソール窓は出さない。ローカル(127.0.0.1)
     からブラウザで開けば自動でトークン Cookie が発行される。失敗時は None。"""
     backend = os.environ.get("DUCKNET_BACKEND", "127.0.0.1:8080")
     listen = os.environ.get("DUCKNET_LISTEN", "8443")
     cmd = [sys.executable, "-m", "dataplane",
            "--backend", backend, "--listen", str(listen),
-           "--admin", str(admin_port), "--admin-host", "127.0.0.1"]
+           "--admin", str(admin_port), "--admin-host", admin_host or "127.0.0.1"]
     # トークンは argv ではなく env で渡す: コマンドラインは他ユーザーから読める
     # (Linux の /proc/<pid>/cmdline は world-readable、Windows は WMI で取得可)。
     # env(/proc/<pid>/environ)は同一UID/root 限定=露出面が小さい。
     child_env = dict(os.environ)
     child_env["DUCKNET_ADMIN_TOKEN"] = token
-    kw = {"stdin": subprocess.DEVNULL, "env": child_env,
+    # 終了時は標準入力の 'stop' で graceful 停止を依頼する(_stop_child)。terminate() は
+    # Windows では即死で、ドレインも BAN の flush も走らない。
+    child_env["DUCKNET_STDIN_STOP"] = "1"
+    kw = {"stdin": subprocess.PIPE, "env": child_env,
           "stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
     if sys.platform.startswith("win"):
         kw["creationflags"] = 0x08000000 | 0x00000200   # CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP
@@ -165,26 +175,78 @@ def _ensure_gateway(base_url: str, token: str):
             return "", None                       # 占有プロセスへトークンを渡さない
         return token, None
     tok = token or secrets.token_urlsafe(24)
-    child = _spawn_gateway(port, tok)
+    # 子の管理APIは、到達確認するのと同じ host で待受けさせる(http://[::1]:PORT なのに
+    # 127.0.0.1 で起動すると永遠に見つけられない)。ループバック以外は従来どおり 127.0.0.1
+    # =トレイの自動起動で管理画面をネットワークへ出さない。
+    child = _spawn_gateway(port, tok, host if _is_loopback(host) else "127.0.0.1")
     if child is not None:
-        for _ in range(30):
-            if _gateway_up(host, port):
-                break
-            time.sleep(0.2)
+        try:
+            for _ in range(30):
+                if _gateway_up(host, port):
+                    break
+                time.sleep(0.2)
+        except BaseException:                     # 待機中の Ctrl-C 等でも子を孤児にしない
+            _stop_child(child)
+            raise
     return tok, child
 
 
+def _is_loopback(host: str) -> bool:
+    import ipaddress
+    try:
+        return ipaddress.ip_address((host or "").strip("[]")).is_loopback
+    except ValueError:
+        return False
+
+
+def _stop_wait() -> float:
+    """graceful 停止を待つ上限秒数: 本体のドレイン猶予(DUCKNET_DRAIN_GRACE、既定 5)+後始末の余裕。"""
+    try:
+        grace = float(os.environ.get("DUCKNET_DRAIN_GRACE", "") or 5.0)
+    except ValueError:
+        grace = 5.0
+    return max(0.0, min(grace, 120.0)) + 5.0
+
+
 def _stop_child(child):
-    """本launcher が起動した子プロセス(本体)を穏当に停止する。None/停止済みは無視。"""
+    """本launcher が起動した子プロセス(本体)を穏当に停止する。None/停止済みは無視。
+    まず標準入力の 'stop' で graceful 停止(ドレイン→BAN の flush)を依頼し、上限時間内に
+    終わらなければ terminate → kill へ落とす。"""
     if child is None:
         return
+    pipe = getattr(child, "stdin", None)
     try:
-        if child.poll() is None:
-            child.terminate()
-            try:
-                child.wait(timeout=3)
-            except Exception:
-                child.kill()
+        if child.poll() is not None:
+            if pipe is not None:
+                pipe.close()
+            return
+    except Exception:
+        return
+    asked = False
+    if pipe is not None:
+        try:
+            pipe.write(b"stop\n")
+            pipe.flush()
+            asked = True
+        except Exception:
+            pass                                  # 既に終了している/パイプが壊れている
+        try:
+            pipe.close()
+        except Exception:
+            pass
+    if asked:
+        try:
+            child.wait(timeout=_stop_wait())
+            return
+        except Exception:
+            pass
+    try:
+        child.terminate()
+        try:
+            child.wait(timeout=3)
+        except Exception:
+            child.kill()
+            child.wait(timeout=3)
     except Exception:
         pass
 
@@ -205,9 +267,11 @@ def main(argv=None) -> int:
               "Lite は CLI + Web ダッシュボードで運用してください。", file=sys.stderr)
         return 0
 
+    admin_url, brand = _admin_url(), _brand()      # app.env の取り込み後に読む
+
     # 本体(ゲートウェイ)も一緒に起動: 管理APIが未待受なら子プロセスで起動する
     # (既に稼働中なら起動しない)。gw は終了時に停止する。
-    _tok, gw = _ensure_gateway(_ADMIN_URL, os.environ.get("DUCKNET_ADMIN_TOKEN", ""))
+    _tok, gw = _ensure_gateway(admin_url, os.environ.get("DUCKNET_ADMIN_TOKEN", ""))
 
     stop = threading.Event()
 
@@ -221,13 +285,13 @@ def main(argv=None) -> int:
     def _on_action(aid):
         if aid == "dash":
             try:
-                webbrowser.open(_ADMIN_URL)
+                webbrowser.open(admin_url)
             except Exception:
                 pass
         elif aid == "about":
-            _msgbox(_ABOUT_TEXT, "About — " + _BRAND)
+            _msgbox(_ABOUT_TEXT.format(brand=brand), "About — " + brand)
         elif aid == "caps":
-            _msgbox(_CAPS_TEXT, _BRAND)
+            _msgbox(_CAPS_TEXT, brand)
         elif aid == "quit":
             try:
                 if ti is not None:
@@ -235,7 +299,11 @@ def main(argv=None) -> int:
             finally:
                 stop.set()
 
-    ti = tray.TrayIcon(_asset_path(ASSET_ICO), _BRAND, items, _on_action)
+    try:
+        ti = tray.TrayIcon(_asset_path(ASSET_ICO), brand, items, _on_action)
+    except BaseException:                          # 構築失敗でも起動した本体を孤児にしない
+        _stop_child(gw)
+        raise
     if not ti.start():
         print("トレイの起動に失敗しました。", file=sys.stderr)
         _stop_child(gw)

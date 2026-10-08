@@ -25,6 +25,12 @@ DuckNet の挙動は CLI 引数・環境変数・設定キー(cfg)で制御し�
 | `DUCKNET_LISTEN` | `8443` | トレイから本体を起動するときの前衛ガード待受ポート。 |
 | `DUCKNET_ORIGIN_KEY` | (生成) | バックエンド・バイパス防止トークン(エッジ経由を証明する時間有界トークン)の鍵。バックエンド側と揃える。 |
 
+> 管理 API の状態変更 POST は、CSRF 対策として `Origin`(無ければ `Referer`)を `Host` と **ホスト名とポートの両方** で
+> 照合し、不一致は 403 にします。前段のリバースプロキシが `Host` をポート抜きに書き換える構成(例: `https://admin.example:8443`
+> で公開し `Host: admin.example` で転送)では、公開ホスト名を `DUCKNET_ADMIN_ALLOWED_HOSTS` に加えてください。
+> また Cookie 認証(ブラウザ)の POST は `Content-Type: application/json` 必須です(それ以外は 415)。
+> `X-Token` / `Authorization: Bearer` で認証するクライアントは対象外です。
+
 ## 主な設定キー(cfg)
 
 | キー | 既定 | 説明 |

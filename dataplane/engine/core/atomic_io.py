@@ -19,10 +19,33 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import threading
+import time
 from typing import Any
 
 _MAX_READ_BYTES = 64 * 1024 * 1024   # 状態JSONの読込上限(#111: 書込権限を持つ攻撃者が巨大
                                       # ファイルを置いてメモリ/CPUを浪費させる DoS を防ぐ)
+
+# Windows の共有違反: Python の open() は FILE_SHARE_DELETE 無しで開くため、誰か(管理 API の
+# 読み手・別プロセス・ウイルス対策/インデクサ)が開いている間は os.replace が、置換の最中は
+# open が PermissionError になる。POSIX には無い一時的な失敗なので、Windows でだけ短い有界
+# バックオフで再試行する(合計 約 0.43 秒で諦める)。POSIX の PermissionError は本物の権限
+# 不足なので待たない。
+_WIN = os.name == "nt"
+_SHARE_RETRIES = 10
+
+
+def _retry_sharing(fn, *args):
+    if not _WIN:
+        return fn(*args)
+    delay = 0.002
+    for _ in range(_SHARE_RETRIES - 1):
+        try:
+            return fn(*args)
+        except PermissionError:
+            time.sleep(delay)
+            delay = min(delay * 2, 0.1)
+    return fn(*args)
 
 
 def default_state_dir() -> str:
@@ -33,7 +56,8 @@ def default_state_dir() -> str:
             or os.path.join(os.path.expanduser("~"), ".cache", "dataplane"))
 
 
-def atomic_write_text(path: str, text: str, *, encoding: str = "utf-8") -> bool:
+def atomic_write_text(path: str, text: str, *, encoding: str = "utf-8",
+                      errors: str = "strict") -> bool:
     """text を path へ原子的に書き込む。成功で True。失敗してもオリジナルは無傷。
     一時ファイル名はランダム化し O_CREAT|O_EXCL で新規作成する(#111: 旧来の predictable な
     `path.tmp.<pid>` は、状態dirが(ステルス運用等で)共有/書込可能な場所を指す構成だと、
@@ -43,14 +67,14 @@ def atomic_write_text(path: str, text: str, *, encoding: str = "utf-8") -> bool:
         d = os.path.dirname(path) or "."
         os.makedirs(d, exist_ok=True)
         fd, tmp = tempfile.mkstemp(prefix=f".{os.path.basename(path)}.", suffix=".tmp", dir=d)
-        with os.fdopen(fd, "w", encoding=encoding) as f:
+        with os.fdopen(fd, "w", encoding=encoding, errors=errors) as f:
             f.write(text)
             f.flush()
             try:
                 os.fsync(f.fileno())          # ディスクへ確実に
             except OSError:
                 pass
-        os.replace(tmp, path)                 # 原子置換(同一FS)
+        _retry_sharing(os.replace, tmp, path)  # 原子置換(同一FS)。Windows の共有違反は待って再試行
         tmp = None
         try:                                  # 親ディレクトリも同期(対応FSのみ)
             dfd = os.open(d, os.O_RDONLY)
@@ -79,7 +103,11 @@ def atomic_write_json(path: str, obj: Any, *, indent: int = 2) -> bool:
         text = json.dumps(obj, ensure_ascii=False, indent=indent)
     except Exception:
         return False
-    return atomic_write_text(path, text)
+    # backslashreplace: json.loads は '\udc80' のような孤立サロゲートをそのまま作るが、厳格な
+    # UTF-8 では書けず保存が黙って失敗していた(管理 API で入った値 1 つで以後の保存が全滅)。
+    # JSON 出力で UTF-8 に書けないのは文字列中の孤立サロゲートだけで、その \udXXX 表記は
+    # JSON の正しいエスケープ=読み戻すと同じ値になる。それ以外の文字は従来どおり生で書く。
+    return atomic_write_text(path, text, errors="backslashreplace")
 
 
 def safe_read_json(path: str, default: Any = None) -> Any:
@@ -92,11 +120,17 @@ def safe_read_json(path: str, default: Any = None) -> Any:
             if os.path.isfile(candidate):
                 if os.path.getsize(candidate) > _MAX_READ_BYTES:
                     continue
-                with open(candidate, encoding="utf-8") as f:
-                    return json.load(f)
+                # 置換の最中/他ハンドル保持中の一時的な共有違反(Windows)を『欠損』扱いしない
+                # (署名付き状態が 'missing' に見えて既定値へ戻っていた)。
+                return _retry_sharing(_load_json_file, candidate)
         except Exception:
             continue
     return default
+
+
+def _load_json_file(p: str):
+    with open(p, encoding="utf-8") as f:
+        return json.load(f)
 
 
 _O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)   # POSIX: 最終要素が symlink なら失敗
@@ -114,12 +148,12 @@ def _rotate(path: str, backups: int) -> None:
         try:
             src = f"{path}.{i - 1}"
             if os.path.exists(src):
-                os.replace(src, f"{path}.{i}")
+                _retry_sharing(os.replace, src, f"{path}.{i}")
         except Exception:
             pass
     try:
         if os.path.exists(path):
-            os.replace(path, f"{path}.1")     # 現行 → path.1
+            _retry_sharing(os.replace, path, f"{path}.1")     # 現行 → path.1
     except Exception:
         pass
 
@@ -135,17 +169,34 @@ def append_jsonl(path: str, obj: Any, *, max_bytes: int = 5_000_000,
     try:
         d = os.path.dirname(path) or "."
         os.makedirs(d, exist_ok=True)
-        try:
-            cur = os.path.getsize(path)
-        except OSError:
-            cur = 0
-        if cur and cur + len(line.encode(encoding, "replace")) > max_bytes:
-            _rotate(path, max(1, backups))
-        with _open_append_nofollow(path, encoding) as f:
-            f.write(line)
+        # 同一プロセスの複数スレッド(ThreadingHTTPServer の管理 API 等)がローテーションを
+        # 同時に走らせると、押し出し(.1→.2 …)が交錯して世代ファイルを上書きし行が消えていた。
+        # サイズ判定〜ローテーション〜追記をパス単位で直列化する。
+        with _append_lock(path):
+            try:
+                cur = os.path.getsize(path)
+            except OSError:
+                cur = 0
+            if cur and cur + len(line.encode(encoding, "replace")) > max_bytes:
+                _rotate(path, max(1, backups))
+            with _retry_sharing(_open_append_nofollow, path, encoding) as f:
+                f.write(line)
         return True
     except Exception:
         return False
+
+
+_APPEND_LOCKS: dict = {}
+_APPEND_LOCKS_GUARD = threading.Lock()
+
+
+def _append_lock(path: str):
+    key = os.path.abspath(path)
+    with _APPEND_LOCKS_GUARD:
+        lk = _APPEND_LOCKS.get(key)
+        if lk is None:
+            lk = _APPEND_LOCKS[key] = threading.Lock()
+        return lk
 
 
 def _open_append_nofollow(path: str, encoding: str):
@@ -159,7 +210,9 @@ def _open_append_nofollow(path: str, encoding: str):
     except OSError:
         pass
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND | _O_NOFOLLOW, 0o600)
-    return os.fdopen(fd, "a", encoding=encoding)
+    # backslashreplace: 孤立サロゲートを含む行を UnicodeEncodeError で黙って捨てない
+    # (JSON 文字列中の \udXXX はそのまま正しいエスケープ。atomic_write_json と同じ理由)。
+    return os.fdopen(fd, "a", encoding=encoding, errors="backslashreplace")
 
 
 _TAIL_AVG_LINE = 512   # 末尾読みの初期見積り(1行あたりバイト数)
@@ -177,14 +230,20 @@ def tail_jsonl(path: str, n: int = 50) -> list:
         # 管理画面がポーリングで叩くため、ログが育つほど 1 回の読み取り量が増える
         # (= 蓄積量 x ポーリング回数)。末尾から必要なぶんだけ遡って読む。
         want = n * _TAIL_AVG_LINE
-        with open(path, "rb") as f:
+        with _retry_sharing(open, path, "rb") as f:
             f.seek(0, os.SEEK_END)
             size = f.tell()
             for _ in range(_TAIL_MAX_ROUNDS):
                 start = max(0, size - want)
                 f.seek(start)
                 raw = f.read(size - start)
-                lines = raw.decode("utf-8", "replace").splitlines()
+                # 行区切りは *バイトの* \n だけ。str.splitlines() は U+0085/U+2028/U+2029 でも
+                # 割るため、それを含む記録(latin-1 で読んだ UA の 0x85 等)が 2 つの壊れた断片に
+                # なって捨てられ、管理画面から消えていた(ログ回避)。UTF-8 の多バイト文字は
+                # 0x0A を含まないので、復号前に割っても文字は壊れない。
+                lines = [ln.decode("utf-8", "replace") for ln in raw.split(b"\n")]
+                if lines and not lines[-1].strip():
+                    lines.pop()                 # 末尾の改行が作る空要素(splitlines と同じ数え方)
                 if start > 0:
                     lines = lines[1:]           # 先頭は途中で切れている可能性がある
                 if len(lines) >= n or start == 0:

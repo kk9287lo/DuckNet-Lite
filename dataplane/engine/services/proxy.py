@@ -19,7 +19,6 @@ proxy.py — stdlib asyncio による Fail-Fast 前衛ガード(依存ゼロの�
 from __future__ import annotations
 
 import asyncio
-import ipaddress
 import json
 import os
 import re
@@ -92,6 +91,88 @@ def _request_declares_body(buf: bytes) -> bool:
     return False
 
 
+_CHUNK_HEX = re.compile(rb"\A[0-9A-Fa-f]{1,16}\Z")
+_CHUNK_LINE_MAX = 8192      # サイズ行/trailer 行の上限(超える行は枠の破損とみなす)
+
+
+class _ChunkedEnd:
+    """chunked 本文の *終端位置* を逐次に追跡する(#18)。本文は保持しない=メモリは行バッファのみ。
+    feed(data) は data のうち *この本文に属する* 先頭バイト数を返す。last-chunk + trailer + 空行に
+    達したら done。枠が RFC 7230 §4.1 の厳密形でなければ bad(どこで終わるか backend と一致させ
+    られない=呼び出し側はそこで転送を止める)。終端より後ろのバイトはパイプライン化された後続要求で
+    あり、転送してはならない(旧実装は読取が '0\\r\\n\\r\\n' で *ちょうど終わる* ときしか完了と
+    見なさず、後ろに第2要求が続くと丸ごと転送していた。逆に chunk データが偶然その並びで終わる
+    パケット境界では本文の途中で転送を打ち切っていた)。"""
+    __slots__ = ("_st", "_line", "_left", "consumed", "done", "bad")
+
+    def __init__(self):
+        self._st = "size"             # size → data → crlf → size … → trailer
+        self._line = bytearray()
+        self._left = 0
+        self.consumed = 0             # これまでに本文として受理した総バイト数
+        self.done = self.bad = False
+
+    def feed(self, data: bytes) -> int:
+        i, n = 0, len(data)
+        while i < n and not (self.done or self.bad):
+            if self._st == "data":
+                take = min(self._left, n - i)
+                i += take
+                self._left -= take
+                if self._left == 0:
+                    self._st = "crlf"
+                continue
+            j = data.find(b"\n", i)
+            if j < 0:
+                self._line += data[i:]
+                i = n
+                if len(self._line) > _CHUNK_LINE_MAX:
+                    self.bad = True
+                break
+            self._line += data[i:j + 1]
+            i = j + 1
+            ln = bytes(self._line)
+            self._line.clear()
+            if len(ln) > _CHUNK_LINE_MAX or not ln.endswith(b"\r\n") or b"\r" in ln[:-2]:
+                self.bad = True       # 裸 LF / 行中の裸 CR / 過大行=境界の解釈が割れる
+                break
+            ln = ln[:-2]
+            if self._st == "crlf":
+                if ln:
+                    self.bad = True   # chunk データの直後は CRLF のみ
+                    break
+                self._st = "size"
+            elif self._st == "size":
+                sz = ln.split(b";", 1)[0].strip(b" \t")   # chunk-ext(;...)は捨てる
+                if not _CHUNK_HEX.match(sz):
+                    self.bad = True   # 0x 接頭辞・符号・空 等も拒否(int(,16) は受理してしまう)
+                    break
+                size = int(sz, 16)
+                if size == 0:
+                    self._st = "trailer"
+                else:
+                    self._left, self._st = size, "data"
+            elif not ln:              # trailer 部の空行=本文終端
+                self.done = True
+        if self.bad:
+            return 0
+        self.consumed += i
+        return i
+
+
+def _resp_status(line: bytes) -> int:
+    """応答行(HTTP/1.x NNN ...)のステータスコード。読めなければ 0。"""
+    parts = line.split(b" ")
+    if len(parts) >= 2 and parts[0].startswith(b"HTTP/") and parts[1].isdigit():
+        return int(parts[1])
+    return 0
+
+
+def _is_interim(code: int) -> bool:
+    """1xx 中間応答(100 Continue / 103 Early Hints 等)か。101 はプロトコル切替=最終応答。"""
+    return 100 <= code < 200 and code != 101
+
+
 def _strip_request_headers(buf: bytes, names_lower) -> bytes:
     """転送リクエスト head から指定ヘッダ(小文字名の集合)を除去する(#75)。リクエストライン/
     body は保持。head 不完全は不変。キャッシュ汚染を招く unkeyed ヘッダ(X-Forwarded-Host 等)を
@@ -143,16 +224,34 @@ def _header_value(buf: bytes, name_lower: bytes) -> str:
     return ", ".join(out)
 
 
-_MAX_XFF_HOPS = 16          # X-Forwarded-For を辿る最大ホップ数(実運用は数個)
+def _header_values(buf: bytes, name_lower: bytes) -> list:
+    """head から指定ヘッダ(小文字名)の値を *出現ごとに* リストで返す(無ければ [])。
+    _header_value の連結は XFF/XFP のようなリスト型ヘッダ用。Authorization / X-API-Key /
+    メソッド override のような *単一値* フィールドを連結すると、検査するのは
+    'Bearer a, Bearer b' という *どの backend も採らない値* になる(Node/Go は先頭の 1 本を採る)。
+    実測: alg:none JWT を 2 本並べると JWT と認識されず素通りした(#16)。単一値フィールドは
+    本関数で本数を確かめてから使う。名前は ':' 手前で切って正規化する(_strip_request_headers と同じ)。"""
+    head = buf.split(b"\r\n\r\n", 1)[0]
+    out = []
+    for ln in head.split(b"\r\n")[1:]:
+        k, sep, v = ln.partition(b":")
+        if sep and k.strip().lower() == name_lower:
+            out.append(v.strip().decode("latin-1", "replace"))
+    return out
+
+
+_MAX_XFF_HOPS = 16         # X-Forwarded-For を辿る最大ホップ数(実運用は数個)
 
 
 def _real_client_ip(peer_ip: str, buf: bytes, trusted) -> str:
     """信頼 proxy 経由のときだけ X-Forwarded-For から実クライアントIPを解決する。
     peer が trusted CIDR に含まれない(=直結 or 未設定)なら **XFF を信頼しない**(偽装無効化)。
-    含まれるなら XFF を右(最も近いhop)から辿り、trusted でない最初の妥当IP=実クライアント。"""
+    含まれるなら XFF を右(最も近いhop)から辿り、trusted でない最初の妥当IP=実クライアント。
+    採った候補は NetShield と同じ正規形(pipeline._canon_ip)で返す。"""
     if not trusted or not peer_ip:
         return peer_ip
     from ..lifeform.netutil import ip_in_any
+    from ..lifeform.pipeline import _canon_ip
     if not ip_in_any(peer_ip, trusted):
         return peer_ip
     xff = _header_value(buf, b"x-forwarded-for")
@@ -162,12 +261,19 @@ def _real_client_ip(peer_ip: str, buf: bytes, trusted) -> str:
     # 1 リクエストあたりの照合回数(x 信頼 CIDR 数)を伸ばせた。実運用の hop は数個。
     _hops = [p.strip() for p in xff.split(",", _MAX_XFF_HOPS) if p.strip()][:_MAX_XFF_HOPS]
     for cand in reversed(_hops):
-        try:
-            ipaddress.ip_address(cand)                # 妥当なIPのみ採用
-        except ValueError:
+        # 妥当な単一IPのみ採用し、正規形(小文字/圧縮・IPv4-mapped は純IPv4)にしてから使う。
+        # 生の綴りを返すと '2001:DB8::1' 等の別表記が BAN/リスト/状態の鍵(正規形)と一致せず、
+        # BAN 済みクライアントが新顔として通った。信頼 hop の照合も正規形で行う(::ffff:10.0.0.9
+        # も信頼側)。ゾーンID付き(fe80::1%eth0。任意文字を運べる)は捨てずにゾーンだけ外す:
+        # 捨てて左へ進むと、信頼 proxy が付けた接続元の代わりに *クライアントが自分で書いた*
+        # 値を採ってしまう(BAN 回避・なりすまし)。peer の _norm_ip と同じ扱い。
+        c = _canon_ip(cand)
+        if not c and "%" in cand:
+            c = _canon_ip(cand.split("%", 1)[0])
+        if not c:
             continue
-        if not ip_in_any(cand, trusted):
-            return cand
+        if not ip_in_any(c, trusted):
+            return c
     return peer_ip
 
 
@@ -517,19 +623,40 @@ def _neutralize_cors(lines) -> list:
     return lines
 
 
+_URL_SCHEME = re.compile(r"\A([A-Za-z][A-Za-z0-9+.\-]*):")
+_SPECIAL_SCHEMES = ("http", "https", "ws", "wss", "ftp")
+_C0_OR_SPACE = "".join(chr(c) for c in range(0x21))
+
+
 def _location_host(loc: str) -> str:
     """Location 値から *絶対* リダイレクト先のホストを取り出す(小文字)。相対パス(/foo)や
-    判定不能は ""(=同一サイト扱い)。scheme://host/.. と scheme 相対 //host/.. の両方に対応。"""
-    v = loc.strip()
-    low = v.lower()
-    if low.startswith("//"):
-        rest = v[2:]
-    elif "://" in low:
-        rest = v.split("://", 1)[1]
+    判定不能は ""(=同一サイト扱い)。ブラウザ(WHATWG URL)と同じ正規化をしてから判定する(#61):
+      · 前後の C0 制御文字/空白を除き、値の中の TAB/CR/LF を取り除く
+      · http(s) では '\\' は '/' と同義(/\\evil や \\\\evil は //evil=外部ホスト)
+      · 特殊スキームの後ろの '/' の本数は問わない(https:evil / https:/evil も host=evil)
+      · userinfo は *最後の* '@' まで(https://evil\\@site は host=evil)
+    旧実装は '//' と '://' しか見ず、これらを相対/自サイト扱いして外部リダイレクトを通していた。
+    逆に相対パスのクエリ中の URL(/sso?next=https://x)を外部扱いする誤検知もあった(スキームは
+    先頭にしか現れない)。"""
+    v = loc.strip(_C0_OR_SPACE)
+    v = v.replace("\t", "").replace("\r", "").replace("\n", "").replace("\\", "/")
+    m = _URL_SCHEME.match(v)
+    if m:
+        rest = v[m.end():]
+        if m.group(1).lower() in _SPECIAL_SCHEMES:
+            rest = rest.lstrip("/")
+        elif rest.startswith("//"):
+            rest = rest[2:]
+        else:
+            return ""                               # mailto:/javascript: 等=ホスト無し
+    elif v.startswith("//"):
+        rest = v.lstrip("/")                        # scheme 相対(/// も同じホスト)
     else:
         return ""                                   # 相対=同一サイト=対象外
-    host = rest.split("/", 1)[0].split("?", 1)[0].split("#", 1)[0]
-    return host.split("@", 1)[-1].split(":", 1)[0].strip().lower()   # userinfo/port 除去
+    host = re.split(r"[/?#]", rest, maxsplit=1)[0].rsplit("@", 1)[-1]   # userinfo 除去
+    if host.startswith("["):                        # IPv6 リテラル [..]:port
+        return host.split("]", 1)[0].lower() + "]"
+    return host.split(":", 1)[0].strip().lower()    # port 除去
 
 
 def _redirect_violation_host(status_line: str, lines, req_host: str, allow) -> str:
@@ -567,7 +694,7 @@ def inject_security_headers(head: bytes, cfg, tls: bool = False, *,
         補完(#65)。
       · harden_cors(既定False): ACAO:*/null + ACAC:true の危険な CORS 誤設定を無害化(#69)。
       · 各加工は独立に効く(_pipe が cfg フラグから渡す)。
-      · WS/プロトコル切替(101/Upgrade)や応答行が読めないものは触らない(壊さない)。"""
+      · WS/プロトコル切替(101)や応答行が読めないものは触らない(壊さない)。"""
     try:
         text = head.decode("latin1")
     except Exception:
@@ -575,8 +702,11 @@ def inject_security_headers(head: bytes, cfg, tls: bool = False, *,
     lines = text.split("\r\n")
     if not lines or not lines[0].startswith("HTTP/"):
         return head                                        # 応答行が読めない=非介入
-    low = text.lower()
-    if " 101 " in lines[0] or "upgrade" in low:            # WebSocket 等の切替は触らない
+    # WebSocket 等の切替(101)は触らない。切替は 101 でしか起きないので *ステータスで* 判定する
+    # (#92)。旧実装は head のどこかに "upgrade" があるだけで全加工を外していた=
+    # Vary: Upgrade-Insecure-Requests(一般的)・Apache の Upgrade: h2,h2c 告知・Cookie 値や
+    # Location の部分一致で、防御ヘッダ/SameSite 補完/CORS 無害化がまとめて消えた。
+    if _resp_status(lines[0].encode("latin1")) == 101:
         return head
     strip = ({str(h).strip().lower() for h in (cfg.get("sec_headers_strip") or [])}
              if add_headers else set())
@@ -913,13 +1043,37 @@ class AsyncEdgeGuard:
                     return await self._serve_block_page(ip, sh, writer)
                 return self._close(writer)        # 444相当・inspectを呼ぶことすら贅沢
             q = path.split("?", 1)[1] if "?" in path else ""
-            _auth = _header_value(buf, b"authorization")
-            _cred = (_auth[7:].strip() if _auth[:7].lower() == "bearer "
-                     else _header_value(buf, b"x-api-key"))   # #70: クレデンシャル識別子
-            _ovr = (_header_value(buf, b"x-http-method-override")     # #72: メソッド override
-                    or _header_value(buf, b"x-method-override")
-                    or _header_value(buf, b"x-http-method"))
-            _opath = (_header_value(buf, b"x-original-url")           # #73: パス override
+            # 単一値ヘッダの重複/食い違い(#16 #17 #57): Authorization / X-API-Key が複数本、または
+            #   メソッド override の値が複数(同名の重複・別名の併用・カンマ列挙)だと、検査した値と
+            #   backend が採る値が一致する保証が無い(Node/Go は先頭の 1 本、Express の
+            #   method-override は先頭トークン、別名は backend の設定次第)。連結値を検査していた
+            #   ため alg:none JWT・遮断メソッド・クレデンシャル単位レートを全て素通りできた。
+            #   どれを採っても安全と言えないので 400 で拒否する(正規クライアントは送らない形)。
+            _auths = _header_values(buf, b"authorization")
+            _keys = _header_values(buf, b"x-api-key")
+            _ovrs = list(dict.fromkeys(
+                t.strip().upper()
+                for _n in (b"x-http-method-override", b"x-method-override", b"x-http-method")
+                for v in _header_values(buf, _n) for t in v.split(",") if t.strip()))
+            if len(_auths) > 1 or len(_keys) > 1 or len(_ovrs) > 1:
+                self.metrics["dropped"] += 1
+                self.metrics["dup_header"] = self.metrics.get("dup_header", 0) + 1
+                writer.write(_http_response("400 Bad Request",
+                                            '{"error":"conflicting header values"}',
+                                            extra=deception.headers_for(ip)))
+                try:
+                    await writer.drain()
+                except Exception:
+                    pass
+                return self._close(writer)
+            _auth = _auths[0] if _auths else ""
+            # #70: クレデンシャル識別子は *載っている全部* を渡す(Bearer と X-API-Key の両方)。
+            #   Bearer があると X-API-Key を数えていなかったため、毎回ランダムな Bearer を添えて
+            #   盗んだ API キーで認証させると識別子が毎回変わり、キー単位の上限が発動しなかった。
+            _creds = ((_auth[7:].strip() if _auth[:7].lower() == "bearer " else ""),
+                      (_keys[0] if _keys else ""))
+            _ovr = _ovrs[0] if _ovrs else ""             # #72: メソッド override
+            _opath =(_header_value(buf, b"x-original-url")           # #73: パス override
                       or _header_value(buf, b"x-rewrite-url")
                       or _header_value(buf, b"x-override-url"))
             # 判定不能(例外)を「許可」にしない=フェイルクローズ(#111)。ここは唯一の
@@ -929,7 +1083,7 @@ class AsyncEdgeGuard:
                                user_agent=ua, query=q, zone=zone, tls=tls, host=host,
                                headers=_scan_header_values(buf),
                                header_names=_header_names(buf),
-                               auth=_auth, cred=_cred, override_method=_ovr,
+                               auth=_auth, cred=_creds, override_method=_ovr,
                                override_path=_opath,
                                range_header=_header_value(buf, b"range"))   # #76
             except Exception:
@@ -1052,29 +1206,52 @@ class AsyncEdgeGuard:
                 extra, blocked = await self._scan_request_body(buf, reader, ip, path)
                 if blocked:
                     self.metrics["dropped"] += 1
+                    if blocked == "unscannable":
+                        # #93: 解けない Content-Encoding は 415 を返す(writer を持つここで送る)。
+                        try:
+                            writer.write(_http_response(
+                                "415 Unsupported Media Type",
+                                '{"ok":false,"error":"unsupported content-encoding"}',
+                                extra=deception.headers_for(ip)))
+                            await writer.drain()
+                        except Exception:
+                            pass
                     return self._close(writer)        # 悪性本文は上流へ流さない(backend は受信せず)
-                bwr.write(fwd)
-                if extra:
-                    bwr.write(extra)                  # buf を超えて読んだ本文先頭も転送
-                await bwr.drain()
-                # #D3: 宣言された本文長ぶんだけを backend へ渡し、それ以降(パイプライン化された
-                #   後続要求)を流さない=#46(bodyless)の半クローズ保証を body 有り要求へ拡張し、
-                #   backend の Connection:close 尊重に依存した smuggling を封じる。走査で本文を
-                #   読み切っている(cap 以下=大多数)なら即 write_eof し client→backend パイプを
-                #   張らない(後続要求は reader に残したまま=転送されず接続 close で破棄)。
-                body_in_buf = buf.partition(b"\r\n\r\n")[2]
-                prefix_len = len(body_in_buf) + len(extra)
+                # #D3/#18: 宣言された本文の *ちょうど末尾まで* を backend へ渡し、それ以降(パイプ
+                #   ライン化された後続要求)を流さない=#46(bodyless)の半クローズ保証を body 有り
+                #   要求へ拡張し、backend の Connection:close 尊重に依存した smuggling を封じる。
+                #   旧実装は buf(と extra)を *丸ごと* 書いてから本文完了を判定していた。_read_head は
+                #   4KiB 単位で読むので buf には本文の後ろのバイトが乗る(CL:0 と第2要求を 1 パケットで
+                #   送るだけで未検査の要求が届いた)。CL はバイト数で、chunked は枠を逐次解析して切る。
+                #   走査で本文を読み切っている(cap 以下=大多数)なら即 write_eof し client→backend
+                #   パイプを張らない(後続要求は転送されず接続 close で破棄)。
+                data = buf.partition(b"\r\n\r\n")[2] + extra
                 _te = _header_value(buf, b"transfer-encoding").lower()
                 _clh = _header_value(buf, b"content-length")
                 _cl = int(_clh) if _clh.isdigit() else None
+                trk = None
                 if "chunked" in _te:
-                    body_done = (body_in_buf + extra).endswith(b"0\r\n\r\n")
-                    remaining = None
+                    trk = _ChunkedEnd()
+                    used = trk.feed(data)
+                    if trk.bad:
+                        # 枠の壊れた chunked=どこで終わるか backend と一致させられない。転送しない。
+                        self.metrics["dropped"] += 1
+                        try:
+                            writer.write(_http_response(
+                                "400 Bad Request", '{"error":"malformed chunked body"}',
+                                extra=deception.headers_for(ip)))
+                            await writer.drain()
+                        except Exception:
+                            pass
+                        return self._close(writer)
+                    body_done, remaining = trk.done, None
                 elif _cl is not None:
-                    body_done = prefix_len >= _cl
-                    remaining = max(0, _cl - prefix_len)
+                    used = min(len(data), _cl)
+                    body_done, remaining = used >= _cl, _cl - used
                 else:
-                    body_done, remaining = True, 0
+                    used, body_done, remaining = 0, True, 0
+                bwr.write(fwd.partition(b"\r\n\r\n")[0] + b"\r\n\r\n" + data[:used])
+                await bwr.drain()
                 if body_done:
                     try:
                         if bwr.can_write_eof():
@@ -1087,7 +1264,7 @@ class AsyncEdgeGuard:
                 else:
                     # 本文が cap 超で未読=宣言長ぶんだけ有界転送(#64 の総受信デッドライン尊重)。
                     res = await asyncio.gather(
-                        self._pipe_body_bounded(reader, bwr, remaining, "chunked" in _te,
+                        self._pipe_body_bounded(reader, bwr, remaining, trk,
                                                 self._body_deadline()),
                         self._pipe(bre, writer, scan=True, ip=ip, tls=tls, req_host=host))
                     inbound += len(extra) + res[0]
@@ -1098,10 +1275,15 @@ class AsyncEdgeGuard:
             self._close(writer)
             self._close(bwr)
             # データ漏洩防止: 送出量/接続時間を集計(上限超過時はNetShieldが当該IPを遮断)
+            # host/method/path も渡す(渡さないと使用量の宛先サイト内訳と usage_log の
+            # host/method/path が常に空)。Host/method は攻撃者が任意長で送れるので、宛先キー/
+            # ログ行が青天井にならないよう DNS 名の上限程度に切る(path は記録側で切る)。
             try:
                 from ..lifeform.pipeline import net_shield
                 net_shield().record_traffic(ip, out_bytes=outbound,
-                                            in_bytes=inbound, conn_sec=time.time() - start)
+                                            in_bytes=inbound, conn_sec=time.time() - start,
+                                            host=(host or "")[:255],
+                                            method=(method or "")[:32], path=path)
             except Exception:
                 pass
 
@@ -1171,8 +1353,20 @@ class AsyncEdgeGuard:
         enc = (encoding or "").strip().lower()
         try:
             if enc in ("gzip", "x-gzip"):
-                d = zlib.decompressobj(16 + zlib.MAX_WBITS)
-                return d.decompress(data, max_out)
+                # 連結 gzip(multi-member)は *全メンバ* を展開する(#58)。decompressobj は 1 メンバの
+                # 終端で止まり残りを unused_data に残すため、旧実装は先頭メンバしか走査しなかった
+                # (Python gzip / Go gzip.Reader / Node zlib は後続メンバも展開する=2 個目以降に
+                # 置いた payload が走査を素通りした)。出力上限はメンバ合計で守る。解けない後続
+                # データは例外→None(=走査不能として扱う)。
+                out = bytearray()
+                rest = data
+                while rest and len(out) < max_out:
+                    d = zlib.decompressobj(16 + zlib.MAX_WBITS)
+                    out += d.decompress(rest, max_out - len(out))
+                    if not d.eof:
+                        break                    # 出力上限 or 走査 prefix の打ち切り=読めた分まで
+                    rest = d.unused_data.lstrip(b"\x00")   # メンバ間のゼロ詰めは gzip の慣行
+                return bytes(out)
             if enc == "deflate":
                 try:
                     return zlib.decompressobj().decompress(data, max_out)
@@ -1216,15 +1410,17 @@ class AsyncEdgeGuard:
 
     async def _pipe_body_bounded(self, reader, bwr, remaining, chunked, deadline):
         """宣言された本文長ぶんだけ client→backend へ転送し、それ以降(パイプライン化された後続
-        要求)は流さない(#D3)。remaining=残り本文バイト数(Content-Length 時)。chunked=終端
-        0\\r\\n\\r\\n まで転送。総受信デッドライン(#64 body_max_sec)も尊重する。返り値=転送バイト数。
-        本文完了後に write_eof=半クローズ(#46 の bodyless 保証を body 有り要求へ拡張)。"""
+        要求)は流さない(#D3)。remaining=残り本文バイト数(Content-Length 時)。chunked=それまでの
+        本文を食わせた _ChunkedEnd(終端=last-chunk+trailer の *ちょうど末尾* まで転送。#18)。
+        True なら新しい追跡器で始める。総受信デッドライン(#64 body_max_sec)も尊重する。返り値=
+        転送バイト数。本文完了後に write_eof=半クローズ(#46 の bodyless 保証を body 有り要求へ拡張)。"""
         total = 0
         loop = asyncio.get_event_loop()
-        tail = b""
+        if isinstance(chunked, bool):
+            chunked = _ChunkedEnd() if chunked else None
         try:
             while True:
-                if chunked:
+                if chunked is not None:
                     want = 65536
                 else:
                     if remaining <= 0:
@@ -1240,12 +1436,18 @@ class AsyncEdgeGuard:
                     break
                 if not chunk:
                     break
-                bwr.write(chunk)
-                await bwr.drain()
-                total += len(chunk)
-                if chunked:
-                    tail = (tail + chunk)[-8:]
-                    if tail.endswith(b"0\r\n\r\n"):
+                if chunked is not None:
+                    # 本文に属する分だけを流す。終端より後ろ=パイプライン第2要求は捨てる。
+                    # 枠の破損はどこで終わるか backend と一致させられない=以降を流さない。
+                    chunk = chunk[:chunked.feed(chunk)]
+                    if chunked.bad:
+                        break
+                if chunk:
+                    bwr.write(chunk)
+                    await bwr.drain()
+                    total += len(chunk)
+                if chunked is not None:
+                    if chunked.done:
                         break
                 else:
                     remaining -= len(chunk)
@@ -1262,7 +1464,8 @@ class AsyncEdgeGuard:
     async def _scan_request_body(self, buf, reader, ip, path=""):
         """要求ボディの先頭を有界に読んで署名走査する(#61)。返り値 (extra, blocked):
           · extra … buf を *超えて* 読んだ本文先頭バイト(クリーン時に backend へ転送する分)。
-          · blocked … 悪性(block)と判定=本文を上流へ流さず接続を切るべきか。
+          · blocked … 悪性(block)と判定=本文を上流へ流さず接続を切るべきか。走査できない
+            Content-Encoding のときは "unscannable"(呼び出し側が 415 を返す・#93)。
         body_scan 無効なら即 (b"", False)=従来のストリーミングと同一(extra を読まない)。
         正直な限界: 走査は先頭 cap バイトのみ(巨大本文を全バッファしない)。chunked 本文は走査面
         では有界復号してから走査する(#D5。backend へは raw 転送)。本文を極端に小出しする回避は
@@ -1294,7 +1497,14 @@ class AsyncEdgeGuard:
         deadline = (loop.time() + float(sh.cfg.get("body_max_sec", 60))
                     if sh.cfg.get("body_timeout_enabled", True) else None)
         timed_out = False
-        while len(prefix) < target:
+        # chunked は枠を逐次解析し、本文の終端(trailer 込み)に達したら読み止める(#18)。旧実装は
+        # 読取が '0\r\n\r\n' で *ちょうど終わる* ときしか完了と見なさず、終端の後ろにパイプライン
+        # 第2要求が続くと head_timeout まで待って正規の送信者を slow_body 加点までしていた。
+        trk = None
+        if content_len is None and "chunked" in _header_value(buf, b"transfer-encoding").lower():
+            trk = _ChunkedEnd()
+            trk.feed(body_in_buf)
+        while len(prefix) < target and not (trk is not None and (trk.done or trk.bad)):
             remaining = self.head_timeout if deadline is None else (deadline - loop.time())
             if remaining <= 0:
                 timed_out = True
@@ -1311,13 +1521,19 @@ class AsyncEdgeGuard:
                 break                                  # 本文終端
             prefix += chunk
             extra += chunk                             # buf を超えた分=後で転送が要る
-            if content_len is None and prefix.endswith(b"0\r\n\r\n"):
-                break                                  # chunked 終端=完了
+            if trk is not None:
+                trk.feed(chunk)                        # 終端/破損に達したら次の周回で止まる
         if timed_out:
             self._on_slow_body(ip)                     # 総時間超過=切断+加点(R-U-Dead-Yet 走査版)
         blocked = False
         try:
             pb = bytes(prefix)
+            # 走査面は *この要求の本文* に限る(転送するのもそこまで=#18)。本文の後ろに乗った
+            # パイプライン後続要求のバイトを本文として採点しない。
+            if content_len is not None:
+                pb = pb[:content_len]
+            elif trk is not None and trk.done:
+                pb = pb[:trk.consumed]
             # #D5: chunked 本文は *復号後* を走査する(境界分割による body-scan 回避封じ)。
             #   Content-Encoding 解凍より前に行う(ワイヤ上は chunk 枠の内側に gzip 等が入る)。
             #   原本(extra)は backend へ raw のまま転送。破損チャンクは fail closed。
@@ -1340,16 +1556,12 @@ class AsyncEdgeGuard:
                         # 解けない符号化(br 等)のボディを *圧縮バイトのまま* 走査しても
                         # 署名は当たらない。バックエンドがその符号化に対応していれば
                         # 実質バイパスになるので、検査できない本文は通さない。
-                        self.metrics["dropped"] += 1
+                        # 415 は writer を持つ呼び出し側(_handle_conn)が返し、dropped もそこで
+                        # 1 回だけ数える。ここで writer を参照していたため NameError → 外側の
+                        # except で「黙って切断」に化け、dropped も二重計上されていた(#93)。
                         self.metrics["body_unscannable"] = self.metrics.get(
                             "body_unscannable", 0) + 1
-                        try:
-                            writer.write(_http_response(
-                                "415 Unsupported Media Type",
-                                '{"ok":false,"error":"unsupported content-encoding"}'))
-                        except Exception:
-                            pass
-                        return self._close(writer)
+                        return bytes(extra), "unscannable"
             blocked = sh.inspect_body(ip, pb).get("action") == "block"
             if not blocked:                            # #66: 危険なアップロード拡張子も拒否
                 blocked = sh.scan_upload(ip, pb).get("action") == "block"
@@ -1492,47 +1704,86 @@ class AsyncEdgeGuard:
                     chunk = await src.read(65536) # 64KiB=syscall/await 往復を削減(I/O律速)
                 if not chunk:
                     if hbuf:                      # head 未完のまま EOF=残りを取りこぼさず放出
+                        if sh is not None and budget > 0:   # ただし DLP は通す(#59)
+                            kinds = sh.scan_leak(hbuf)
+                            if kinds and sh.note_leak(ip, kinds).get("action") == "block":
+                                break
                         await self._send(dst, hbuf, ip)
                         hbuf = b""
                     break
                 total += len(chunk)               # 転送バイトを計上(漏洩量算定)
                 if report_status and not st_done:   # 応答ステータス行を覗き見て #60 へ
-                    st_buf += chunk[:64]
-                    nl = st_buf.find(b"\r\n")
-                    if nl >= 0 or len(st_buf) >= 64:
-                        st_done = True
-                        line = st_buf[:nl] if nl >= 0 else st_buf[:64]
-                        parts = line.split(b" ")
-                        if len(parts) >= 2 and parts[0].startswith(b"HTTP/"):
+                    # 1xx 中間応答(100 Continue / 103 Early Hints)は読み飛ばし、*最終* 応答の
+                    # ステータスを還元する(#60)。旧実装は先頭の応答行しか見なかったため、
+                    # Expect: 100-continue を付けるだけで 401/404 の連射が一切数えられなかった。
+                    st_buf += chunk
+                    while True:
+                        nl = st_buf.find(b"\r\n", 0, 64)
+                        if nl < 0 and len(st_buf) < 64:
+                            break                 # 応答行が未完=次の chunk を待つ
+                        code = _resp_status(st_buf[:nl] if nl >= 0 else st_buf[:64])
+                        if nl >= 0 and _is_interim(code):
+                            e = st_buf.find(b"\r\n\r\n")
+                            if e >= 0:
+                                st_buf = st_buf[e + 4:]   # 中間応答の head を読み捨て次の応答行へ
+                                continue
+                            if len(st_buf) <= 16384:
+                                break             # 中間応答の head が未完=次を待つ
+                        st_done, st_buf = True, b""
+                        if code:
                             try:
                                 from ..lifeform.pipeline import net_shield
-                                net_shield().note_response(ip, int(parts[1]))
+                                net_shield().note_response(ip, code)
                             except Exception:
                                 pass
+                        break
                 if not head_done:                 # 応答 head を蓄積→注入→以降は body として通常処理
                     hbuf += chunk
-                    if not hbuf.startswith(b"HTTP/") and len(hbuf) >= 5:
-                        # 応答行が HTTP でない(非HTTPストリーム等)=head 加工対象外。諦めて
-                        # 溜めた分を body 経路(DLP)へ回す=非HTTPでもバイト透過を維持。
-                        chunk, hbuf, head_done = hbuf, b"", True
-                    else:
+                    chunk = b""
+                    leak_stop = False
+                    while not head_done:
+                        if not hbuf.startswith(b"HTTP/"):
+                            if len(hbuf) >= 5:
+                                # 応答行が HTTP でない(非HTTPストリーム等)=head 加工対象外。諦めて
+                                # 溜めた分を body 経路(DLP)へ回す=非HTTPでもバイト透過を維持。
+                                chunk, hbuf, head_done = hbuf, b"", True
+                            break
                         idx = hbuf.find(b"\r\n\r\n")
                         if idx < 0:
-                            if len(hbuf) > 65536: # head 過大=書換を諦め素通し(壊さない)
-                                await self._send(dst, hbuf, ip)
-                                hbuf, head_done = b"", True
-                            continue              # head 未完 or 諦め=この chunk は処理済み
-                        new_head = inject_security_headers(hbuf[:idx], sec_cfg, tls=tls,
-                                                           add_headers=add_sec,
-                                                           harden_cookies=harden_ck,
-                                                           harden_cors=harden_cors)
-                        if harden_redir:              # #71: オープンリダイレクト無害化
-                            new_head = self._apply_redirect_policy(new_head, req_host, ip)
-                        await self._send(dst, new_head + b"\r\n\r\n", ip)
-                        chunk = hbuf[idx + 4:]    # head 以降=body として今回処理へ続行
-                        hbuf, head_done = b"", True
-                        if not chunk:
-                            continue
+                            if len(hbuf) > 65536: # head 過大=書換を諦め素通し(壊さない)。DLP の
+                                chunk, hbuf, head_done = hbuf, b"", True   # 走査は通す(#59)
+                            break                 # head 未完=次の chunk を待つ
+                        if _is_interim(_resp_status(hbuf[:hbuf.find(b"\r\n")])):
+                            # 1xx 中間応答は無加工で即送り、*次の* head を最終応答として加工する(#60)。
+                            # 旧実装は中間応答を『その応答』として加工し、本物の最終 head を body と
+                            # して素通ししていた=Set-Cookie 補完/CORS 無害化/防御ヘッダ/オープン
+                            # リダイレクト無害化がまとめて外れた。
+                            out_head, hbuf = hbuf[:idx + 4], hbuf[idx + 4:]
+                        else:
+                            new_head = inject_security_headers(hbuf[:idx], sec_cfg, tls=tls,
+                                                               add_headers=add_sec,
+                                                               harden_cookies=harden_ck,
+                                                               harden_cors=harden_cors)
+                            if harden_redir:          # #71: オープンリダイレクト無害化
+                                new_head = self._apply_redirect_policy(new_head, req_host, ip)
+                            out_head, chunk = new_head + b"\r\n\r\n", hbuf[idx + 4:]
+                            hbuf, head_done = b"", True   # head 以降=body として今回処理へ続行
+                        # head も DLP を通してから送る(#59)。旧実装は加工した head を走査せずに
+                        # 送っていたため、head 加工が有効(cookie/CORS 加工は既定 ON)だと応答
+                        # ヘッダの秘密(X-Debug-Key・Set-Cookie のトークン等)が素通りした。
+                        # head は CRLFCRLF で閉じるので body 側の保留窓は要らない=従来どおり即送る。
+                        if sh is not None and budget > 0:
+                            kinds = sh.scan_leak(out_head)
+                            if kinds:
+                                if sh.note_leak(ip, kinds).get("action") == "block":
+                                    leak_stop = True
+                                    break
+                                sh = None         # audit: 記録したら走査停止(body 経路と同じ)
+                        await self._send(dst, out_head, ip)
+                    if leak_stop:
+                        break
+                    if not chunk:
+                        continue
                 if sh is not None and budget > 0:
                     seg = pending + chunk         # 保留(未送信)末尾窓 + 今回 を一括走査
                     kinds = sh.scan_leak(seg)
@@ -1592,14 +1843,19 @@ class AsyncEdgeGuard:
 
     @staticmethod
     def _norm_ip(ip: str) -> str:
-        """IPv4-mapped IPv6(::ffff:192.0.2.1)を純IPv4へ正規化(#14)。dual-stack 束縛時、peername が
-        射影アドレス文字列で返ると BAN リストの完全一致を素通りする。純IPv4(":"無し)は即返し=ゼロ負荷。"""
+        """peer/XFF 由来の IPv6 を NetShield と同じ正規形(pipeline._canon_ip)へ(#14)。dual-stack
+        束縛時の射影アドレス(::ffff:192.0.2.1)は純IPv4へ、別表記は小文字/圧縮へ揃える(生の綴り
+        だと BAN/状態の鍵と一致しない)。純IPv4(":"無し)は即返し=ゼロ負荷。"""
         if not ip or ":" not in ip:
             return ip
         try:
-            import ipaddress
-            mapped = getattr(ipaddress.ip_address(ip), "ipv4_mapped", None)
-            return str(mapped) if mapped else ip
+            from ..lifeform.pipeline import _canon_ip
+            c = _canon_ip(ip)
+            if not c and "%" in ip:
+                # リンクローカル peer(fe80::1%eth0)のゾーンIDはカーネルが付けた受信 IF 名。
+                # NetShield はゾーンID付きを鍵にしない(BAN できない)ので外して正規形にする。
+                c = _canon_ip(ip.split("%", 1)[0])
+            return c or ip
         except Exception:
             return ip
 
@@ -1621,23 +1877,30 @@ class AsyncEdgeGuard:
         else:
             self._server = await asyncio.start_server(
                 self._handle, self.listen_host, self.listen_port)
-        self.listen_port = self._server.sockets[0].getsockname()[1]
+        srv = self._server
+        self.listen_port = srv.sockets[0].getsockname()[1]
         self._stop_event = asyncio.Event()
         self._ready.set()
-        # serve_forever は『新規受理』専任のキャンセル可能タスク。コルーチンの寿命は stop_event に
-        # 委ねる=停止時に listener だけ閉じて(受理停止)、進行中の _handle タスクは生かしたまま
-        # drain を待てる(per-connection タスクは serve_forever とは独立に走り続ける)。
-        serve_task = asyncio.ensure_future(self._server.serve_forever())
+        # 受理は start_server の時点で始まっている(start_serving=True)ので serve_forever は
+        # 使わない。コルーチンの寿命は stop_event に委ね、受理停止は Server.close()(listener
+        # だけを閉じる)で行う=進行中の _handle タスクは生かしたまま drain を待てる。
+        # serve_forever を走らせていると、Server.close() がそれをキャンセルし、3.15 以降は
+        # そのキャンセル処理が close_clients() まで呼ぶ=drain の最初に進行中の接続を切る(#54)。
         check_task = asyncio.ensure_future(self._periodic_checks_loop())
         try:
             await self._stop_event.wait()
         finally:
-            for _t in (serve_task, check_task):
-                _t.cancel()
-                try:
-                    await _t
-                except (asyncio.CancelledError, Exception):
-                    pass
+            check_task.cancel()
+            try:
+                await check_task
+            except (asyncio.CancelledError, Exception):
+                pass
+            # drain を経ずに抜けた(例外・停止合図の直接送付)ときも listener は必ず閉じる
+            # (以前は serve_forever のキャンセルが担っていた)。次の start() が bind できる。
+            try:
+                srv.close()
+            except Exception:
+                pass
 
     async def _periodic_checks_loop(self, interval: float = 30.0):
         """トラフィック非依存の定期セキュリティチェックを回す独立ループ(自己再起動/生存監視とは
@@ -1675,18 +1938,19 @@ class AsyncEdgeGuard:
     async def _drain(self, grace: float):
         """graceful shutdown: ① 新規受理を止め ② 進行中の接続が捌けるのを最大 `grace` 秒待ち
         ③ 停止合図。`grace<=0`(既定)は待たず即時=従来挙動。残接続数を返す。
-        新規受理の停止は listener ソケットだけを閉じて行う: asyncio.Server.close() は Python 3.13 で
-        *進行中の接続まで* 切断する(3.12 以前は listener のみ)ため、drain の前に呼ぶと in-flight を
-        取りこぼす。in-flight を捌き切ってから Server.close() する=全バージョンで graceful。"""
+        新規受理の停止は Server.close() で行う。close() 自体が閉じるのは listener だけで、
+        進行中の接続には触らない(3.10〜3.15 共通)。ただし serve_forever を走らせていると
+        close() がそれをキャンセルし、3.15 ではその後始末が close_clients() まで呼ぶので、
+        _serve は serve_forever を使わない。"""
         if self._server is not None:
-            # listener のみ閉じる=新規受理を止め、in-flight は生かす。sockets 非公開のサーバ
-            # (テスト用フェイク等)は空扱いにして下の Server.close() に委ねる。
-            for _sock in getattr(self._server, "sockets", None) or ():
-                try:
-                    _sock.close()
-                except Exception:
-                    pass
-        deadline = self._loop.time() + max(0.0, float(grace))
+            # 以前は Server.sockets の各要素を close() していたが、3.11+ のそれは close() を
+            # 持たない TransportSocket で、例外は握り潰されて listener は開いたままだった
+            # (猶予中も新規接続を受理・中継し、絶え間ない負荷では drain が終わらない・#54)。
+            try:
+                self._server.close()
+            except Exception:
+                pass
+        deadline = self._loop.time() + self._clamp_grace(grace)
         while self._active > 0 and self._loop.time() < deadline:
             await asyncio.sleep(0.05)
         remaining = self._active
@@ -1699,10 +1963,10 @@ class AsyncEdgeGuard:
                 except Exception:
                     pass
             self._live.clear()
-            await asyncio.sleep(0)                # close を1度まわしてから listener を畳む
+            await asyncio.sleep(0)                # close を1度まわしてから後片付けへ
         if self._server is not None:
             try:
-                self._server.close()              # in-flight 捌け後なら安全(全バージョン共通の後片付け)
+                self._server.close()              # 冪等(既に閉じていれば何もしない)
             except Exception:
                 pass
             try:
@@ -1772,9 +2036,32 @@ class AsyncEdgeGuard:
         from ..core.netaddr import url as _url          # IPv6 リテラルは [] で囲う
         return _url(self.listen_host, self.listen_port)
 
+    _grace_shm = None             # --cluster: 停止時の drain 猶予をワーカーへ渡す共有メモリ(#56)
+    _worker_draining = False      # --cluster のワーカー側: SIGTERM を受けて drain 中
+
+    @staticmethod
+    def _clamp_grace(grace) -> float:
+        """drain 猶予を有限の非負秒へ正規化する(#55)。`--drain-grace inf` や 1e7
+        (「捌けるまで待つ」のつもり)をそのまま待機 API へ渡すと threading の上限
+        (Windows で約 49 日)を超えて OverflowError になり、stop() がワーカー刈り取り・
+        listener の後始末の手前で例外脱出していた。
+        上限は待機 API が受け付ける最大値の手前=事実上「捌けるまで待つ」のまま。
+        NaN・負・数値でない値は 0(即時停止)。"""
+        try:
+            g = float(grace)
+        except (TypeError, ValueError):
+            return 0.0
+        if not g > 0.0:                           # NaN も負もここで落ちる
+            return 0.0
+        return min(g, threading.TIMEOUT_MAX - 3600.0)
+
     def stop(self, grace: float = 0.0) -> dict:
         """停止。`grace>0` なら進行中リクエストを最大 grace 秒ドレイン(受理停止→捌けるまで待機)。
-        既定 grace=0 は従来どおり即時停止(後方互換)。別スレッドのループへ drain を投入して待つ。"""
+        既定 grace=0 は従来どおり即時停止(後方互換)。別スレッドのループへ drain を投入して待つ。
+        --cluster のワーカーにも先に合図して、親と同時に drain させる(#56)。"""
+        grace = self._clamp_grace(grace)
+        since = time.monotonic()
+        self._signal_workers(grace)
         remaining = None
         loop = self._loop
         # ループが走っている時だけ drain を投入する。停止済み(例: restart() 呼び出し直後)へ
@@ -1783,7 +2070,7 @@ class AsyncEdgeGuard:
             try:
                 fut = asyncio.run_coroutine_threadsafe(self._drain(grace), loop)
                 try:
-                    remaining = fut.result(timeout=max(0.0, float(grace)) + 5.0)
+                    remaining = fut.result(timeout=grace + 5.0)
                 except Exception:
                     pass
             except Exception:               # 競合で停止した=ベストエフォート
@@ -1793,7 +2080,7 @@ class AsyncEdgeGuard:
                     except Exception:
                         pass
         if self._thread is not None and self._thread.is_alive():
-            self._thread.join(timeout=max(0.0, float(grace)) + 5.0)
+            self._thread.join(timeout=grace + 5.0)
         # --cluster 用の listener は *持ち越さない*。ループ側で既に閉じられているため、
         # 残しておくと次の start()(watchdog の restart など)が **閉じたソケット** を
         # asyncio へ渡して二度と起動できなくなる。次回は素の bind でやり直す
@@ -1804,7 +2091,7 @@ class AsyncEdgeGuard:
                 ls.close()
             except Exception:
                 pass
-        reaped = self._stop_workers(grace)
+        reaped = self._stop_workers(grace, since=since)
         # asyncio のトランスポート/プロトコルは循環参照を作るため、参照カウントだけでは
         # 解放されない。stop() から戻った時点でソケットの FD が世代別 GC 任せで開いたまま
         # 残り(実測: 高負荷停止の直後に 31 本。gc.collect() で 5 本まで落ちる)、
@@ -1829,21 +2116,42 @@ class AsyncEdgeGuard:
         return {"ok": True, "stopped": True, "drained": remaining,
                 "workers_stopped": reaped, "metrics": dict(self.metrics)}
 
-    def _stop_workers(self, grace: float = 0.0) -> int:
-        """--cluster で fork したワーカーを確実に終わらせる。
-        旧実装は子 pid を集めるだけで誰も止めておらず、親へ SIGTERM を送ると
-        *親だけが死んで子が待受ポートを握ったまま生き残った*(実測: 13 ワーカー全残存・
-        前衛ポートも管理ポートも開いたまま)。SIGTERM → 猶予 → SIGKILL で刈り取る。"""
-        pids, self._workers = list(self._workers), []
+    def _signal_workers(self, grace: float = 0.0, pids=None) -> None:
+        """--cluster のワーカーへ drain 開始を合図する(待たない・#56)。猶予は共有メモリ経由で
+        渡す ―― ワーカーは SIGTERM を受けたらそれを読み、親と同じ drain(受理停止→最大
+        grace 秒待機→残りを閉じる)をしてから抜ける。"""
+        pids = list(self._workers) if pids is None else pids
         if not pids or not hasattr(os, "kill"):
-            return 0
+            return
+        shm = self._grace_shm
+        if shm is not None:
+            try:
+                import struct
+                shm[:8] = struct.pack("d", self._clamp_grace(grace))
+            except Exception:
+                pass
         import signal as _sig
         for pid in pids:
             try:
                 os.kill(pid, _sig.SIGTERM)
             except OSError:
                 pass
-        deadline = time.monotonic() + max(1.0, float(grace) + 2.0)
+
+    def _stop_workers(self, grace: float = 0.0, since: float = None) -> int:
+        """--cluster で fork したワーカーを確実に終わらせる。
+        旧実装は子 pid を集めるだけで誰も止めておらず、親へ SIGTERM を送ると
+        *親だけが死んで子が待受ポートを握ったまま生き残った*(実測: 13 ワーカー全残存・
+        前衛ポートも管理ポートも開いたまま)。SIGTERM → 猶予 → SIGKILL で刈り取る。
+        ワーカーは SIGTERM で自分の drain をしてから抜ける(#56)。stop() は先に合図済み
+        なので、待つ期限はその時刻(since)から数える(親の drain と同時進行)。"""
+        pids, self._workers = list(self._workers), []
+        if not pids or not hasattr(os, "kill"):
+            return 0
+        import signal as _sig
+        grace = self._clamp_grace(grace)
+        self._signal_workers(grace, pids)     # 合図済みでも再送は無害(ワーカー側で一度きり)
+        start = time.monotonic() if since is None else since
+        deadline = start + max(1.0, grace + 2.0)
         alive = list(pids)
         while alive and time.monotonic() < deadline:
             for pid in list(alive):
@@ -1860,6 +2168,12 @@ class AsyncEdgeGuard:
                 os.kill(pid, getattr(_sig, "SIGKILL", _sig.SIGTERM))
                 os.waitpid(pid, 0)
             except OSError:
+                pass
+        shm, self._grace_shm = self._grace_shm, None
+        if shm is not None:
+            try:
+                shm.close()
+            except Exception:
                 pass
         return len(pids)
 
@@ -1904,16 +2218,58 @@ class AsyncEdgeGuard:
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         loop.set_exception_handler(lambda l, c: None)
+        self._loop = loop
+        self._server = self._stop_event = None     # fork 元(親)の値を引き継がない
         sock = self._reuseport_socket()       # 各ワーカーが同ポートを共有listen
 
         async def _s():
-            server = await asyncio.start_server(self._handle, sock=sock)
-            async with server:
-                await server.serve_forever()
+            # 受理は start_server の時点で始まる。serve_forever を使わない理由は _serve と同じ。
+            srv = self._server = await asyncio.start_server(self._handle, sock=sock)
+            self._stop_event = asyncio.Event()
+            if self._worker_draining:             # 待受前に SIGTERM が来ていた
+                self._worker_drain_task = asyncio.ensure_future(
+                    self._drain(self._worker_grace()))
+            try:
+                await self._stop_event.wait()     # drain が立てる
+            finally:
+                try:
+                    srv.close()
+                except Exception:
+                    pass
+        # SIGTERM で即死させず、親と同じ drain(受理停止→最大 grace 秒待機→残りを閉じる)を
+        # してから抜ける(#56)。以前は SIG_DFL のままで、親が自分の drain をしている間も
+        # 新規受理を続け、その後の SIGTERM で進行中のリクエストごと切られていた。
+        # 張れなければ従来どおり SIG_DFL(即終了)。抜けた後は呼び出し側が os._exit する。
+        try:
+            import signal as _sig
+            loop.add_signal_handler(_sig.SIGTERM, self._worker_on_term)
+        except Exception:
+            pass
         try:
             loop.run_until_complete(_s())
         except (Exception, asyncio.CancelledError):
             pass
+
+    def _worker_grace(self) -> float:
+        """親が stop(grace) で共有メモリへ書いた猶予。親を経ない SIGTERM(未記入)は 0=即時。"""
+        shm = self._grace_shm
+        if shm is None:
+            return 0.0
+        try:
+            import struct
+            return self._clamp_grace(struct.unpack("d", shm[:8])[0])
+        except Exception:
+            return 0.0
+
+    def _worker_on_term(self):
+        """ワーカーの SIGTERM(ループ内で呼ばれる): 親と同じ drain を始める(一度きり)。"""
+        if self._worker_draining:
+            return
+        self._worker_draining = True
+        if self._stop_event is not None:          # 待受前なら _s() が待受直後に始める
+            # 参照を保持する(ループはタスクを弱参照でしか持たない=途中で回収され得る)
+            self._worker_drain_task = self._loop.create_task(
+                self._drain(self._worker_grace()))
 
     def serve_cluster(self, workers: int = 0) -> dict:
         """CPUコア数ぶんの asyncio ループで同一ポートを SO_REUSEPORT 共有待受(全コア解放)。
@@ -1932,13 +2288,20 @@ class AsyncEdgeGuard:
             print(f" [note] クラスタ {n} ワーカー: レート状態はワーカー間で共有しません"
                   f"(fork=独立メモリ)。IP単位の上限は実効で最大 約(設定値×{n})。"
                   " 厳密なグローバル制限は単一プロセスか共有KVS層で。")
+            # 停止時の drain 猶予をワーカーへ渡す共有メモリ(#56)。匿名 mmap は fork 後も
+            # 親子で同じ領域を指すので、親が stop(grace) で書いた値をワーカーが読める。
+            try:
+                import mmap
+                self._grace_shm = mmap.mmap(-1, 8)
+            except Exception:
+                self._grace_shm = None
         pids = []
         for _ in range(max(0, n - 1)):
             pid = os.fork()
             if pid == 0:                      # 子ワーカー: 自分のループで待受(戻らない)
                 # 親から継承したシグナル配線を既定へ戻す。親のハンドラは親の
                 # threading.Event を叩くだけで子には効かず、SIGTERM を無視する
-                # ワーカーが残る原因になる。
+                # ワーカーが残る原因になる。SIGTERM は _worker_blocking が drain 用に張り直す。
                 try:
                     import signal as _sig
                     for _s in ("SIGTERM", "SIGINT", "SIGBREAK"):

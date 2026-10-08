@@ -8,6 +8,7 @@ i18n.py — サーバ側の最小多言語(日本語/英語)。依存ゼロ。
 from __future__ import annotations
 
 import os
+import re
 
 
 # 「ロケール未設定」を表す値。C/POSIX は *英語ではなく* 「指定なし」であり、
@@ -29,8 +30,10 @@ def _locale_lang() -> str:
         import locale
         # *表示言語* を決める変数だけを見る。LC_CTYPE は文字種の扱いを決める変数で、
         # 「日本語 UI のまま LC_CTYPE だけ en_US」という設定は珍しくないため入れない。
-        srcs = [os.environ.get("LC_ALL"), os.environ.get("LC_MESSAGES"),
-                os.environ.get("LANG"), os.environ.get("LANGUAGE")]
+        # 並びは優先順: GNU gettext と同じく LANGUAGE(メッセージ言語の優先リスト)が最上位、
+        # 次いで POSIX の LC_ALL > LC_MESSAGES > LANG。
+        srcs = [os.environ.get("LANGUAGE"), os.environ.get("LC_ALL"),
+                os.environ.get("LC_MESSAGES"), os.environ.get("LANG")]
         if not any(_meaningful_locale(s) for s in srcs):
             # env が何も言っていない場合だけ OS ロケールを見る(Windows/mac 用)。
             # ただし現在のロケールが C/POSIX のままなら *聞かない*: Python 3.11 以前の
@@ -46,8 +49,13 @@ def _locale_lang() -> str:
             s = (s or "").strip().lower()
             if not _meaningful_locale(s):
                 continue                               # C/POSIX/空 = 不明(英語ではない)
-            if s.startswith("en") or "english" in s or "_us" in s or "_gb" in s:
-                return "en"
+            # 最初に *言語を語っている* 変数だけで決める(上の優先順)。以前は英語の変数が
+            # 1 つでもあれば英語にしていたため、LANG=en_US の
+            # クラウドイメージで LC_ALL=ja_JP を設定しても英語になった。言語は先頭の言語コードで
+            # 判定する('_us' を含むだけで es_US=スペイン語まで英語扱いしていた)。
+            first = s.split(":", 1)[0]                 # LANGUAGE は ja:en のような優先リスト
+            code = re.split(r"[_.@\-\s]", first, maxsplit=1)[0]
+            return "en" if code in ("en", "english") else ""   # English_United States(Windows)
     except Exception:
         pass
     return ""

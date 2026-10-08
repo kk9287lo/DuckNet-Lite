@@ -18,6 +18,7 @@ from __future__ import annotations
 import hmac
 import http.cookies
 import json
+import math
 import os
 import re
 import secrets
@@ -39,10 +40,46 @@ from dataplane.engine.core.atomic_io import (default_state_dir, tail_jsonl,
 
 # 管理APIのリクエストボディ上限(Content-Length 詐称・巨大ボディのメモリ枯渇防止)。
 _MAX_BODY = 1 << 20
+# 真偽値を必須とするルートとそのキー。欠落・綴り違い・非 bool を False 扱いで実行すると
+# 「無効化・拒否」側が走る(シールド OFF・全体遮断の解除・申立の却下)ため 400 で弾く(#24)。
+_BOOL_KEYS = {"/api/firewall/toggle": "on", "/api/shield/toggle": "on",
+              "/api/global_block": "on", "/api/shield/optional_sig": "on",
+              "/api/firewall/resolve": "approve", "/api/appeal/resolve": "approve"}
+
+
+def _json_finite(o, _active=None):
+    """NaN/±Infinity の float を None にした複製(dict/list/tuple を再帰)。dict のキーは従来の
+    json.dumps と同じ文字列("NaN" 等)にする。循環参照は辿らず元の値を残す(直後の json.dumps が
+    従来どおり ValueError を出す=無限再帰にしない)。"""
+    if isinstance(o, float):
+        return o if math.isfinite(o) else None
+    if not isinstance(o, (dict, list, tuple)):
+        return o
+    active = set() if _active is None else _active
+    if id(o) in active:
+        return o
+    active.add(id(o))
+    try:
+        if isinstance(o, dict):
+            return {(json.dumps(k) if isinstance(k, float) and not math.isfinite(k) else k):
+                    _json_finite(v, active) for k, v in o.items()}
+        return [_json_finite(v, active) for v in o]
+    finally:
+        active.discard(id(o))
 
 
 def _j(obj) -> bytes:
-    return json.dumps(obj, ensure_ascii=False, default=lambda o: str(o)).encode("utf-8")
+    # allow_nan=False: 既定の json.dumps は NaN/Infinity を出すが、ブラウザの JSON.parse はそれを
+    # 拒否する=状態のどこか 1 つの非有限値で応答全体が解析不能になり、ダッシュボードが『切断』の
+    # まま戻らなかった。通常は 1 回で済み、ValueError の時だけ非有限を null にして出し直す。
+    # backslashreplace: 本文は json.loads 由来なので孤立サロゲート('\udc80')が入り得る。厳格な
+    # UTF-8 では応答が毎回 500 になっていた。文字列中の \udXXX は JSON の正しいエスケープ。
+    try:
+        s = json.dumps(obj, ensure_ascii=False, allow_nan=False, default=lambda o: str(o))
+    except ValueError:
+        s = json.dumps(_json_finite(obj), ensure_ascii=False, allow_nan=False,
+                       default=lambda o: str(o))
+    return s.encode("utf-8", "backslashreplace")
 
 
 def _metrics_exposition(sh) -> str:
@@ -144,9 +181,14 @@ def _audit_entry(path: str, b: dict, r: dict, pre_cfg: dict, pre_fw: dict):
     if path == "/api/shield/paranoia":
         before = pre_cfg.get("paranoia")
         after = r.get("paranoia")
+        # set_paranoia はプリセットで optional_sigs を丸ごと上書きする。level だけ戻すと、
+        # 変更前に個別に点けていた任意シグネチャ(例 ssti)が消えたままになる(#69)ので、
+        # 変更前の optional_sigs も revert に同梱し、/api/shield/paranoia 側で復元する。
+        opt = {k: bool(v) for k, v in (pre_cfg.get("optional_sigs") or {}).items()}
         return (f"paranoia level {before} -> {after}", before, after,
                 (cfgrevert("paranoia", before) if before is None else
-                 {"endpoint": "/api/shield/paranoia", "body": {"level": before}}))
+                 {"endpoint": "/api/shield/paranoia",
+                  "body": {"level": before, "optional_sigs": opt}}))
     if path == "/api/shield/path_limits":
         after = r.get("path_limits", [])
         before = pre_cfg.get("path_limits")
@@ -442,22 +484,47 @@ def _make_handler(app: AdminDashboard):
             except Exception:
                 pass
 
-        def _body(self) -> dict:
+        def _reject(self, code: int, body: bytes):
+            """本文を読む前の拒否応答(421/403/401/415)。宣言された本文を上限内で読み捨ててから送る。
+            未読の本文を残したままソケットを閉じると TCP RST になり(Windows は受信済みの応答まで
+            捨てる)、正規のクライアントが拒否理由を受け取れなかった。chunked と上限超は読まない
+            (どのみち接続を閉じる。未認証の相手に無制限に読ませない)。"""
             try:
                 n = int(self.headers.get("Content-Length") or 0)
-                if n <= 0:
-                    return {}
-                # 読み込み量を上限で頭打ち(Content-Length 詐称/巨大ボディのメモリ枯渇防止)。
-                raw = self.rfile.read(min(n, _MAX_BODY))
-                if not raw:
-                    return {}
+                if not self.headers.get("Transfer-Encoding") and 0 < n <= _MAX_BODY:
+                    self.rfile.read(n)
+            except Exception:
+                pass
+            self._send(code, body)
+
+        def _body(self):
+            """POST 本文(JSON object)を dict で返す。本文なし(Content-Length 0/無し)は {}。
+            読めない本文は None を返し、do_POST がルートを実行せずに 4xx で弾く(#24)。
+            以前はどの失敗も {} に潰していたため、ルートが既定値=破壊側(disable()・
+            public=allow・path_limits 全消去)で走り、『ON にする』要求でシールドが OFF になった。"""
+            # 本文長が分からない(chunked 等)。この管理面は Content-Length 前提。
+            if self.headers.get("Transfer-Encoding"):
+                return None
+            try:
+                n = int(self.headers.get("Content-Length") or 0)
+            except ValueError:
+                return None
+            if n == 0:
+                return {}
+            # 上限超は読まずに拒否(先頭だけ読んで JSON 失敗→{} に化けさせない・メモリ枯渇防止)。
+            if n < 0 or n > _MAX_BODY:
+                return None
+            try:
+                raw = self.rfile.read(n)
+                if len(raw) < n:             # 途中で切れた本文
+                    return None
                 # JSON 再帰爆弾([[[[…]]]])はパース前に深さで弾く(graphql と統一・自己DoS回避)。
                 from .engine.core import saferegex
                 d = saferegex.safe_json_loads(raw.decode("utf-8", "replace"),
                                               max_len=_MAX_BODY, default=None)
-                return d if isinstance(d, dict) else {}
+                return d if isinstance(d, dict) else None
             except Exception:
-                return {}
+                return None
 
         def _hostname_allowed(self, hostname) -> bool:
             """hostname(port/[]除去済み・小文字)が管理面の正規ホストとして許可されるか。
@@ -496,6 +563,24 @@ def _make_handler(app: AdminDashboard):
                 return raw[1:end] if end != -1 else raw
             return raw.rsplit(":", 1)[0] if raw.count(":") == 1 else raw
 
+        @staticmethod
+        def _port_of(raw: str):
+            """Host/Origin/Referer から (明示ポート or None, scheme の既定ポート or None) を返す。
+            既定は http=80 / https=443(Host には scheme が無いので常に None)。"""
+            raw = (raw or "").strip().lower()
+            default = {"http": "80", "https": "443"}.get(raw.split("://", 1)[0]) if "://" in raw else None
+            if raw.startswith("//"):
+                raw = raw[2:]
+            if "://" in raw:
+                raw = raw.split("://", 1)[1]
+            raw = raw.split("/", 1)[0]
+            if raw.startswith("["):
+                rest = raw[raw.find("]") + 1:] if "]" in raw else ""
+                port = rest[1:] if rest.startswith(":") else ""
+            else:
+                port = raw.rsplit(":", 1)[1] if raw.count(":") == 1 else ""
+            return ((port.lstrip("0") or "0") if port else None), default
+
         def _host_ok(self) -> bool:
             """Host ヘッダの検証(全リクエスト・認証やトークン配布より手前)。"""
             return self._hostname_allowed(self._host_of(self.headers.get("Host")))
@@ -515,7 +600,16 @@ def _make_handler(app: AdminDashboard):
             if not shost:
                 return False
             host = self._host_of(self.headers.get("Host"))
-            if host and shost == host:
+            # ポートも比べる(#26)。ホスト名だけだと 127.0.0.1:9999 の任意ページ(ローカルの
+            # 開発サーバや保護対象のバックエンド)が同一オリジン扱いになり、しかも SameSite
+            # Cookie はポートを区別しないため、管理 API の状態変更 POST がそのまま通っていた。
+            sport, sdefault = self._port_of(src)
+            hport, _ = self._port_of(self.headers.get("Host"))
+            if hport is not None:
+                same_port = (sport or sdefault) == hport
+            else:                            # Host にポート無し=scheme 既定ポートでの到達
+                same_port = sport is None or sport == sdefault
+            if host and shost == host and same_port:
                 return True                  # 同一オリジン(通常のダッシュボード操作)
             allowed = os.environ.get("DUCKNET_ADMIN_ALLOWED_HOSTS", "")
             return shost in {h.strip().lower() for h in allowed.split(",") if h.strip()}
@@ -632,16 +726,37 @@ def _make_handler(app: AdminDashboard):
         def do_POST(self):
             # Host + Origin 検証を認証より手前に置く(rebinding/CSRF の多層防御)。
             if not self._host_ok():
-                self._send(421, _j({"ok": False, "error": "host not allowed"}))
+                self._reject(421, _j({"ok": False, "error": "host not allowed"}))
                 return
             if not self._origin_ok():
-                self._send(403, _j({"ok": False, "error": "bad origin"}))
+                self._reject(403, _j({"ok": False, "error": "bad origin"}))
                 return
             if not self._auth():
-                self._send(401, _j({"ok": False, "error": "token required"}))
+                self._reject(401, _j({"ok": False, "error": "token required"}))
+                return
+            # Cookie 認証(=ブラウザ)の POST は JSON に限る(#26)。text/plain や form の「単純
+            # リクエスト」はプリフライト無しで他オリジンから飛ぶため、Origin を付けない環境では
+            # CSRF の経路になる。application/json は他オリジンからだとプリフライト必須で、この
+            # 管理面は CORS に応じない。ヘッダトークン(X-Token/Bearer)はブラウザが他オリジン
+            # から付けられないので対象外(curl 等の既存クライアントはそのまま)。
+            hdr_tok = bool(self.headers.get("X-Token")) or (
+                (self.headers.get("Authorization") or "").lower().startswith("bearer "))
+            ctype = (self.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
+            if not hdr_tok and ctype != "application/json":
+                self._reject(415, _j({"ok": False, "error": "Content-Type must be application/json"}))
                 return
             path = self.path.split("?")[0]
             b = self._body()
+            if b is None:
+                # 読めない本文(chunked・上限超・途中切れ・JSON object でない)はルートを実行しない(#24)。
+                self._send(400, _j({"ok": False, "error":
+                                    "invalid body (JSON object with Content-Length required)"}))
+                return
+            key = _BOOL_KEYS.get(path)
+            if key and not isinstance(b.get(key), bool):
+                # 真偽値の欠落・綴り違いを False(=無効化・拒否側)として実行しない(#24)。
+                self._send(400, _j({"ok": False, "error": f"'{key}' must be true or false"}))
+                return
             fw, sh = app_firewall(), net_shield()
             # 監査ログ用の変更前スナップショット。個々の分岐へ計装せず、ここ1箇所で変更前を
             # 取り、成功後にもう1箇所(下の record_audit 呼び出し)でログする ―― 唯一のフック
@@ -675,13 +790,28 @@ def _make_handler(app: AdminDashboard):
                     r = sh.set_optional_signature(b.get("name", ""), bool(b.get("on")))
                 elif path == "/api/shield/paranoia":
                     r = sh.set_paranoia(b.get("level", 1))
+                    # 監査ログの「元に戻す」は変更前の optional_sigs を同梱する(#69)。プリセットで
+                    # 上書きされた個別設定を、検証済みセッター経由で変更前どおりに戻す。
+                    opt = b.get("optional_sigs")
+                    if isinstance(opt, dict):
+                        cur = dict(sh.cfg.get("optional_sigs") or {})
+                        for name in sorted(set(cur) | set(opt)):
+                            if bool(opt.get(name)) != bool(cur.get(name)):
+                                sh.set_optional_signature(name, bool(opt.get(name)))
+                        r = sh.paranoia_status()
                 elif path == "/api/shield/path_limits":
-                    r = sh.set_path_limits(b.get("rules"))
+                    # rules が配列でない(綴り違い {"rule": …} 等)なら置換しない(#24: 空へ
+                    # 正規化して全ルールを消し、ok:true を返していた)。
+                    rules = b.get("rules")
+                    r = (sh.set_path_limits(rules) if isinstance(rules, list)
+                         else {"ok": False, "error": "'rules' must be a list"})
                 elif path == "/api/shield/blocked_methods":
                     r = sh.set_blocked_methods(b.get("methods"))
                 elif path == "/api/shield/sig_add":
+                    # weight の検証(有限・範囲)は add_signature に一本化。ここで float() すると
+                    # "nan" が NaN として素通りし、"abc" は例外文言がそのまま返っていた。
                     r = sh.add_signature(b.get("name", ""), b.get("pattern", ""),
-                                         weight=float(b.get("weight", 40)))
+                                         weight=b.get("weight", 40))
                 elif path == "/api/shield/sig_remove":
                     r = sh.remove_signature(b.get("name", ""))
                 elif path == "/api/shield/unban":
@@ -983,6 +1113,7 @@ th.sortable .sortarrow{display:inline-block;width:9px;font-size:9px;color:var(--
   <div class="controls">
     <label class="sw"><input type="checkbox" id="fw" class="toggle"> ファイアウォール</label>
     <label class="sw"><input type="checkbox" id="sh" class="toggle"> DDoS / 侵入防御</label>
+    <span class="badge warn" id="cfgwarn" style="display:none"></span>
     <div class="spacer"></div>
     <button class="red" onclick="globalBlock(true,this)">🌍 グローバル遮断</button>
     <button class="ghost" onclick="globalBlock(false,this)">解除</button>
@@ -1464,6 +1595,9 @@ async function refresh(){
   return}
  $("conn").className="pill ok";$("connt").textContent=tr("接続中");
  $("fw").checked=s.firewall.enabled;$("sh").checked=s.shield.cfg.enabled;
+ // 直すべき設定(旧版が保存した site whitelist+空 など)を警告バッジで出す。本文は必ず esc() を通す
+ const W=s.shield.warnings||[];$("cfgwarn").style.display=W.length?"":"none";
+ $("cfgwarn").innerHTML=W.map(w=>"⚠ "+esc(w.message||w.code||"")).join("<br>");
  const m=s.shield_metrics;
  const em=s.edge_metrics||{};
  $("cards").innerHTML=[["要求",m.requests,"i-blue"],["許可",m.allow,"i-green"],["スロットル",m.throttle,"i-amber"],
@@ -1490,7 +1624,7 @@ async function refresh(){
  const oset=dc.optional_sigs||{};
  $("optsigs").innerHTML=(s.shield.optional_signatures||[]).map(n=>
    `<div class="row"><label class="sw"><input type="checkbox" class="toggle" ${oset[n]?"checked":""}`
-   +` onchange="postT('/api/shield/optional_sig',{name:'${esc(n)}',on:this.checked},null,tr('設定を保存しました')).then(refresh)">`
+   +` data-name="${esc(n)}" onchange="postT('/api/shield/optional_sig',{name:this.dataset.name,on:this.checked},null,tr('設定を保存しました')).then(refresh)">`
    +` ${esc(tr(OPTL[n]||n))}</label></div>`).join("")||'<div class="empty">'+tr("なし")+'</div>';
  // パス別レート制限(per-path token bucket): 現在のルール一覧 + 削除
  curPathLimits=dc.path_limits||[];
@@ -1546,8 +1680,8 @@ async function refresh(){
    `<tr><td class="num">${esc(p.ip)}</td><td><span class="badge info">${esc(p.zone)}</span></td>
    <td class="num">${tm(p.ts)}</td>
    <td><label class="meta" style="font-weight:normal;cursor:pointer"><input type="checkbox" id="rem_${esc(p.id)}"> ${tr("常時許可として記憶")}</label>
-   <button onclick="resolvePending('${esc(p.id)}',true,this)">${tr("承認")}</button>
-   <button class="red" onclick="resolvePending('${esc(p.id)}',false,this)">${tr("却下")}</button></td></tr>`).join("")
+   <button data-pid="${esc(p.id)}" onclick="resolvePending(this.dataset.pid,true,this)">${tr("承認")}</button>
+   <button class="red" data-pid="${esc(p.id)}" onclick="resolvePending(this.dataset.pid,false,this)">${tr("却下")}</button></td></tr>`).join("")
    ||'<tr><td colspan="4" class="empty">'+tr("承認待ちなし — ゾーンポリシーが「承認待ち」のゾーンで新規接続があるとここに表示されます")+'</td></tr>';
 }
 /* BAN中IPテーブル: 検索/ソート/一括選択。curBans はサーバから取得した最新配列。 */
@@ -1567,7 +1701,9 @@ function renderBans(){
    `<tr><td><input type="checkbox" class="bansel" data-ip="${esc(b.ip)}" ${banSel.has(b.ip)?"checked":""}></td>`
    +`<td class="num">${esc(b.ip)}</td><td class="num">${esc(tr("残"))}${Math.round(b.remain_sec)}s</td>`
    +`<td><span class="badge ${b.score>40?"danger":"warn"}">score ${b.score}</span></td>`
-   +`<td><button class="ghost" onclick="unban('${esc(b.ip)}',this)">${tr("解除")}</button></td></tr>`).join("")
+   // IP は data 属性で渡す(#1/#40: onclick の JS 文字列に埋めると属性の実体参照復号で
+   // &#39; が ' に戻る。IPv6 スコープ ID は引用符ごと ip_address() を通るため保存型 XSS になった)。
+   +`<td><button class="ghost" data-ip="${esc(b.ip)}" onclick="unban(this.dataset.ip,this)">${tr("解除")}</button></td></tr>`).join("")
    ||'<tr><td colspan="5" class="empty">'+tr(curBans.length?"該当なし":"BAN なし")+'</td></tr>';
  document.querySelectorAll(".bansel").forEach(cb=>cb.onchange=()=>{
   if(cb.checked)banSel.add(cb.dataset.ip);else banSel.delete(cb.dataset.ip);
@@ -1672,8 +1808,8 @@ async function refreshPro(){
   $("appeals").querySelector("tbody").innerHTML=ap.map(a=>
    `<tr><td class="num">${esc(a.ip)}</td><td><span class="badge ${a.status==="pending"?"warn":"muted"}">${esc(a.status)}</span></td>
    <td>${esc((a.reason||"").slice(0,40))}</td>
-   <td>${a.status==="pending"?`<button onclick="resolveAppeal('${esc(a.ip)}',true,this)">${tr("承認")}</button>
-   <button class="red" onclick="resolveAppeal('${esc(a.ip)}',false,this)">${tr("却下")}</button>`:""}</td></tr>`
+   <td>${a.status==="pending"?`<button data-ip="${esc(a.ip)}" onclick="resolveAppeal(this.dataset.ip,true,this)">${tr("承認")}</button>
+   <button class="red" data-ip="${esc(a.ip)}" onclick="resolveAppeal(this.dataset.ip,false,this)">${tr("却下")}</button>`:""}</td></tr>`
   ).join("")||'<tr><td colspan="4" class="empty">'+tr("申立なし — BANされた利用者が異議申立を送るとここに表示されます")+'</td></tr>';}catch(e){if(isAuthFail(e))markAuthError();}
  try{const an=await guardedFetch("/api/analysis");
   $("analysis").textContent=JSON.stringify({actions:an.actions,by_zone:an.by_zone,
@@ -1795,7 +1931,8 @@ function drawMap(d){
    const col=n.banned?red:(n.score>40?amber:green);
    g+=`<line x1="${cx}" y1="${cy}" x2="${x}" y2="${y}" stroke="${line}" stroke-width="1"/>`
     +`<circle cx="${x}" cy="${y}" r="7" fill="${col}" style="cursor:pointer"`
-    +` onclick="toggleNode('${esc(n.ip)}',${!!n.banned})"><title>${esc(n.ip)} [${esc(z)}] score${n.score}${n.mac?" "+esc(n.mac):""}</title></circle>`;});});
+    +` data-ip="${esc(n.ip)}" data-banned="${n.banned?1:0}"`
+    +` onclick="toggleNode(this.getAttribute('data-ip'),this.getAttribute('data-banned')==='1')"><title>${esc(n.ip)} [${esc(z)}] score${n.score}${n.mac?" "+esc(n.mac):""}</title></circle>`;});});
  $("netmap").innerHTML=g;
 }
 function toggleNode(ip,banned){
