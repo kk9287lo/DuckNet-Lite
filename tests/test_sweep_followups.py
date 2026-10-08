@@ -222,3 +222,87 @@ def test_f8_admin_early_reject_still_delivers_the_response():
         finally:
             adm.stop()
             FW._FW, ND._SHIELD = ofw, osh
+
+
+# ── stop() が待受を手放さない(Linux): close() は accept()/recvfrom() の待ちを起こさない ──
+def _port_is_free(port, kind):
+    s = socket.socket(socket.AF_INET, kind)
+    try:
+        s.bind(("127.0.0.1", port))                # SO_REUSEADDR なし=本当に空いているか
+        return True
+    except OSError:
+        return False
+    finally:
+        s.close()
+
+
+def _assert_released(name, obj, port, kind):
+    obj.stop()
+    deadline = time.time() + 3.0
+    while time.time() < deadline and not _port_is_free(port, kind):
+        time.sleep(0.05)
+    assert _port_is_free(port, kind), "%s: stop() 後もポート %d が使用中のまま" % (name, port)
+
+
+def test_f9_listeners_release_their_port_on_stop():
+    """別スレッドが accept()/recvfrom() で待っているソケットを close() しても、Linux では待ちが
+    起きずカーネルが待受を保持したままになる。デコイ・DNS フィルタ・gossip・LDAP プロキシの
+    stop() は close() だけだったため、停止後もポートを掴み続け、同じポートで再起動できなかった
+    (Windows では close() で起きるので見えなかった)。shutdown() で起こしてから閉じる。"""
+    try:
+        from dataplane.engine.lifeform.listeners import CanaryListener, DecoySensor
+        from dataplane.engine.lifeform.dns import DnsFilter
+        from dataplane.engine.lifeform.ldap_proxy import LdapProxy, ProxyMonitor, LdapEnumDetector
+        from dataplane.engine.services.gossip import GossipNode
+    except ImportError:
+        raise SkipTest("デコイ/DNS/LDAP プロキシ/gossip は Full 版のみ")
+    with tempfile.TemporaryDirectory() as d:
+        a = CanaryListener(DecoySensor(state_dir=d), "ldap", "127.0.0.1", 0, read_timeout=0.3)
+        assert a.start()["ok"]
+        _assert_released("decoy", a, a.port, socket.SOCK_STREAM)
+        p = LdapProxy(ProxyMonitor(state_dir=d), LdapEnumDetector(), listen_host="127.0.0.1",
+                      listen_port=0, upstream_host="127.0.0.1", upstream_port=9)
+        assert p.start()["ok"]
+        _assert_released("ldap-proxy", p, p.listen_port, socket.SOCK_STREAM)
+        f = DnsFilter(host="127.0.0.1", port=0, state_dir=d)
+        assert f.start()["ok"]
+        _assert_released("dns", f, f.port, socket.SOCK_DGRAM)
+        g = GossipNode(ND.NetShield(state_dir=d), secret="k", host="127.0.0.1", port=0,
+                       state_dir=d)
+        assert g.start()["ok"]
+        _assert_released("gossip", g, g.port, socket.SOCK_DGRAM)
+
+
+# ── 整合性監視の通知: すり替えの場所と隔離先が載っていなかった ──
+def test_f10_integrity_tamper_event_names_shadowing_paths_and_quarantine():
+    """r5 で監視は『ソースより先に import される兄弟(同名パッケージ/拡張モジュール)』と pyc を
+    検知し、修復で隔離するようになったが、通知(report_tamper)には basename しか載らず、
+    パッケージの場合は 'pipeline' のような名前だけで、隔離先(証拠の置き場)も分からなかった。"""
+    try:
+        from dataplane.engine.services.proxy import AsyncEdgeGuard
+    except ImportError:
+        raise SkipTest("proxy が無い")
+    shadow = os.path.join(tempfile.gettempdir(), "pkg", "pipeline")
+    pyc = os.path.join(tempfile.gettempdir(), "pkg", "__pycache__", "policy.cpython-312.pyc")
+
+    class _SI:
+        def tick(self):
+            return {"event": "tamper", "modified": [shadow, pyc], "missing": [],
+                    "manifest_valid": True, "shadowed": [shadow], "bytecode": [pyc],
+                    "repair": {"ok": True, "quarantined": {shadow: shadow + ".quarantined-1"}}}
+
+    with tempfile.TemporaryDirectory() as d:
+        old = ND._SHIELD
+        ND._SHIELD = ND.NetShield(state_dir=d)
+        try:
+            g = AsyncEdgeGuard()
+            if not hasattr(g, "_make_integrity_tick"):
+                raise SkipTest("整合性監視は Full 版のみ")
+            g._make_integrity_tick(_SI())()
+            last = ND._SHIELD._tamper["last"]
+        finally:
+            ND._SHIELD = old
+    assert last.get("kind") == "integrity_tamper", last
+    assert last.get("shadowed") == [shadow], last
+    assert last.get("bytecode") == [pyc], last
+    assert last.get("quarantined") == {shadow: shadow + ".quarantined-1"}, last
