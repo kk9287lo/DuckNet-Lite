@@ -306,3 +306,71 @@ def test_f10_integrity_tamper_event_names_shadowing_paths_and_quarantine():
     assert last.get("shadowed") == [shadow], last
     assert last.get("bytecode") == [pyc], last
     assert last.get("quarantined") == {shadow: shadow + ".quarantined-1"}, last
+
+
+# ── 完全性監視: 基準を書けなかったのに ok を返していた ──
+def test_f11_integrity_baseline_reports_failure_when_nothing_was_saved():
+    """baseline() は複製とマニフェストの書込例外をすべて握りつぶして常に ok=True を返していた。
+    保存先に書けない(読み取り専用・ファイルで塞がれている等)と基準は何も残らないのに、
+    --integrity-baseline は終了コード 0 で終わり、終了コードを見る deploy 手順は成功と判断した。"""
+    try:
+        from dataplane.engine.core.integrity import SelfIntegrity
+    except ImportError:
+        raise SkipTest("自己完全性監視は Full 版のみ")
+    with tempfile.TemporaryDirectory() as d:
+        src = os.path.join(d, "code.txt")
+        with open(src, "w", encoding="utf-8") as f:
+            f.write("a'b<c\n")
+        state = os.path.join(d, "state")
+        os.makedirs(state)
+        with open(os.path.join(state, ".integrity"), "w", encoding="utf-8") as f:
+            f.write("x")                                   # 基準の置き場(ディレクトリ)を作れなくする
+        out = SelfIntegrity(state, paths=[src], secret=b"k" * 32).mon.baseline()
+        assert out.get("ok") is False, out
+        assert out.get("errors"), out                       # 何が書けなかったかを残す
+        ok_state = os.path.join(d, "state2")
+        os.makedirs(ok_state)
+        out2 = SelfIntegrity(ok_state, paths=[src], secret=b"k" * 32).mon.baseline()
+        assert out2.get("ok") is True and not out2.get("errors"), out2   # 正常系は従来どおり
+
+
+# ── トレイ: 保護の切り替えに失敗しても何も言わなかった ──
+def test_f12_tray_toggle_failure_is_reported_not_swallowed():
+    """トレイの『防御 ON/OFF』『Under Attack 切替』は失敗を except Exception: pass で捨てており、
+    ゲートウェイが止まっている・トークンが合わない等で切り替わらなくても利用者は気づけなかった。
+    失敗は『何が起きたか+次の一手』の平文で知らせる(例外文字列や JSON は出さない)。"""
+    try:
+        import dataplane.gui.app  # noqa: F401  (Full 版のコントロールパネル=トレイに防御切替がある)
+    except ImportError:
+        raise SkipTest("トレイに防御の切り替えが無い版(Lite)")
+    try:
+        import dataplane.gui.__main__ as GM
+    except Exception as e:                                  # Tk の無いサーバ等
+        raise SkipTest("GUI モジュールを読み込めない環境: %r" % (e,))
+
+    class _Down:
+        def cfg(self):
+            raise ConnectionRefusedError(10061, "refused")
+
+        def set_config(self, changes):
+            raise AssertionError("cfg() が失敗したのに set_config まで進んだ")
+
+    class _Ok:
+        def __init__(self):
+            self.sent = []
+
+        def cfg(self):
+            return {"enabled": True, "under_attack": False}
+
+        def set_config(self, changes):
+            self.sent.append(changes)
+
+    shown = []
+    assert GM._tray_toggle(_Down(), "enabled", shown.append) is False
+    assert len(shown) == 1 and shown[0], shown
+    assert "Traceback" not in shown[0] and "{" not in shown[0], shown[0]
+    assert "10061" not in shown[0], shown[0]               # 生の例外文字列を出さない
+    ok = _Ok()
+    shown.clear()
+    assert GM._tray_toggle(ok, "under_attack", shown.append) is True
+    assert ok.sent == [{"under_attack": True}] and shown == [], (ok.sent, shown)

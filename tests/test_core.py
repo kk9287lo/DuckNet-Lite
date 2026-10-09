@@ -1045,6 +1045,7 @@ def test_slowloris_penalty_escalates_to_ban_not_on_single():
     import tempfile
     with tempfile.TemporaryDirectory() as tmp:
         sh = ND.NetShield(state_dir=tmp)
+        sh.enable()                           # 加点はシールド ON のときだけ(#28)
         ip = "203.0.113.50"
         r1 = sh.penalize(ip, reason="slowloris")
         assert r1["banned"] is False          # 単発では落とさない(正規の低速回線を誤遮断しない)

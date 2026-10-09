@@ -8,6 +8,21 @@
 テスト付きで、修正を外すとそのテストが落ちることを 1 本ずつ確認している(`tests/test_sweep_*.py`)。
 
 ### 運用者に見える挙動の変化
+- **トレイで防御の ON/OFF が分かる**: トレイ常駐は 5 秒ごとに管理 API(`/api/metrics`)を読み、防御 ON は
+  通常アイコン、OFF・本体に接続できない・管理トークン不一致は淡色アイコン(`DuckNet-off.ico`)にして、
+  ツールチップに「防御 ON / 防御 OFF / ゲートウェイに接続できません / 状態を確認できません」を出す(切替は
+  従来どおりダッシュボードで)。本体を別に起動している場合は `DUCKNET_ADMIN_TOKEN` を揃える
+  ([docs/dashboard.md](docs/dashboard.md))。
+- **自動起動の結果表示**: `--install-autostart` / `--uninstall-autostart` は結果を JSON のまま出さず、成否の
+  1 行・登録先・確認方法・取り消し方・失敗時の「次の手順」を平文で出す(表示言語は `DUCKNET_LANG`、未設定なら
+  OS のロケール)。結果をスクリプトで読む場合は **`--json` を付ける** と従来とまったく同じ JSON を出す
+  (終了コードは従来どおり)。
+- **訪問者に返す画面**: レート超過(429)・サイト側の一時障害(502)・送信内容の不備(400/413/415/431)・
+  異議申し立ては、ブラウザには「何が起きたか+次にすること」(何秒後に再試行するか、再読み込み、ファイルを
+  小さく、Cookie の削除、管理者への連絡など)の画面を返す。API クライアント(`Accept` が HTML を優先しない
+  要求)には従来と同じ JSON を返す。
+- **ダッシュボードの表示**: 「詳細分析」は JSON の羅列ではなく見出し付きの集計で表示する。通信断・認証切れ・
+  操作の失敗は、原因と次の一手を平文で出す。
 - **管理 API**: Cookie 認証の POST は `Content-Type: application/json` 必須(それ以外は 415)。
   Origin/Referer はホストに加えて **ポートも** 照合する(Host をポート抜きに書き換えるリバース
   プロキシは `DUCKNET_ADMIN_ALLOWED_HOSTS` へ登録)。読めない本文(chunked・上限超・途中切れ・
@@ -22,6 +37,71 @@
 - **署名付き状態ファイルの手動削除**: 署名済みサイドカー(`.hw`)が残っていると改竄警報を 1 回出す。
   警報なしで初期化するときは `.hw` も消す。
 - **`--cluster` を systemd で使う場合は `KillMode=mixed` を推奨**([docs/hardening.md](docs/hardening.md))。
+- **要求ボディの読み方**: 本文は UTF-8 として読み(不正なバイトだけ latin-1 で 1:1)、改行は `;` ではなく
+  空白として扱う(パス/クエリ/ヘッダは従来どおり `;`)。multipart は枠を外し、パートの中身とパートヘッダを
+  別々に走査する。普通のブラウザのアップロードやフォームの改行が crlf/sqli/rce に当たって加点・BAN されて
+  いた誤検知が無くなる([docs/defenses.md](docs/defenses.md))。
+- **バイナリ本文は署名走査しない**: バイナリのファイルパートと、`Content-Type` がバイナリ型
+  (`application/octet-stream`・protobuf・`image/*`・`audio/*`・`video/*`・zip・pdf など)*かつ* 中身もバイナリ
+  (タブ/CR/LF 以外の制御バイトを含む)の本文。ランダムなバイト列が rce に当たり、64KB で約 42 点(単発拒否の
+  `deny_score` 超)になっていた。省いた本文は metrics の `body_binary_skipped` に数える。テキスト型・型が無い/
+  重複・中身がテキストの本文は従来どおり走査する。
+- **アップロード検査**: 生本文アップロード(要求ヘッダ `Content-Disposition` の `filename` / `filename*`。
+  WordPress REST の media など)にも拡張子ポリシーを掛け、拒否なら backend へ何も送らない。multipart では
+  `filename*`(RFC 5987)と RFC 2231 の継続を復号し、本文先頭 64KiB より後ろのパートも転送しながら検査する。
+  二重拡張子は最終拡張子と既知の実行拡張子(php 系など)だけを見る(`www.example.com.har` を `.com` で遮断
+  しない)。パートヘッダ以外の `filename=` という文字列では遮断しない。`body_scan_enabled=false` でも
+  アップロード検査と GraphQL 防御は止まらない。
+- **GraphQL**: 本文は新設の `graphql_max_bytes`(既定 262144)まで全体を解析し、超える本文は 413(加点・
+  BAN なし)。`graphql_max_complexity` は選択したフィールド(エイリアス込み)の数で数え、既定を 1000 に
+  上げた(旧版で保存した 100 はそのまま残るので見直す)。GET の `?query=`・urlencoded の `query=`・
+  multipart の `operations` も検査する。`__typename` はイントロスペクション扱いしない。`graphql_paths` は
+  正規化したパスで照合する。
+- **出口 DLP**: 有効時は backend へ `Accept-Encoding: identity` を渡す(それでも圧縮で返った本文は
+  `dlp_unscannable` として `dlp_action` どおり)。chunked は枠を外し、読取の切れ目をまたいで走査する。
+  カード番号は主要ブランドの IIN+14〜19 桁+Luhn(13 桁の JAN/EAN は対象外)。全体 `mode=audit` の間は
+  `block` も記録のみ。audit では応答を保留しない(block でも SSE/101 は保留せず、他も backend が 0.2 秒
+  黙れば送る)。`dlp_action` は `audit` / `block` だけ、`dlp_max_scan_bytes` は 1 以上だけを受け付ける。
+- **シールド OFF の間は応答側で加点しない**: 4xx 連射の採点と penalize(slowloris・slow-read など)は何も
+  しない(OFF の間に溜まった BAN で、ON に戻した直後の正規の利用者が 403 になっていた)。
+  `resp_error_threshold` は 1 以上。
+- **誤検知の修正(cadence / JWT)**: 規則的なポーリングへの加点は検知エピソードごとに 1 回にした(毎要求
+  加点して約 10 秒で拒否/BAN になっていた)。`alg` を持たない 3 区切りトークン(itsdangerous 形式など)は
+  JWT とみなさない(本物の `alg:none` は従来どおり即時 BAN)。`cadence_min_samples` は 24 以下(旧版の
+  保存値は 24 に丸める)。
+- **カスタムシグネチャ**: 大小を区別せずに照合し、組込シグネチャが先に当たっても評価して最も重い weight で
+  採点する。weight 0 は記録のみ(加点しない)。件数は最大 256(超える追加は拒否、読込時の超過分は無効として
+  残す)。組込と同名の規則は拒否し、同名で追加すると編集(置き換え)になる。無効化された規則は一覧に
+  `active=false` と理由で残る。`body_sig_weight_factor=0` は本文ヒットを記録のみにする。
+- **`paranoia` / `optional_sigs` の検証**: `paranoia` は 1〜4、`optional_sigs` は任意シグネチャ名と真偽値
+  だけを受け付け、不正な値は拒否して現在の設定を保つ(`apply_config` は rejected と報告)。
+- **クレデンシャル単位レート**: `cred_rate_score` が効くようになった(既定 0=加点なし。旧版の保存値 40 は
+  読み込まない)。上限 N に対して N 件まで通し、N+1 件目から遮断する(1 件ずれていた)。
+- **ダッシュボードの集計**: メソッド別は既知メソッドと遮断設定したメソッドだけを個別に数え、他は OTHER に
+  まとめる。全体レートは同じ時刻に届いた要求も数える(Windows の粗い時計で過小表示されていた)。
+- **経路制御のパス照合**: `blocked_urls` / `blocked_extensions` / `path_limits` / `graphql_paths` は、
+  %デコード・小文字化に加えて `;` のパスパラメータを除き、`/` の連続を畳み、ドットセグメントを解決した
+  パスで照合する(`//admin`・`/admin;x=1`・`/public/../admin` も `/admin` として当たる)。照合専用で、転送する
+  要求は変えない。設定値も解決後の形で書く(`..`・`//`・`;` を含む `blocked_urls` / `path_limits` の値は
+  当たらない)。生のパスで経路を決める backend(Node/Express など)でも照合は解決後の形になる
+  ([docs/defenses.md](docs/defenses.md))。
+- **設定の改竄で防御を止めない(fail-closed)**: `state.json` とメモリ上の cfg を同時に改竄されると、整合
+  チェックの復元が既定値(シールド OFF)に倒れて WAF が止まっていた。稼働中は最後に検証できた cfg を保ち
+  (それも照合できなければ既定値+シールド ON)、起動時は署名保存の実績があるのに `state.json` が改竄・
+  巻き戻し・削除されていれば、既定値+シールド ON で起動して `state_tamper` 警報と `cfg_fail_closed`
+  イベントを出す。初回起動と、一度も保存していない `state.json` の欠損は従来どおり OFF。既存の state dir で
+  `DUCKNET_STATE_KEY` を替えた起動も ON+警報になる([docs/hardening.md](docs/hardening.md) 1.4)。
+- **列挙値キーの検証**: `mode` / `open_redirect_mode` / `geo_mode` / `site_mode` / `ip_mode` /
+  `cookie_samesite` も決まった値だけを受け付ける(前後の空白と大小文字は正規化。綴り違いを黙って受理し、
+  意図と違うモードで動いていた)。保存済みの不正な値は既定値として読む。`body_sig_weight_factor` の負の値は
+  拒否する(保存済みの負の値は 0=記録のみとして読む)。HTTP ヘッダへそのまま書く `origin_header` はヘッダ名の
+  token だけ、`open_redirect_safe_path` は改行などの制御文字を含まない値だけを受け付ける。
+- **本文の `;` を手がかりにする検知**: 要求本文では、スタック複文(`sqli-stacked`)は `;` の後に SQL 文の構文が
+  続くとき、`rce` の `;` 連結はコマンドが引数を伴うとき、`crlf` は既知の応答ヘッダ名とその値の形が続くとき
+  だけ当てる(`Looks good; update the changelog` のような地の文や CSV の区切りが加点されていた)。`crlf` は
+  値に符号化して入れた改行(`%0D%0A`・`&#10;` など)の後のヘッダの形も数える(本文の改行を空白にした修正で
+  見えなくなっていた)。生の改行(YAML/テキストの行・multipart の枠)は文書の構造として数えない。URL/ヘッダの
+  走査は従来どおり([docs/defenses.md](docs/defenses.md))。
 
 ## [Lite] — ライセンスを GNU AGPL-3.0-or-later に変更
 

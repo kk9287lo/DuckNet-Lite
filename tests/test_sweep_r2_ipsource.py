@@ -209,7 +209,7 @@ def test_r2_cred_rate_counts_api_key_alongside_random_bearer():
                               f"Authorization: Bearer junk{i}\r\n"
                               f"X-API-Key: stolen-key\r\n\r\n").encode())
         passed = sum(1 for d in be.got if b"/r2-api" in d)
-        assert passed <= 2, passed
+        assert passed <= 3, passed                 # 上限 3 件までは通す(#38)
     finally:
         be.close()
 
@@ -221,13 +221,15 @@ def test_r2_cred_rate_inspect_charges_every_identifier():
         sh.cfg.update(enabled=True, cred_rate_enabled=True, cred_rate_limit=3)
         acts = [sh.inspect(f"192.0.2.{10 + i}", path="/api",
                            cred=(f"junk{i}", "stolen-key"))["action"] for i in range(5)]
-        assert acts[:2] == ["allow", "allow"] and "block" in acts[2:], acts
+        # 上限 3 件までは通し、超えた要求を遮断(#38: 旧実装は 3 件目で遮断していた)
+        assert acts[:3] == ["allow", "allow", "allow"] and "block" in acts[3:], acts
         # 単一 str の従来シグネチャ: 盗用キー単体でも同じ窓を共有して数える
         assert sh.inspect("192.0.2.40", path="/api", cred="stolen-key")["action"] == "block"
-        # 同じ値が Bearer と X-API-Key の両方に載っても 1 要求 1 回の計上
+        # 同じ値が Bearer と X-API-Key の両方に載っても 1 要求 1 回の計上(二重計上なら 3 件目で超過)
         assert sh.inspect("192.0.2.50", path="/api", cred=("dup-key", "dup-key"))["action"] == "allow"
         assert sh.inspect("192.0.2.51", path="/api", cred=("dup-key", ""))["action"] == "allow"
-        assert sh.inspect("192.0.2.52", path="/api", cred="dup-key")["action"] == "block"
+        assert sh.inspect("192.0.2.52", path="/api", cred="dup-key")["action"] == "allow"
+        assert sh.inspect("192.0.2.53", path="/api", cred="dup-key")["action"] == "block"
 
 
 if __name__ == "__main__":

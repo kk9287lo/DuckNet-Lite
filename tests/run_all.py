@@ -131,6 +131,26 @@ MODULES = [
     "test_sweep_r3_net",        # IPv4-mapped の CIDR 照合
     "test_sweep_followups",     # XFF のゾーンID/使用量の IPv6 Host/FW の IPv4-mapped
     "test_sweep_r4_site_whitelist",  # 空の site_whitelist を whitelist モードにする設定を拒否
+    # 2026-10 検知エンジン本体の点検の回帰テスト
+    "test_sweep_det_normalize",       # 正規化/走査窓/本文専用の正規化(multipart の誤検知)
+    "test_sweep_det_signatures",      # シグネチャ: 重み 0/独自規則の照合面/組込との優先/読込の堅牢性
+    "test_sweep_det_inspect_state",   # 状態と採点: 追い出し/早期拒否の計上/減衰/各種設定の境界
+    "test_sweep_det_inspect_checks",  # 個別検査: JWT/周期判定
+    "test_sweep_det_body",            # GraphQL/アップロード/本文検査の配線
+    "test_sweep_det_response",        # 出口 DLP/応答採点
+    "test_sweep_det_periphery",       # ブルームフィルタ
+    "test_sweep_det2_signatures",     # 本文の ';' は文脈必須/管理 API の入力検証/シグネチャ画面
+    "test_sweep_det2_body",           # バイナリ本文/要求ヘッダのファイル名
+    "test_sweep_det2_config",         # 設定改ざん時も保護を止めない/列挙値と係数の検証
+    "test_sweep_det2_path",           # 照合用パスのドットセグメント/'//'/';' の解決
+    "test_sweep_det3_crlf",           # 本文の値に符号化された改行+応答ヘッダの検知(誤検知は戻さない)
+    "test_sweep_det3_docs",           # カスタム規則の注意文言と文書の整合
+    "test_sweep_det3_misc",           # ヘッダに書く設定値の検証
+    # 2026-10 人に向けた表示: JSON の垂れ流しをやめ『何が起きたか+次にすること』を出す
+    "test_sweep_ux_proxy_pages",      # 訪問者向けの拒否ページ(API には従来の JSON)
+    "test_sweep_ux_dashboard_gui",    # ダッシュボードの詳細分析/エラー表示
+    "test_sweep_ux_cli",              # CLI の要約表示と --json
+    "test_sweep_lite_tray_status",    # トレイのアイコン/ツールチップで防御 ON/OFF を表示
 ]
 
 

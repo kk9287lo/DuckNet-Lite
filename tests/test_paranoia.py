@@ -34,7 +34,8 @@ def test_set_paranoia_tiers_and_clamp():
         assert sh.set_paranoia(4)["enabled_optional"] == ["redirect", "ssrf_internal", "ssti"]
         assert sh.set_paranoia(0)["paranoia"] == 1          # 下限 clamp
         assert sh.set_paranoia(9)["paranoia"] == 4          # 上限 clamp
-        assert sh.set_paranoia("x")["paranoia"] == 1        # 不正入力→1
+        r = sh.set_paranoia("x")                            # 不正入力は拒否して現状維持
+        assert r["ok"] is False and r["paranoia"] == 4      # (旧: 1 に落として任意署名を全 OFF)
 
 
 def test_redirect_signature_gated_by_level2():

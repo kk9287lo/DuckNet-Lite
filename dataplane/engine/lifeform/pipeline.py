@@ -113,6 +113,41 @@ _SIGNATURES = [
     ("redirect", r"=//[a-z0-9.\-]"),
 ]
 _SIG_RE = [(name, re.compile(pat)) for name, pat in _SIGNATURES]
+# 要求本文用の差し替え(#2)。head では ';' は注入された改行(正規化で ';' にする)かコマンド/文の区切り
+# だが、本文の ';' は CSV の区切りや地の文の句読点でもある('Bought two bowls; cat loved them' が rce、
+# 'Hi team; To: everyone' が crlf に当たっていた)。本文では ';' の後に文脈が揃う時だけ当てる:
+#  rce : ';' の後のコマンドが引数を伴う(-フラグ / パス / $ / リダイレクト / URL / IPv4 / host.tld/…)。
+#        '||' '&&' 連結と他の分岐は head と同じ。
+#  crlf: ヘッダ名の後にそのヘッダの値の形が続く(set-cookie:名前= / location:URL / to:…@ 等)。
+#        本文の走査面では改行は ';' にならない([[_normalize_full]] body=True)ので、ここに来る ';' は
+#        字面どおり。値に符号化して入れた改行(%0D%0A 等)は crlf の照合でだけ ';' として読む
+#        (nl=True の見え方・[[NetShield._scan_field]]。生の改行=YAML/テキスト/multipart の枠は空白のまま)。
+# 判定は head 用より狭い(部分集合)=prescan のスーパーセット性は崩れない。URL/ヘッダの走査は従来どおり。
+# 本文の crlf の『ヘッダ名+値の形』(先頭の ';' を除いた部分)。[[_BODY_CRLF_GATE]] も同じ形を使う。
+_BODY_CRLF_SHAPE = (r"(?:set-cookie:\s?[^\s=;]{1,64}=|location:\s?(?:[a-z][a-z0-9+.-]{0,15}:)?/"
+                    r"|refresh:\s?\d|content-type:\s?[a-z]{1,32}/[a-z0-9]|content-length:\s?\d"
+                    r"|content-disposition:\s?(?:attachment|inline|form-data)\b"
+                    r"|(?:bcc|cc|to):\s?[^\s;@]{1,64}@[a-z0-9]|mime-version:\s?\d"
+                    r"|content-transfer-encoding:\s?(?:base64|quoted-printable|7bit|8bit|binary)\b)")
+_BODY_SIG_PATTERNS = {
+    "rce": r"(?i)(;\s*(?:cat|wget|curl|bash|sh|nc|powershell)\b"
+           r"(?:\s?\$[a-z_{(]|\s?[<>]{1,2}\s?[/&~$.]|\s(?:--?[a-z0-9]|[/~\\][^\s;]|\.\.?/"
+           r"|[a-z][a-z0-9+.-]{0,15}://|\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b"
+           r"|[\w-]{1,63}\.[\w.-]{1,63}/))"
+           r"|(?:\|\||&&)\s*(cat|wget|curl|bash|sh|nc|powershell)\b|\$\([^)]{0,200}\)|`[^`]{0,200}`"
+           r"|\|\s*(nc|bash|sh|curl|wget|python)\b|\(\)\s\{|<\?php\b|<\?=)",
+    "crlf": r"(?i);" + _BODY_CRLF_SHAPE,
+}
+_SIG_RE_BODY = [(name, re.compile(_BODY_SIG_PATTERNS[name]) if name in _BODY_SIG_PATTERNS else rgx)
+                for name, rgx in _SIG_RE]
+_BODY_CRLF_RE = dict(_SIG_RE_BODY)["crlf"]
+# 値の改行を ';' にした見え方(2 回目の正規化)を作るかの前置ゲート。本文の走査面(改行=空白)に
+# ';' 無しの『ヘッダ名+値の形』が無ければ、その見え方でも crlf は当たらない(';' と空白の違いは改行の
+# 位置だけで、形の部分は両方に同じ字面で載る)=真陽性のスーパーセット。良性の本文は大半ここで終わる。
+# 走査面は小文字化済みなので (?i) を付けない((?i) 付きは 8KB で約 4 倍遅い)。先にヘッダ名の
+# リテラル(名前の直後は必ず ':'。content- は 4 種・cc: は bcc: も含む)で絞る(8KB で数 µs)。
+_BODY_CRLF_NAMES = ("to:", "cc:", "location:", "set-cookie:", "refresh:", "content-", "mime-version:")
+_BODY_CRLF_GATE = re.compile(_BODY_CRLF_SHAPE)
 # 高コストなシグネチャの前置ゲート(真陽性のスーパーセット): その名前の *どの分岐も*
 # 必ず含むリテラルを列挙する。1 つも無ければ正規表現は原理的にマッチしないので評価を省く。
 # 走査面は正規化済み(小文字化・比較演算子前後の空白除去)なので "1=1" 等の形で確実に現れる。
@@ -243,11 +278,14 @@ _DEFAULTS = {
     "jwt_allowed_algs": [],        # 許可する alg のホワイトリスト(空=none のみ遮断)。例 ["RS256","ES256"]
     # クレデンシャル単位レート制限(evolution #70): IP ではなく Bearer トークン/API キーの *識別子*
     # 単位でレートを集計する。攻撃者が IP をローテーションしつつ同一の盗用キーを使う濫用を、IP に
-    # 依らず絞る。トークンは生で保持せずハッシュ短縮。超過で加点(既定=deny_score→単発拒否)。
+    # 依らず絞る。トークンは生で保持せずハッシュ短縮。上限を超えた *その要求だけ* を遮断する。
     "cred_rate_enabled": False,    # API キー/トークン単位のレート制限(IP ローテーション濫用対策)
     "cred_rate_window_sec": 60,    # 集計窓
-    "cred_rate_limit": 600,        # 窓内のリクエスト上限(超で加点)
-    "cred_rate_score": 40,         # 超過時の加点(既定=deny_score 相当→次要求で単発拒否)
+    "cred_rate_limit": 600,        # 窓内のリクエスト上限(この件数までは通し、超えた要求を遮断)
+    # 超過した要求の送信元 IP への加点(0=加点しない・既定)。共有キー(アプリ埋込/公開キー)では
+    # 攻撃者が窓を超えさせ続けると同じキーを使う正規利用者の IP に加点が乗る(BAN の第三者転嫁)ため、
+    # キーが利用者ごとに固有の配備でのみ使う(#39: 旧版は文書だけあって未配線だった)。
+    "cred_rate_score": 0,
     # スロー POST(R-U-Dead-Yet)対策(evolution #64): 要求ボディの *総受信時間* に上限を設ける。
     # head slowloris(head_timeout)は対処済みだが、ボディを小出しして接続を保持する攻撃に上限が
     # 無かった。client→backend 方向のみに効く(応答=backend→client の長時間ストリームは縛らない)。
@@ -275,18 +313,24 @@ _DEFAULTS = {
     "open_redirect_mode": "enforce",   # enforce=安全パスへ書換 / audit=記録のみ
     "open_redirect_allow": [],         # 許可する外部リダイレクト先ホスト(例 ["accounts.google.com"])
     "open_redirect_safe_path": "/",    # enforce 時に書き換える安全な遷移先
-    # ファイルアップロード検査(evolution #66): multipart の filename= から危険拡張子(webshell/実行体)を
-    # 拒否する。#61(本文シグネチャ)とは別関心=ファイル種別ポリシー。二重拡張子(shell.php.jpg)も
-    # 全セグメント検査で捉える。block_score 超で BAN。
-    "upload_scan_enabled": True,   # multipart アップロードの危険拡張子拒否(webshell 投入対策)
+    # ファイルアップロード検査(evolution #66): multipart(Content-Type: multipart/*)の *パートヘッダ*
+    # Content-Disposition の filename= / filename*= から危険拡張子(webshell/実行体)を拒否する。
+    # #61(本文シグネチャ)とは別関心=ファイル種別ポリシー(body_scan_enabled とは独立に効く)。
+    # 最終拡張子と、ハンドラが中間セグメントにも効く既知の二重拡張子(shell.php.jpg)を見る。
+    # 走査 prefix より後ろのパートヘッダも転送しながら検査する。block_score 超で BAN。
+    "upload_scan_enabled": True,   # アップロードの危険拡張子拒否(webshell 投入対策)。multipart の
+                                   # パートと、生本文アップロードの要求ヘッダ Content-Disposition
     # GraphQL クエリ防御(evolution #67): 深いネスト/複雑度/イントロスペクション/バッチを上限化。
-    # 既定OFF(GraphQL を使う配備で有効化)。graphql_paths のエンドポイントにだけ適用。
+    # 既定OFF(GraphQL を使う配備で有効化)。graphql_paths のエンドポイントにだけ適用(パスは
+    # _path_for_match で正規化して照合)。POST(JSON/application/graphql/urlencoded/multipart の
+    # operations)と GET ?query= の両方を見る。body_scan_enabled とは独立に効く。
     "graphql_enabled": False,      # GraphQL 固有のDoS/情報漏洩防御
     "graphql_paths": ["/graphql"], # GraphQL とみなすパス(前方一致)
     "graphql_max_depth": 12,       # 選択セットの最大ネスト深さ(超で遮断)
-    "graphql_max_complexity": 100, # 選択セット数の上限(エイリアス/フィールド増幅対策)
-    "graphql_block_introspection": True,  # __schema/__type を遮断(本番のスキーマ漏洩防止)
+    "graphql_max_complexity": 1000,  # 選択(フィールド。エイリアス付きも 1 個ずつ)数の上限(増幅対策)
+    "graphql_block_introspection": True,  # __schema/__type を遮断(__typename は対象外)
     "graphql_max_batch": 10,       # バッチ(配列)オペレーション数の上限
+    "graphql_max_bytes": 262144,   # GraphQL 本文はここまで全体を読んで解析。超える本文は 413 で拒否
     "upload_deny_ext": [           # 拒否するサーバ実行/スクリプト拡張子(小文字・ドット無し)
         "php", "php3", "php4", "php5", "php7", "phtml", "pht", "phar",
         "jsp", "jspx", "jspf", "asp", "aspx", "asa", "asax", "cer",
@@ -364,6 +408,14 @@ _PARANOIA_TIERS = {
     4: frozenset({"redirect", "ssrf_internal", "ssti"}),   # + テンプレート注入(最大)
 }
 _MAX_IPS = 20000
+_CADENCE_SAMPLES = 24  # per-IP に保持する要求間隔の数(=cadence_min_samples の上限・#40)
+# メソッド別テレメトリに個別キーで載せる既知メソッド(それ以外は OTHER に畳む=攻撃者が任意の
+# 英字トークンで辞書を無制限に伸ばせないように・#14)。運用者の blocked_methods も個別に数える。
+_KNOWN_METHODS = frozenset({
+    "GET", "HEAD", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "TRACE", "TRACK", "CONNECT",
+    "PROPFIND", "PROPPATCH", "MKCOL", "COPY", "MOVE", "LOCK", "UNLOCK", "SEARCH", "REPORT",
+    "PURGE"})
+_CFG_REV = 2           # 保存する cfg の版(1=版なし・cred_rate_score 未配線の時代・#39)
 _USAGE_HOSTS_CAP = 60  # 1 IP あたり記録する宛先ホスト数の上限
 _USAGE_HOSTS_LOW = 48  # 刈り取り後の目標水位(上限との差=ソートの償却間隔)
 _EVENTS_MAX = 500
@@ -482,7 +534,10 @@ def _now() -> float:
 
 def _jwt_alg(token: str):
     """Bearer JWT の header(1番目のセグメント)から alg を取り出す(#68)。署名検証はしない
-    =鍵不要。3セグメントの JWT でなければ None。base64url/JSON が壊れていても None(落ちない)。"""
+    =鍵不要。3セグメントの JWT でなければ None。base64url/JSON が壊れていても None(落ちない)。
+    header に alg メンバーが無いものも None(=JWT でない)。JWS header は alg 必須(RFC 7515)で、
+    1 段目が base64url(JSON) の 3 段トークンは JWT 以外にもある(itsdangerous の
+    payload.timestamp.signature 等)。旧実装は欠落を "" にして alg=none 扱い=即時BANしていた。"""
     parts = token.split(".")
     if len(parts) != 3 or not parts[0]:
         return None
@@ -491,7 +546,9 @@ def _jwt_alg(token: str):
         seg = parts[0]
         seg += "=" * (-len(seg) % 4)              # base64url パディング補完
         hdr = json.loads(base64.urlsafe_b64decode(seg).decode("utf-8", "replace"))
-        return str(hdr.get("alg", "")) if isinstance(hdr, dict) else None
+        if not isinstance(hdr, dict) or "alg" not in hdr:
+            return None
+        return str(hdr["alg"])
     except Exception:
         return None
 
@@ -518,29 +575,415 @@ def _jwt_violation(auth: str, allowed_algs) -> str:
 _BROWSER_UA_TOKENS = ("chrome", "safari", "firefox", "edg", "opr", "gecko/")
 
 
-_FILENAME_RE = re.compile(rb'filename\*?\s*=\s*(?:"([^"\r\n]*)"|([^;\r\n]+))', re.I)
+# ── アップロード検査(#66)の multipart 解析 ──
+# 旧実装は本文のどこにある 'filename=' も拾い(フォーム値/テキスト本文で誤遮断+BAN・#10)、
+# filename* を復号せず(#11)、本文先頭しか見なかった(#33)。今は multipart の *パートヘッダ* の
+# Content-Disposition だけを、解析器ごとの読み方の違いの和集合で読む。
+# Content-Disposition の値の中で filename= を拾う素朴な読み方(区切り抜け等にも寛容な網)。
+# 'filename' の直前が名前の一部でないこと(xfilename= を拾わない)。
+_CD_FILENAME_RE = re.compile(
+    r'(?<![\w*-])filename(\*?)[ \t]*=[ \t]*(?:"([^"\r\n]*)"|([^;\s"]+))', re.I)
+_CD_CONT_RE = re.compile(r"filename\*(\d{1,3})(\*?)")    # RFC 2231 継続 filename*0= / *1*=
+_HDR_NAME_RE = re.compile(rb"[!#$%&'*+.^_`|~0-9A-Za-z-]+[ \t]*:")
+_UPLOAD_HDR_MAX = 65536      # 1 パートのヘッダ塊の上限。超過=壊れた/回避狙い→フェイルクローズ
+_UPLOAD_PARTS_MAX = 10000    # 1 本文で検査するパート数の上限。超過=フェイルクローズ
+# 中間セグメントでも実行され得る拡張子。Apache mod_mime の AddHandler/AddType はファイル名の
+# *どの* ドット区切りにも効く(shell.php.jpg が PHP として動く)。最終拡張子は拒否リスト全体で
+# 見るが、中間はこれ(と拒否リストの積)だけ=www.example.com.har の com を拾わない(#9)。
+# pl は言語タグ付きの名前(messages.pl.yml=ポーランド語の翻訳ファイル)と衝突するので中間では見ない
+# (最終拡張子 .pl は従来どおり拒否)。
+_UPLOAD_MULTI_EXT = frozenset((
+    "php", "php3", "php4", "php5", "php7", "php8", "phps", "pht", "phtml", "phar",
+    "cgi", "py", "asp", "aspx", "jsp", "jspx", "jspf", "shtml"))
 
 
-def _dangerous_upload_filename(body: bytes, deny_exts, cap: int = 65536):
-    """multipart 本文(先頭 cap)の Content-Disposition: filename= から危険拡張子を探す(#66)。
-    返り値 (filename, ext) or None。二重拡張子(shell.php.jpg)は *全* ドットセグメントを検査して
-    捉える。NUL 切り(shell.php\\x00.jpg)も各セグメントを NUL で切って先頭を見る。deny_exts は
-    小文字・ドット無しの集合。filename= が無い(非multipart等)は None。"""
+def _mp_params(value: str, escapes: bool = True) -> list:
+    """Content-Type / Content-Disposition 値のパラメータを [(小文字名, 値)] で返す(先頭の型は飛ばす)。
+    escapes=True は quoted-string の \\ エスケープを解く(RFC 7230)。False は最初の '"' で閉じる
+    素朴な読み方(エスケープを解かない実装の見え方)。区切りは ';' か空白(区切り抜けにも寛容)。"""
+    n = len(value)
+    j = value.find(";")
+    head = value if j < 0 else value[:j]
+    i = 0 if "=" in head else (n if j < 0 else j + 1)
+    out = []
+    while i < n:
+        while i < n and value[i] in "; \t\r\n":
+            i += 1
+        k = i
+        while i < n and value[i] not in "=; \t\r\n":
+            i += 1
+        name = value[k:i].lower()
+        while i < n and value[i] in " \t":
+            i += 1
+        if i >= n or value[i] != "=":
+            continue                              # 値の無い属性(型名など)
+        i += 1
+        while i < n and value[i] in " \t":
+            i += 1
+        if i < n and value[i] == '"':
+            i += 1
+            buf = []
+            while i < n:
+                ch = value[i]
+                if ch == "\\" and escapes and i + 1 < n:
+                    buf.append(value[i + 1])
+                    i += 2
+                    continue
+                i += 1
+                if ch == '"':
+                    break
+                buf.append(ch)
+            v = "".join(buf)
+        else:
+            k = i
+            while i < n and value[i] != ";":
+                i += 1
+            v = value[k:i].strip()
+        if name:
+            out.append((name, v))
+    return out
+
+
+def _rfc5987(v: str, charset: bool = True) -> str:
+    """RFC 5987/8187 の ext-value(charset'lang'%XX…)を復号する(#11)。拡張子判定には ASCII が
+    残れば足りるので常に UTF-8(不正は置換)で読む。charset=False は継続の 2 個目以降(%XX のみ)。"""
+    from urllib.parse import unquote_to_bytes
+    v = v.strip().strip('"')
+    if charset and v.count("'") >= 2:
+        v = v.split("'", 2)[2]
+    return unquote_to_bytes(v).decode("utf-8", "replace")
+
+
+def _cd_filenames(value: str) -> list:
+    """Content-Disposition 値からファイル名の候補を全部集める。エスケープを解く/解かない読み方、
+    filename*(RFC 5987)、RFC 2231 継続(filename*0= …)、素朴な正規表現の和集合=どの解析器が採る
+    名前も取りこぼさない(誤検知はパートヘッダの中に限られる)。"""
+    names, cont = [], {}
+    for esc in (True, False):
+        for k, v in _mp_params(value, esc):
+            if k == "filename":
+                names.append(v)
+            elif k == "filename*":
+                names.append(_rfc5987(v))
+            elif esc:
+                m = _CD_CONT_RE.fullmatch(k)
+                if m:
+                    cont[int(m.group(1))] = (v, bool(m.group(2)))
+    if cont:                                      # 継続は番号順に連結(*N* は %XX 復号・先頭だけ charset 付き)
+        parts = []
+        for idx in sorted(cont):
+            v, enc = cont[idx]
+            parts.append(_rfc5987(v, idx == 0) if enc else v)
+        names.append("".join(parts))
+    for m in _CD_FILENAME_RE.finditer(value):
+        v = m.group(2) if m.group(2) is not None else (m.group(3) or "")
+        names.append(_rfc5987(v) if m.group(1) else v)
+    return [x for x in names if x]
+
+
+def _upload_bad_ext(fn: str, deny) -> str:
+    """ファイル名が拒否拡張子なら該当拡張子、でなければ ""。最終拡張子は deny 全体、中間セグメントは
+    _UPLOAD_MULTI_EXT に入るものだけ(二重拡張子 shell.php.jpg・#9)。パス(/ と \\)は basename に、
+    Windows が捨てる末尾の '.'/空白は落とし、NUL で切った形(C 文字列として保存する実装)と
+    切らない形の両方を見る。"""
+    base = fn.replace("\\", "/").rsplit("/", 1)[-1]
+    for cand in (base.split("\x00", 1)[0], base):
+        segs = cand.rstrip(" .").lower().split(".")
+        if len(segs) < 2:
+            continue
+        last = segs[-1].strip()
+        if last in deny:
+            return last
+        for s in segs[1:-1]:
+            s = s.strip()
+            if s in deny and s in _UPLOAD_MULTI_EXT:
+                return s
+    return ""
+
+
+def _part_header_hit(block: bytes, deny):
+    """パートヘッダ塊(LF 区切りの行)の Content-Disposition から危険なファイル名を探す。
+    折り返し行・ヘッダ名で始まらない行は前の行の続きとして読む(裸 LF を改行と見ない実装の見え方)。"""
+    lines = []
+    for ln in block.split(b"\n"):
+        ln = ln.rstrip(b"\r")
+        if not ln:
+            continue
+        if lines and (ln[:1] in (b" ", b"\t") or not _HDR_NAME_RE.match(ln)):
+            lines[-1] = lines[-1] + b" " + ln.strip()
+        else:
+            lines.append(ln)
+    for ln in lines:
+        name, _, val = ln.partition(b":")
+        if name.strip().lower() != b"content-disposition":
+            continue
+        for fn in _cd_filenames(val.decode("latin1", "replace")):
+            ext = _upload_bad_ext(fn, deny)
+            if ext:
+                return fn[:120], ext
+    return None
+
+
+class _MultipartHeads:
+    """multipart 本文から *パートヘッダ塊* を逐次に切り出す(#10/#33)。本文そのものは保持しない
+    (区切り検出用の末尾とヘッダ塊だけを有界に持つ=転送しながら全パートを検査できる)。
+    区切り行は行頭(直前が LF)の '--' + boundary。行は LF 区切り(CR は剥ぐ)=CRLF と LF だけの
+    送信者の両方に効く。終端区切り(--boundary--)の後ろも見続ける(寛容な解析器が拾う形も逃さない)。"""
+    __slots__ = ("_pat", "_buf", "_hdr", "_st", "parts", "bad")
+
+    def __init__(self, boundary: bytes):
+        self._pat = b"--" + bytes(boundary)
+        self._buf = bytearray(b"\n")              # 本文先頭も行頭として扱う
+        self._hdr = bytearray()
+        self._st = 0                              # 0=区切り探し 1=区切り行の残り 2=ヘッダ行
+        self.parts = 0
+        self.bad = ""
+
+    def feed(self, data) -> list:
+        """data を食わせ、検査すべきヘッダ塊(bytes)の列を返す(完結した塊と、Content-Disposition
+        行が揃った時点の途中までの塊)。"""
+        out = []
+        buf, pat = self._buf, self._pat
+        buf += data
+        while not self.bad:
+            if self._st == 0:
+                i = buf.find(pat)
+                while i == 0 or (i > 0 and buf[i - 1] != 0x0A):
+                    i = buf.find(pat, i + 1)
+                if i < 0:
+                    keep = len(pat) + 1               # 区切りの途中かもしれない末尾(+直前の LF)
+                    if len(buf) > keep:
+                        del buf[:len(buf) - keep]
+                    break
+                del buf[:i + len(pat)]
+                self._hdr.clear()
+                self._st = 1
+            elif self._st == 1:
+                j = buf.find(b"\n")
+                if j < 0:
+                    if len(buf) > _UPLOAD_HDR_MAX:
+                        self.bad = "multipart の区切り行が過大"
+                    break
+                del buf[:j + 1]
+                self.parts += 1
+                if self.parts > _UPLOAD_PARTS_MAX:
+                    self.bad = "multipart のパート数が上限超過"
+                    break
+                self._st = 2
+            else:
+                j = buf.find(b"\n")
+                if j < 0:
+                    if len(self._hdr) + len(buf) > _UPLOAD_HDR_MAX:
+                        self.bad = "multipart のパートヘッダが過大"
+                    break
+                line = bytes(buf[:j]).rstrip(b"\r")
+                if line:
+                    del buf[:j + 1]
+                    self._hdr += line + b"\n"
+                    if len(self._hdr) > _UPLOAD_HDR_MAX:
+                        self.bad = "multipart のパートヘッダが過大"
+                    elif line.lstrip()[:19].lower() == b"content-disposition":
+                        # 行が揃った時点でも見る(ヘッダ塊の終わりを待つと、塊の途中までを含む
+                        # チャンクが先に転送される)。塊の終わりで続き行込みでもう一度見る。
+                        out.append(bytes(self._hdr))
+                else:
+                    del buf[:j]                   # 空行の LF は残す(中身が空なら次の区切りの行頭)
+                    out.append(bytes(self._hdr))
+                    self._st = 0
+        return out
+
+
+class _ChunkDecode:
+    """Transfer-Encoding: chunked の枠を逐次に解いて中身だけを返す(転送中のアップロード検査用)。
+    枠の厳密な検証は proxy(_ChunkedEnd)が担う=壊れた枠はそこで転送が止まる。ここは寛容に読む。"""
+    __slots__ = ("_st", "_line", "_left", "done")
+
+    def __init__(self):
+        self._st = 0                              # 0=サイズ行 1=中身 2=中身直後の CRLF
+        self._line = bytearray()
+        self._left = 0
+        self.done = False
+
+    def feed(self, data) -> bytes:
+        out = bytearray()
+        i, n = 0, len(data)
+        while i < n and not self.done:
+            if self._st == 1:
+                take = min(self._left, n - i)
+                out += data[i:i + take]
+                i += take
+                self._left -= take
+                if self._left == 0:
+                    self._st = 2
+                continue
+            j = data.find(b"\n", i)
+            if j < 0:
+                self._line += data[i:]
+                if len(self._line) > 4096:
+                    self.done = True
+                break
+            self._line += data[i:j]
+            i = j + 1
+            ln = bytes(self._line).strip()
+            self._line.clear()
+            if self._st == 2:
+                self._st = 0
+                continue
+            try:
+                size = int(ln.split(b";", 1)[0].strip(), 16)
+            except ValueError:
+                self.done = True
+                break
+            if size <= 0:
+                self.done = True
+            else:
+                self._left, self._st = size, 1
+        return bytes(out)
+
+
+class _UploadScan:
+    """アップロード検査の逐次版(#33): 本文を転送しながら *全* パートのヘッダを検査する。
+    feed(生の本文バイト) は危険なパートを見つけたら (filename, ext) を返す(以後も同じ値)。
+    壊れた/過大な multipart は (理由, "")=検査できないのでフェイルクローズ。chunked=True は
+    転送符号化の枠を解いてから見る(枠でパートヘッダを分断する回避を封じる)。"""
+    __slots__ = ("_heads", "_deny", "_dechunk", "hit")
+
+    def __init__(self, boundaries, deny, chunked: bool = False):
+        self._heads = [_MultipartHeads(b) for b in boundaries]
+        self._deny = deny
+        self._dechunk = _ChunkDecode() if chunked else None
+        self.hit = None
+
+    def feed(self, data):
+        if self.hit is not None or not data:
+            return self.hit
+        if self._dechunk is not None:
+            data = self._dechunk.feed(bytes(data))
+        for h in self._heads:
+            for block in h.feed(data):
+                r = _part_header_hit(block, self._deny)
+                if r:
+                    self.hit = r
+                    return r
+            if h.bad:
+                self.hit = (h.bad, "")
+                return self.hit
+        return None
+
+
+def _mp_boundaries(content_type: str, sample: bytes = b"") -> list:
+    """multipart の境界(bytes)の候補。Content-Type の boundary 引数(重複/読み方違いは全部・最大 4)。
+    Content-Type が無いときだけ本文先頭行(--boundary)から推定する。multipart 以外の
+    Content-Type は空(=アップロード検査の対象外・#10)。"""
+    ct = (content_type or "").strip()
+    out = []
+    if ct:
+        if not ct.lower().startswith("multipart/"):
+            return []
+        for esc in (True, False):
+            for k, v in _mp_params(ct, esc):
+                b = v.strip().encode("latin1", "replace")[:200]
+                if k == "boundary" and b and b not in out:
+                    out.append(b)
+    if not out and sample:
+        first = bytes(sample[:512]).split(b"\n", 1)[0].rstrip(b"\r \t")
+        if first.startswith(b"--") and len(first) > 2:
+            out.append(first[2:202])
+    return out[:4]
+
+
+def _multipart_field(body: bytes, boundaries, field: str):
+    """multipart 本文から name=field のパートの中身(bytes)を返す。無ければ None、本文内で完結
+    しない(ヘッダや次の区切りが無い)なら False。GraphQL multipart の operations 欄用(#5)。"""
+    res = None
+    for bnd in boundaries:
+        pat = b"--" + bytes(bnd)
+        i = 0
+        while True:
+            i = body.find(pat, i)
+            if i < 0:
+                break
+            if i > 0 and body[i - 1] != 0x0A:
+                i += 1
+                continue
+            if body[i + len(pat):i + len(pat) + 2] == b"--":
+                break                             # 終端区切り=以降にパートは無い
+            j = body.find(b"\n", i)
+            if j < 0:
+                res = False                       # 区切り行が途中で切れている
+                break
+            pos = j + 1
+            while True:                           # ヘッダ行を空行まで
+                e = body.find(b"\n", pos)
+                if e < 0:
+                    return False
+                if not body[pos:e].rstrip(b"\r"):
+                    break
+                pos = e + 1
+            name = ""
+            for ln in body[j + 1:pos].split(b"\n"):
+                nm, _, val = ln.rstrip(b"\r").partition(b":")
+                if nm.strip().lower() == b"content-disposition":
+                    name = dict(_mp_params(val.decode("latin1", "replace"))).get("name", name)
+            start = e + 1
+            if name == field:
+                k = start - 1                     # 中身が空なら空行の LF の直後が区切り
+                while True:
+                    k = body.find(pat, k + 1)
+                    if k < 0:
+                        return False
+                    if body[k - 1] == 0x0A:
+                        break
+                end = k - 1
+                if end > start and body[end - 1] == 0x0D:
+                    end -= 1
+                return body[start:max(start, end)]
+            i = start
+    return res
+
+
+def _dangerous_upload_filename(body: bytes, deny_exts, cap: int = 65536, content_type: str = ""):
+    """multipart 本文(先頭 cap)の *パートヘッダ* の Content-Disposition(filename= / filename*= /
+    RFC 2231 継続)から危険拡張子を探す(#66)。返り値 (filename, ext) or None。壊れた/過大な
+    multipart は (理由, "")。最終拡張子と、中間セグメントでも実行され得る二重拡張子
+    (shell.php.jpg)を見る。NUL 切り(shell.php\\x00.jpg)・パス付きも考慮。deny_exts は小文字・
+    ドット無しの集合。content_type が multipart 以外/本文が multipart でない場合は None。"""
     deny = {str(e).lower().lstrip(".") for e in (deny_exts or [])}
     if not deny:
         return None
-    for m in _FILENAME_RE.finditer(body[:cap]):
-        raw = (m.group(1) or m.group(2) or b"").strip()
-        if not raw:
-            continue
-        fn = raw.decode("latin1", "replace")
-        # パス分離子を除いた basename の全拡張子セグメントを検査(NUL 切りも考慮)
-        base = fn.replace("\\", "/").rsplit("/", 1)[-1]
-        for seg in base.lower().split(".")[1:]:
-            seg = seg.split("\x00", 1)[0].strip()
-            if seg in deny:
-                return fn[:120], seg
+    data = bytes(body[:cap])
+    bnds = _mp_boundaries(content_type, data)
+    if not bnds:
+        return None
+    return _UploadScan(bnds, deny).feed(data)
+
+
+def _disposition_upload_filename(values, deny_exts):
+    """要求ヘッダの Content-Disposition(生本文アップロード・T2)のファイル名から危険拡張子を探す。
+    WordPress REST の /wp/v2/media 等は本文がファイルそのもので、保存名はこのヘッダの filename /
+    filename*(RFC 5987)で渡る。読み方(_cd_filenames)も拡張子規則(_upload_bad_ext)も multipart の
+    パートヘッダと同じ。values は値 1 本(str)か出現ごとの並び。返り値 (filename, ext) or None。"""
+    deny = {str(e).lower().lstrip(".") for e in (deny_exts or [])}
+    if not deny or not values:
+        return None
+    for v in ((values,) if isinstance(values, str) else values):
+        for fn in _cd_filenames(str(v)):
+            ext = _upload_bad_ext(fn, deny)
+            if ext:
+                return fn[:120], ext
     return None
+
+
+def _graphql_path(path: str, paths) -> bool:
+    """path が graphql_paths のどれかに当たるか(前方一致)。両側を _path_for_match で正規化して
+    比べる(/GraphQL・/graphq%6C も backend は同じハンドラへ回す・#6)。"""
+    p = _path_for_match(path)
+    for gp in (paths or ["/graphql"]):
+        g = _path_for_match(str(gp))
+        g0 = g.rstrip("/")
+        if p == g or p == g0 or p.startswith(g0 + "/"):
+            return True
+    return False
 
 
 def _looks_like_browser_ua(ua: str) -> bool:
@@ -611,7 +1054,9 @@ _SCAN_DECODERS: dict = {}    # name -> callable(str) -> str|bytes
 
 
 def register_scan_decoder(name: str, fn) -> dict:
-    """走査前に適用する独自デコーダを登録(可逆=clear_scan_decoder で解除)。fn(str)->str|bytes。"""
+    """走査前に適用する独自デコーダを登録(可逆=clear_scan_decoder で解除)。fn(str)->str|bytes。
+    fn は 1 フィールドの *全体*(先頭 _PRE_CUT 文字)を 1 回受け取る。出力も _PRE_CUT で打ち切り、
+    その全域を窓分割して走査する([[_scan_windows]])。"""
     _SCAN_DECODERS[str(name)] = fn
     return {"installed": str(name), "active": True, "total": len(_SCAN_DECODERS)}
 
@@ -624,6 +1069,21 @@ def registered_scan_decoders() -> list:
     return sorted(_SCAN_DECODERS)
 
 
+def _apply_scan_decoders(s: str) -> str:
+    """登録された独自デコーダを順に適用する(出力は _PRE_CUT で打ち切り=暴走デコーダで肥大させない)。
+    壊れたデコーダ(例外/非文字列)は飛ばす=防御を止めない(素通りより安全側)。"""
+    for _name, _fn in list(_SCAN_DECODERS.items()):
+        try:
+            out = _fn(s)
+            if isinstance(out, (bytes, bytearray)):
+                out = bytes(out).decode("utf-8", "replace")
+            if isinstance(out, str) and out:
+                s = out[:_PRE_CUT]
+        except Exception:
+            pass
+    return s
+
+
 _NFKC_MAX_EXPAND = 4        # 1 文字あたりの NFKC 展開許容倍率(超える文字は展開しない)
 
 
@@ -633,6 +1093,63 @@ def _nfkc_char(c: str) -> str:
     走査面の長さを入力の定数倍に抑えるための安全弁([[_normalize_full]] の異常時経路)。"""
     n = unicodedata.normalize("NFKC", c)
     return n if len(n) <= _NFKC_MAX_EXPAND else c
+
+
+# \t\n\v\f\r(空白類)以外の C0 制御文字。[[_normalize_full]] が ASCII/非 ASCII の別なく除去する。
+_CTRL_RE = re.compile(r"[\x00-\x08\x0e-\x1f]")
+_SS_RUN = 10    # 非 starter 始まりの文字をこの数ごとに区切る(1 文字は NFKD で非 starter 最大 2 個)
+
+
+def _char_class(pred, spans) -> str:
+    """spans の範囲で pred を満たす code point を、正規表現の文字クラス本体(連続区間に畳む)にする。"""
+    ranges = []
+    for lo, hi in spans:
+        for cp in range(lo, hi):
+            if not pred(chr(cp)):
+                continue
+            if ranges and ranges[-1][1] == cp - 1:
+                ranges[-1][1] = cp
+            else:
+                ranges.append([cp, cp])
+    return "".join("\\U%08x" % a if a == b else "\\U%08x-\\U%08x" % (a, b) for a, b in ranges)
+
+
+@functools.lru_cache(maxsize=1)
+def _nonstarter_run_re():
+    """NFKD の先頭が非 starter(結合クラス≠0)になる文字が _SS_RUN を超えて続く箇所の正規表現。
+    結合クラス≠0 の文字は BMP/SMP にしか無いので、そこだけを初回に 1 度数え上げて作る(十数 ms)。"""
+    cls = _char_class(lambda c: bool(unicodedata.combining(c) or (
+        unicodedata.decomposition(c)
+        and unicodedata.combining(unicodedata.normalize("NFKD", c)[0]))),
+        ((0, 0xD800), (0xE000, 0x20000)))
+    return re.compile("[%s]{%d,}" % (cls, _SS_RUN + 1))
+
+
+@functools.lru_cache(maxsize=1)
+def _cf_re():
+    """書式文字(Cf=ゼロ幅/ソフトハイフン/方向制御/BOM/タグ文字 等)の正規表現。1 文字ずつ
+    unicodedata.category を引く Python ループ(32K 文字で数 ms)の代わり。Cf は BMP/SMP と
+    第 14 面(タグ文字)にしか無いので、そこだけを初回に 1 度数え上げて作る。"""
+    cls = _char_class(lambda c: unicodedata.category(c) == "Cf",
+                      ((0, 0x20000), (0xE0000, 0xE1000)))
+    return re.compile("[%s]+" % cls)
+
+
+_CGJ = chr(0x034F)     # U+034F COMBINING GRAPHEME JOINER(不可視・結合クラス 0=並べ替えの壁)
+_I_DOT = chr(0x0130)   # U+0130(lower() で 2 文字に伸びる唯一の文字)
+
+
+def _ss_split(m) -> str:
+    run = m.group(0)
+    return _CGJ.join(run[i:i + _SS_RUN] for i in range(0, len(run), _SS_RUN))
+
+
+def _stream_safe(s: str) -> str:
+    """UAX #15 の Stream-Safe Text Format 相当: 非 starter の長い連続へ U+034F(CGJ・結合クラス 0)を
+    挟む。CPython の NFKC は連続の中を挿入ソートで並べ替えるため、結合クラスが交互に変わる結合文字を
+    長く続けると入力長の 2 乗の時間が掛かった(16K で約 40ms・#64)。区切れば 1 区間の並べ替えは
+    定数長=線形。区切るのは _SS_RUN を超えて続く所だけ=通常の文章(アクセント・濁点等)は変わらない。"""
+    return _nonstarter_run_re().sub(_ss_split, s)
 
 
 def _strip_sql_comments(s: str) -> str:
@@ -684,24 +1201,25 @@ def _strip_sql_comments(s: str) -> str:
     return "".join(out)
 
 
-def _normalize_full(s: str) -> str:
+def _normalize_full(s: str, *, body: bool = False, decode: bool = True,
+                    cap: int = _PRE_CUT, nl: bool = False) -> str:
     """シグネチャ走査前の正規化。難読化(多重エンコード/インラインコメント/空白増し/Unicode)を
     減らし、入力長を有界化して ReDoS と CPU 枯渇を抑える。完全な無害化ではない。
     返値は 1 窓(_MAX_SCAN)へ *切り詰めない*(全域を [[_scan_windows]] が窓分割する)。
-    長さは _PRE_CUT で有界=正規化中の NFKC 展開等でも走査面積は爆発しない。"""
+    入力は _PRE_CUT、返値の長さは cap(既定 _PRE_CUT)で有界=NFKC 展開等でも走査面積は爆発しない。
+    body=True は要求本文用: 改行(生でも %0D%0A 由来でも)を ';' にせず空白として畳む。本文の改行は
+    地の文/YAML/CSV/multipart の枠の区切りで、文/コマンドの区切りとみなすと誤検知になる(#0/#2)。
+    nl=True(body=True と併用)は本文の crlf 照合専用の見え方: 生の改行(文書の枠)は空白のまま、
+    復号で現れた改行(%0D%0A・&#10;・\\u000a 等で *値に* 入った改行)だけを head と同じく ';' にする。
+    decode=False は登録デコーダを掛けない([[_scan_windows]] がフィールド全体へ 1 回掛けた後)。"""
     if not s:
         return ""
     s = s[:_PRE_CUT]
-    if _SCAN_DECODERS:                        # 登録された独自デコーダを走査面で先に適用(可逆)
-        for _name, _fn in list(_SCAN_DECODERS.items()):
-            try:
-                out = _fn(s)
-                if isinstance(out, (bytes, bytearray)):
-                    out = bytes(out).decode("utf-8", "replace")
-                if isinstance(out, str) and out:
-                    s = out[:_PRE_CUT]         # 出力も上限化(暴走デコーダで肥大させない)
-            except Exception:
-                pass                          # 壊れたデコーダで防御を止めない(素通りより安全側)
+    if decode and _SCAN_DECODERS:             # 登録された独自デコーダを走査面で先に適用(可逆)
+        s = _apply_scan_decoders(s)
+    if body and nl and ("\r" in s or "\n" in s):
+        s = s.replace("\r", " ").replace("\n", " ")   # 生の改行=枠。復号前に空白へ(後段で区別できる)
+    lim = len(s) * _NFKC_MAX_EXPAND           # NFKC 展開の上限: 周回をまたいで *元の長さ* の 4 倍
     # 復号の外側 fixpoint(有界3周): entity/NFKC 復号が *後段で* 新たに生む %エスケープを
     # URL 復号し損ねる死角を塞ぐ(例 &#37;3cscript → %3cscript が復号されず素通り)。各ステップは
     # ガード付きで no-op 時は安価=既に復号済みの通常トラフィックは実質1周で抜ける(低速化しない)。
@@ -746,16 +1264,27 @@ def _normalize_full(s: str) -> str:
                 # ASCII の難読化に使える互換文字(全角英数 1→1・合字 ﬁ→2・丸数字 1→1・㈱ 1→3)は
                 # いずれも _NFKC_MAX_EXPAND 以内なので畳み込みは維持=検知能力は落ちない。
                 # 展開しないのは U+FDFA(アラビア語句)等、ASCII 攻撃文字列を作れない文字だけ。
-                t = unicodedata.normalize("NFKC", s)
-                if len(t) > len(s) * _NFKC_MAX_EXPAND:
-                    t = "".join(_nfkc_char(c) for c in s)
-                s = t[:_PRE_CUT]
+                # 既に NFKC 済みなら何もしない(大半の非 ASCII テキスト)。結合文字の長い連続は
+                # 先に区切る([[_stream_safe]]: NFKC の並べ替えが 2 乗にならないように・#64)。
+                if not unicodedata.is_normalized("NFKC", s):
+                    s2 = _stream_safe(s)
+                    t = unicodedata.normalize("NFKC", s2)
+                    # 上限は周回ごとの 4 倍ではなく元の入力の 4 倍(前の周回で展開しなかった U+FDFA を
+                    # 次の周回で展開させない)。U+0130 は最後の lower() で 2 文字になるので数に入れる。
+                    if len(t) + t.count(_I_DOT) > lim:
+                        t = "".join(_nfkc_char(c) for c in s2)
+                    s = t[:cap]
             except Exception:
-                s = s[:_PRE_CUT]
-            # 書式文字(Cf=ゼロ幅/ソフトハイフン/方向制御 等)と \t\r\n 以外の制御文字を除去。
-            s = "".join(c for c in s if not (
-                unicodedata.category(c) == "Cf"
-                or (c < " " and c not in "\t\r\n")))
+                s = s[:cap]
+            # 書式文字(Cf=ゼロ幅/ソフトハイフン/方向制御 等)を除去。isprintable() が真なら Cf も
+            # 制御文字も無い=見ずに済む。
+            if not s.isprintable():
+                s = _cf_re().sub("", s)
+        # \t\n\v\f\r(空白類)以外の C0 制御文字を除去。ASCII の高速パスでも同じに行う(#66: 旧実装は
+        # 非 ASCII の分岐の中だけで行い、同じ値が無関係な非 ASCII 文字の有無で別物に見えた)。
+        # \v\f は除去せず後段で空白に畳む(SQL では空白=除去すると union\vselect が繋がって消える)。
+        if not s.isprintable():                      # 制御文字が無ければ(大半)正規表現も回さない
+            s = _CTRL_RE.sub("", s)
         if s == _before:                             # 安定=これ以上復号で変化しない → 早期終了
             break
     # Log4j ルックアップ難読化を畳む: 既知のルックアップ名(${lower:j} 等)と :- デフォルト形
@@ -787,7 +1316,10 @@ def _normalize_full(s: str) -> str:
     # 注入された改行(%0a/%0d)を区切り ; に正規化。path/query/UA に正規の生改行は無いため、
     # CR/LF はコマンド/文の区切りとみなせる(サーバ側で実際そう解釈される)。これで ; ベースの
     # 既存検知(RCE ;cat / stacked SQL ;select)が改行注入にも効く。空白畳みより *前* に行う。
-    if "\r" in s or "\n" in s:
+    # 本文(body=True)では行わない: 本文の改行は正規の区切りで、次の空白畳みで空白になる。
+    # 例外は nl=True(本文の crlf 照合用): 生の改行は冒頭で空白にしたので、ここに残るのは復号で
+    # 値に現れた改行だけ=head と同じく ';' にする。
+    if (not body or nl) and ("\r" in s or "\n" in s):
         s = re.sub(r"[\r\n]+", ";", s)
     s = re.sub(r"\s+", " ", s)               # 空白畳み込み(回避抑制+走査面積減)
     if ":" in s:
@@ -801,7 +1333,8 @@ def _normalize_full(s: str) -> str:
         s = re.sub(r"\s*(<=|>=|<>|!=|=|<|>)\s*", r"\1", s)  # 比較演算子前後の空白除去(1 < 2 → 1<2)
     if ";" in s or "|" in s:
         s = re.sub(r"([;|])\s+", r"\1", s)   # ;/| 直後の空白除去(; cat → ;cat)
-    return s[:_PRE_CUT].lower()
+    # lower() は切り詰めの *前*: U+0130 等は小文字化で 2 文字に伸びる(後に掛けると cap の 2 倍・#63)
+    return s.lower()[:cap]
 
 
 def _normalize_for_scan(s: str) -> str:
@@ -810,24 +1343,33 @@ def _normalize_for_scan(s: str) -> str:
     return _normalize_full(s)[:_MAX_SCAN]
 
 
-def _normalized_parts(chunk: str, step: int, depth: int = 0):
-    """生入力 1 断片を正規化し、走査窓の列として返す。
-    正規化が _PRE_CUT で頭打ちになった場合(=復号/NFKC 展開で入力が膨らんだ)、末尾を捨てると
-    その先の payload が走査面から消えるため、生入力の側を半分に割って各々正規化し直す
-    (重なりを付けて境界を跨ぐ payload を保つ)。展開率に依らず全域が必ずどれかの窓に載る。
-    深さと最小長で有界=悪意ある入力でも分割は数回で止まる。"""
-    n = _normalize_full(chunk)
-    if len(n) < _PRE_CUT or depth >= 4 or len(chunk) <= 512:
-        if len(n) <= _MAX_SCAN:
-            return [n]
-        return [n[j:j + _MAX_SCAN] for j in range(0, len(n), step)]
+def _window_starts(n: int, step: int) -> list:
+    """長さ n を _MAX_SCAN 幅・step 刻み(=重なり付き)の窓で覆う開始位置の列(全域がどれかに載る)。"""
+    starts = [0]
+    while starts[-1] + _MAX_SCAN < n:
+        starts.append(starts[-1] + step)
+    return starts
+
+
+def _normalized_parts(chunk: str, step: int, depth: int = 0, *, body: bool = False,
+                      nl: bool = False) -> list:
+    """生入力 1 断片を *1 回だけ* 正規化し、走査窓の列として返す(#65)。
+    返値の上限は断片長 × _NFKC_MAX_EXPAND(+1)。1 文字の展開は NFKC・lower() 込みで最大 4 倍
+    ([[_nfkc_char]])なので、展開しても切り捨ては起きず、正規化結果の全域がどれかの窓に載る。
+    旧実装は上限 _PRE_CUT で頭打ちになると結果を捨て、生入力を半分ずつ正規化し直していた
+    (16K の U+3300 で 15 回)。上限に届いた時(展開上限の想定外)だけ、安全弁として生入力を
+    半分に割って正規化し直す(重なり付き・深さと最小長で有界)。
+    登録デコーダはここでは掛けない([[_scan_windows]] がフィールド全体へ 1 回掛け済み)。"""
+    cap = len(chunk) * _NFKC_MAX_EXPAND + 1
+    n = _normalize_full(chunk, body=body, decode=False, cap=cap, nl=nl)
+    if len(n) < cap or depth >= 4 or len(chunk) <= 512:
+        return [n[j:j + _MAX_SCAN] for j in _window_starts(len(n), step)]
     half = len(chunk) // 2
-    out = _normalized_parts(chunk[:half + _SCAN_WIN_OVERLAP], step, depth + 1)
-    out.extend(_normalized_parts(chunk[half:], step, depth + 1))
-    return out
+    return (_normalized_parts(chunk[:half + _SCAN_WIN_OVERLAP], step, depth + 1, body=body, nl=nl)
+            + _normalized_parts(chunk[half:], step, depth + 1, body=body, nl=nl))
 
 
-def _scan_windows(s: str) -> tuple:
+def _scan_windows(s: str, *, body: bool = False, nl: bool = False) -> tuple:
     """1 フィールドの走査面を返す。生入力を _MAX_SCAN 窓+重なりで刻み、*窓ごとに* 正規化して
     (正規化結果が長ければさらに窓分割して)返す。
     旧実装は「正規化してから [:_MAX_SCAN] で切る」だったため、次の 2 つが『backend へ転送
@@ -838,39 +1380,152 @@ def _scan_windows(s: str) -> tuple:
           切り詰めは正規化 *後* だったため、展開させるだけで後続 payload が消えた。
     生入力の側で刻めば、展開で溢れた分も次の生窓に必ず現れる=全域が走査面に載る。重なりは
     窓境界を跨ぐ payload の分断を防ぐ。生入力は _PRE_CUT、窓数は _MAX_SCAN_WINDOWS で有界
-    (=CPU 枯渇にならない)。8192 以下の通常フィールドは窓 1 枚=従来と同じ経路・同じ費用。"""
+    (=CPU 枯渇にならない)。8192 以下の通常フィールドは窓 1 枚=従来と同じ経路・同じ費用。
+    登録デコーダはフィールド全体へ 1 回だけ掛け、その出力(上限 _PRE_CUT)を刻む(#62: 旧実装は
+    生チャンクごとに掛け、出力が _PRE_CUT に届くと捨てて生入力の半分ずつを復号し直していた=
+    全体が要る復号(圧縮/枠付き形式)は断片で失敗し、復号結果が走査面に載らなかった)。
+    body=True は本文用の正規化([[_normalize_full]])で窓を作る。nl=True は本文の crlf 照合用の見え方
+    (値に復号で現れた改行だけを ';' にする)で窓を作る。"""
     raw = s[:_PRE_CUT]
     if not raw:
         return ("",)
+    if _SCAN_DECODERS:
+        raw = _apply_scan_decoders(raw)
     step = _MAX_SCAN - _SCAN_WIN_OVERLAP
-    starts = [0]
-    while starts[-1] + _MAX_SCAN < len(raw):
-        starts.append(starts[-1] + step)
-    # 窓予算はチャンク数で按分する。全体の上限だけで打ち切ると、先頭チャンクを大量展開する
-    # 文字(NFKC で 1→18 文字)で埋めて予算を使い切らせ、*後続チャンクを丸ごと未走査に*
-    # できてしまう(先頭パディング回避の再来・実証済)。逆に固定の小さな上限にすると、
-    # 1 チャンク内の展開を刻んだ断片が入り切らず取りこぼす。按分なら両方を満たす。
-    budget = max(_MIN_PARTS_PER_CHUNK, _MAX_SCAN_WINDOWS // len(starts))
+    groups = [_normalized_parts(raw[i:i + _MAX_SCAN], step, body=body, nl=nl)
+              for i in _window_starts(len(raw), step)]
+    # 窓予算は全チャンク通しで数える(#61)。1 文字の展開は最大 4 倍なので、_PRE_CUT 文字を
+    # 4 倍に展開しても窓は 11 枚=_MAX_SCAN_WINDOWS に収まり、全域が載る(旧実装はチャンクごとに
+    # 12//チャンク数 で打ち切って余りを他へ回さず、16K の 1→4 展開で 4 割強を落としていた)。
+    # 上限を超えるのは安全弁(半分割り)が働いた想定外の時だけ。その時もチャンク数で按分し、
+    # チャンク内は等間隔に間引く=先頭チャンクを大量展開する文字で埋めて予算を独占させ、
+    # *後続チャンクを丸ごと未走査に* する回避(先頭パディング回避の再来・実証済)は起きない。
+    if sum(len(g) for g in groups) > _MAX_SCAN_WINDOWS:
+        share = max(_MIN_PARTS_PER_CHUNK, _MAX_SCAN_WINDOWS // len(groups))
+        groups = [g if len(g) <= share else
+                  [g[k * (len(g) - 1) // (share - 1)] for k in range(share)] for g in groups]
     wins, seen = [], set()
-    for i in starts:
-        n_here = 0
-        for _p in _normalized_parts(raw[i:i + _MAX_SCAN], step):
-            if n_here >= budget:
-                break
+    for g in groups:
+        for _p in g:
             if _p in seen:                 # 重なり由来の同一窓は走査しない(無駄な CPU)
                 continue
             seen.add(_p)
             wins.append(_p)
-            n_here += 1
     return tuple(wins) or ("",)
 
 
-def _path_for_match(path: str) -> str:
-    """アクセス制御/経路照合用に path を *バックエンドが見る形* へ軽く正規化(evolution #40)。
-    %エンコードを最大2回復号し小文字化(query/fragment は除去)。これが無いと blocked_urls /
-    blocked_extensions / path_limits を /%61dmin・/secret%2eenv・/%6cogin 等で回避できる
-    (バックエンドは復号して提供するのに WAF が生 path で照合してしまうため)。署名走査の重い
-    正規化(_normalize_for_scan)とは別系統の軽量版。path の '+' は空白でないので unquote(非plus)。"""
+# 本文(バイト列)を走査用の文字列へ読む(#8)。UTF-8 として正しい所は UTF-8 として読み、不正な
+# バイト(バイナリのファイル部・latin-1 の旧式フォーム等)だけを latin-1 として 1:1 で読む。
+# 旧実装は全体を latin-1 で読んでいたため、生 UTF-8 の全角/ゼロ幅は 1 バイトずつの文字化けになり、
+# NFKC/書式文字の畳み込みが効かなかった(%XX や \u エスケープで送った同じ値だけが検知された)。
+# 不正バイトを U+FFFD にせず latin-1 で残すのは、どのバイトも走査面から消さないため。
+_SURROGATE_TO_LATIN1 = {0xDC80 + _b: 0x80 + _b for _b in range(128)}
+
+
+def _body_text(data: bytes) -> str:
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        return data.decode("utf-8", "surrogateescape").translate(_SURROGATE_TO_LATIN1)
+
+
+# バイナリ本文の署名走査の省略(T1・決定)。圧縮画像/protobuf/zip 等のランダムなバイト列は `…` や
+# $(…) を偶然含み、64KB で rce 約 42 点(単発拒否の deny_score 超)になっていた。省くのは *宣言型が
+# バイナリ* かつ *中身がバイナリ*(走査する先頭にタブ/CR/LF 以外の C0 制御バイトがある)のときだけ。
+# テキストの中身をバイナリ型で送っても、テキスト型でバイナリを送っても走査する。型は引数を落とした
+# 小文字の type/subtype で見る。+xml/+json の構文接尾辞(image/svg+xml 等)はテキスト=常に走査する。
+_BINARY_CT_TOP = ("image/", "audio/", "video/", "font/")
+_BINARY_CT_APP = frozenset((
+    "octet-stream", "x-protobuf", "protobuf", "x-google-protobuf", "vnd.google.protobuf",
+    "grpc", "grpc+proto", "grpc-web", "grpc-web+proto",
+    "zip", "x-zip-compressed", "gzip", "x-gzip", "x-tar", "x-bzip2", "x-xz", "zstd",
+    "x-7z-compressed", "x-rar-compressed", "vnd.rar", "pdf", "wasm",
+    "msgpack", "x-msgpack", "vnd.msgpack", "cbor", "bson"))
+_BINARY_BYTE_RE = re.compile(rb"[\x00-\x08\x0b\x0c\x0e-\x1f]")
+
+
+def _binary_ctype(content_type: str) -> bool:
+    """Content-Type がバイナリの表現型か(T1)。空/テキスト型/+xml・+json 接尾辞は False。"""
+    t = (content_type or "").split(";", 1)[0].strip().lower()
+    if not t or t.endswith(("+xml", "+json")):
+        return False
+    if t.startswith(_BINARY_CT_TOP):
+        return True
+    return t.startswith("application/") and t[12:] in _BINARY_CT_APP
+
+
+# ブラウザ形 multipart/form-data の枠(RFC 2046/7578)。Content-Type は重複/省略され得る(proxy は
+# 1 本だけのときしか渡さない)ので形で見分ける: 先頭行が --<境界> の本文だけを multipart とみなす
+# (ブラウザ/curl/requests は前置き無し)。
+_MP_FIRST_RE = re.compile(r"--([0-9A-Za-z'()+_,./:=?-](?:[0-9A-Za-z'()+_,./:=? -]{0,68}"
+                          r"[0-9A-Za-z'()+_,./:=?-])?)[ \t]*\r?\n")
+_MP_HEADER_RE = re.compile(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+[ \t]*:")
+_MP_FILENAME_RE = re.compile(r"(?i)\bfilename\*?[ \t]*=")
+_MP_SEP = "\n_\n"     # 部どうしの区切り: 空白/';' ではない 1 語=部を跨いだ照合('--… 等)を作らない
+
+
+def _mp_split_part(pt: str) -> tuple:
+    """1 部を (部ヘッダ, 中身) に分ける。最初の空行までがヘッダ。ヘッダの形でない行があれば
+    全体を中身とみなす(=ヘッダ扱いで照合を外す範囲を最小にする)。"""
+    if pt.startswith("\r\n"):
+        return "", pt[2:]
+    if pt.startswith("\n"):
+        return "", pt[1:]
+    ends = [(i, k) for i, k in ((pt.find("\r\n\r\n"), 4), (pt.find("\n\n"), 2)) if i >= 0]
+    i, k = min(ends) if ends else (len(pt), 0)
+    head = pt[:i]
+    for line in head.split("\n"):
+        line = line.rstrip("\r")
+        if not (_MP_HEADER_RE.match(line) or line[:1] in (" ", "\t")):
+            return "", pt
+    return head, pt[i + k:]
+
+
+def _multipart_fields(text: str):
+    """multipart 本文なら (部の中身の連結, 境界+部ヘッダの連結) の 2 フィールドを返す。非該当は None。
+    枠(--境界 行)を外し、部ヘッダと中身を別フィールドで走査させる(#0)。枠を中身と続けて読むと、
+    末尾がアポストロフィの値 + 改行 + '--境界' が sqli('--)に当たり、普通のアップロードが毎回
+    加点された。部ヘッダ(name/filename 等)と境界の文字列そのものは捨てずに別フィールドとして
+    走査する(filename 経由の注入や、multipart でない本文に偽の枠を書く手を死角にしない)。
+    バイナリのファイル部(filename 付きで中身に制御文字を含む)は中身を署名走査しない: 圧縮画像等の
+    ランダムなバイト列は `…` や $(…) を偶然含み(数十 KB の画像でほぼ確実)、rce 等に当たって
+    普通のアップロードが加点されていた。ファイル種別の危険は scan_upload(拡張子)が見る。
+    filename の無い部(フォーム値)は不正バイトが混じっても走査する(1 バイト足して素通りさせない)。"""
+    m = _MP_FIRST_RE.match(text)
+    if m is None:
+        return None
+    boundary = m.group(1)
+    delim = "\n--" + boundary
+    pieces = text[m.end():].split(delim)
+    parts = [pieces[0]]
+    for p in pieces[1:]:
+        q = (p[2:] if p.startswith("--") else p).lstrip(" \t")   # 終端 --境界-- と行末の空白
+        if q.startswith("\r\n"):
+            parts.append(q[2:])
+        elif q.startswith("\n"):
+            parts.append(q[1:])
+        elif not q:
+            parts.append("")
+        else:
+            parts[-1] += delim + p          # 境界を接頭に持つ別の行=枠ではない(中身へ戻す)
+    heads, bodies = [boundary], []
+    for pt in parts:
+        if pt.endswith("\r"):
+            pt = pt[:-1]                    # 次の枠の直前の CRLF の CR
+        h, c = _mp_split_part(pt)
+        if h:
+            heads.append(h)
+        if c and not (_MP_FILENAME_RE.search(h) and _CTRL_RE.search(c)):
+            bodies.append(c)
+    return _MP_SEP.join(bodies), _MP_SEP.join(heads)
+
+
+def _path_decoded(path: str) -> str:
+    """照合用パスの前段(evolution #40): query/fragment を落とし、%エンコードを最大2回復号して
+    小文字化する。ドットセグメント・'//'・';' は解決しない(要求行に書かれたままの区切り)。
+    経路制御は通常 _path_for_match(配信先の形)で照合する。/a/../b を解決せずに経路照合する
+    バックエンドも守りたい呼び出し元は、両方の形で照合する(遮断=どちらかが当たれば遮断、
+    許可=両方とも許可のときだけ)。path の '+' は空白でないので unquote(非plus)。"""
     from urllib.parse import unquote
     p = (path or "").split("?", 1)[0].split("#", 1)[0]
     for _ in range(2):                       # 多重%エンコードも戻す(WAF定石・有界)
@@ -879,6 +1534,38 @@ def _path_for_match(path: str) -> str:
             break
         p = d
     return p.lower()
+
+
+def _path_for_match(path: str) -> str:
+    """アクセス制御/経路照合用に path を *バックエンドが見る形* へ軽く正規化(evolution #40)。
+    %エンコードを最大2回復号し小文字化(query/fragment は除去・_path_decoded)。これが無いと
+    blocked_urls / blocked_extensions / path_limits を /%61dmin・/secret%2eenv・/%6cogin 等で
+    回避できる(バックエンドは復号して提供するのに WAF が生 path で照合してしまうため)。
+    署名走査の重い正規化(_normalize_for_scan)とは別系統の軽量版。
+    復号後に *バックエンドが配信する形* へ解決する: 各セグメントの ';' 以降(パスパラメータ。
+    servlet コンテナと同じく '..;x' も '..')を除き、'/' の連続を 1 個に畳み、RFC 3986 の
+    remove_dot_segments(. を除き .. で 1 段戻る・根より上へは戻らない・末尾スラッシュは残す)。
+    これが無いと //admin・/public/../private が '/admin'・'/private' の経路レート規則を外れ、
+    //graphql・/graphql;x=1 が GraphQL ガードを外れた。照合専用で、転送する要求そのものは変えない。"""
+    p = _path_decoded(path)
+    # 早道: ドットセグメント('/.' か先頭 '.')・'//'・';' のどれも無い普通のパスはそのまま
+    if "/." in p or "//" in p or ";" in p or p[:1] == ".":
+        segs = p.split("/")
+        out = []
+        for s in segs:                       # 1 パス・線形(病的な '../'*N でも O(N))
+            s = s.split(";", 1)[0]
+            if s == "..":
+                if out:
+                    out.pop()                # 根より上へは戻らない
+            elif s and s != ".":             # 空(= '/' の連続)と '.' は捨てる
+                out.append(s)
+        q = "/".join(out)
+        if p[:1] == "/":
+            q = "/" + q
+        if out and segs[-1].split(";", 1)[0] in ("", ".", ".."):
+            q += "/"                         # 末尾スラッシュ/末尾ドットセグメント=ディレクトリ
+        p = q
+    return p                                 # 小文字化は解決と可換('.'/'/'/';' を生む文字は無い)
 
 
 # 恒真式(tautology)SQLi の *意味的* 検知 — 文字列マッチを卒業する第一歩(evolution #2)。
@@ -923,11 +1610,27 @@ def _tautology_suspect(blob: str) -> bool:
 # URL パラメータに ;<SQL動詞> が現れるのは実質常に注入(誤検知が低い)。
 _STACKED_RE = re.compile(
     r";\s*(select|insert|update|delete|drop|create|alter|truncate|exec|union|grant)\b")
+# 本文用(#2): 本文の ';' は CSV の区切りや地の文('Looks good; update the changelog')にも出るので、
+# 動詞の後に SQL 文の *構文* まで続く時だけ複文とみなす(update <名前> set / delete from /
+# insert into / select … from / drop|create|alter <オブジェクト> 等。動詞の集合は head 用と同じで、
+# 判定は head 用の部分集合)。走査面は正規化済み=空白は 1 個に畳まれ、';' 直後の空白は除去済み。
+_STACKED_BODY_RE = re.compile(
+    r";\s*(?:select\b[^;]{0,120}?\bfrom\b"
+    r"|insert\s(?:ignore\s)?into\b"
+    r"|update\s[\w.`\"\[\]]{1,64}\sset\b"
+    r"|delete\sfrom\b"
+    r"|(?:drop|create|alter)\s(?:or\sreplace\s|temporary\s|unique\s)?"
+    r"(?:table|database|schema|view|index|procedure|function|trigger)\b"
+    r"|truncate\stable\b"
+    r"|exec(?:\s?[(@]|\s(?:xp_|sp_|master\.))"
+    r"|union\s(?:all\s|distinct\s)?select\b"
+    r"|grant\s[\w, ]{1,80}?\son\s[^;]{1,80}?\sto\b)")
 
 
-def _stacked_query_suspect(blob: str) -> bool:
-    """正規化済み文字列に『; に続く SQL 文(複文)』が含まれるか=スタッククエリ注入。"""
-    return _STACKED_RE.search(blob) is not None
+def _stacked_query_suspect(blob: str, *, body: bool = False) -> bool:
+    """正規化済み文字列に『; に続く SQL 文(複文)』が含まれるか=スタッククエリ注入。
+    body=True は要求本文用(SQL 文の構文まで要求する・[[_STACKED_BODY_RE]])。"""
+    return (_STACKED_BODY_RE if body else _STACKED_RE).search(blob) is not None
 
 
 # DOMイベントハンドラ系 XSS の *構造* 検知 — 個別ハンドラ名の列挙(prescan需要)を避け、
@@ -956,6 +1659,35 @@ _SIG_WEIGHT_MAX = 1000.0   # カスタムシグネチャ weight の上限(組込
 # deque が閾値ぶんの長さを持てないと永久に発火しない(旧: 8192/1024 固定で黙って無効だった)。
 _RATE_COUNT_MAX = 1 << 20
 _RATE_COUNT_KEYS = frozenset({"cred_rate_limit", "resp_error_threshold"})
+# 0 以下が『無効』ではなく *壊れた動作* になるキー(#50)。resp_error_threshold<=0 は 4xx が来るたび
+# 加点して 2 件で BAN、dlp_max_scan_bytes<=0 は dlp_active のまま何も走査しない(=黙って DLP 無効)。
+# 他のキーの『0=無効/無制限』と取り違えやすいので、受理せず現状を保つ。
+_POSITIVE_KEYS = frozenset({"resp_error_threshold", "dlp_max_scan_bytes"})
+# 0 以上だけが意味を持つキー。body_sig_weight_factor の負値は本文ヒットで他の検知の加点を
+# 打ち消していた(読む側は 0 に丸める・#36)。API では拒否し、保存済みの旧値は 0 に丸めて読む。
+_NONNEG_KEYS = frozenset({"body_sig_weight_factor"})
+# 列挙値の文字列キー(#49)。綴り違い('BLOCK' 'deny' 等)を黙って受理すると、block のつもりが
+# audit として動いていた。前後空白と大小文字だけ正規化し、それ以外は拒否する。値は読む側の
+# 比較(== "audit" 等)と同じ綴りで持つ(cookie_samesite は Set-Cookie にそのまま書く綴り・""=付けない)。
+# Lite の geo_mode は CIDR 判定のみ(GeoIP の country_* は持たない)。
+_ENUM_KEYS = {
+    "dlp_action": ("audit", "block"),
+    "mode": ("enforce", "audit"),
+    "open_redirect_mode": ("enforce", "audit"),
+    "geo_mode": ("off", "allow", "block"),
+    "site_mode": ("off", "whitelist", "blacklist"),
+    "ip_mode": ("off", "whitelist", "blacklist"),
+    "cookie_samesite": ("Lax", "Strict", "None", ""),
+}
+# 照合用: 小文字の綴り → 正規の綴り
+_ENUM_CANON = {k: {a.lower(): a for a in vs} for k, vs in _ENUM_KEYS.items()}
+# HTTP ヘッダへそのまま書く自由入力の文字列キー。origin_header は要求ヘッダの *名前*
+# (エッジトークン・#77)、open_redirect_safe_path は応答の Location の *値*。改行(CR/LF)・NUL・
+# 他の制御文字(C0/DEL/C1 と U+2028/2029)はヘッダの区切りを壊すので受理しない。ヘッダ名は
+# さらに RFC 9110 の token(tchar の並び)に限る(空白・':' 等を含む名前は送れない)。
+_HEADER_STR_KEYS = frozenset({"origin_header", "open_redirect_safe_path"})
+_CTRL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f-\x9f  ]")
+_HDR_TOKEN_RE = re.compile(r"[!#$%&'*+\-.^_`|~0-9A-Za-z]+")
 
 
 def _finite_number(v) -> bool:
@@ -979,6 +1711,78 @@ def _sig_weight(w):
     except (TypeError, ValueError, OverflowError):
         return None
     return w if math.isfinite(w) and 0 <= w <= _SIG_WEIGHT_MAX else None
+
+
+# ── カスタムシグネチャの補助(名前・件数上限・正規化との食い違い) ──
+# 最大件数(#59)。カスタム規則は prescan ゲートを通らず全要求の全走査窓で評価されるため、件数に
+# 比例して全要求が遅くなる(実測 2000 件で 1 要求 17ms)。超過は追加を拒否し、読込時は無効化して残す。
+_CUSTOM_SIG_MAX = 256
+_CUSTOM_NAME_RE = re.compile(r"[A-Za-z0-9._-]{1,64}")
+# 組込/構造検知の名前(小文字)。同名のカスタム規則は理由表示とヒット数が組込と混ざる(#29)。
+_BUILTIN_SIG_NAMES = frozenset(
+    [n for n, _p in _SIGNATURES] + list(_SIG_WEIGHT) + ["sqli-tautology", "sqli-stacked"])
+# 組込署名の重複判定用コーパス一致集合。不変なので import 時に 1 度だけ求める(#32/#59)。
+_SIG_CORPUS_SETS = tuple(
+    (p, frozenset(i for i, s in enumerate(_DEDUP_CORPUS) if rgx.search(s)))
+    for (_n, p), (_n2, rgx) in zip(_SIGNATURES, _SIG_RE))
+# 走査面の正規化(_normalize_full)が書き換えるため、パターンに書いても決して一致しない字面(#30)。
+_CUSTOM_LITERAL_LINTS = (
+    (re.compile(r"%[0-9A-Fa-f]{2}"), "%XX は走査前に URL デコードされる(デコード後の文字で書く)"),
+    (re.compile(r"\\\+|\[\+\]"), "'+' は走査前に空白へデコードされる"),
+    (re.compile(r"\\[rn]|[\r\n]"),
+     "改行(CR/LF)は走査前に、URL/ヘッダでは ';' へ、本文では空白へ置き換えられる"),
+    (re.compile(r"&(?:#x?[0-9A-Fa-f]{1,7}|[A-Za-z][A-Za-z0-9]{1,31});"),
+     "HTML 実体参照は走査前に復号される"),
+)
+# 保存済み optional_sigs の旧値(文字列)を読み替える真偽語(_load のみ・API は bool 以外を拒否・#57)
+_BOOL_WORDS = {"true": True, "on": True, "yes": True, "1": True,
+               "false": False, "off": False, "no": False, "0": False}
+
+
+def _custom_re_flags(pattern: str) -> int:
+    """カスタム規則のコンパイルフラグ。走査面は小文字化済みなので、大文字(または文字コード指定の
+    エスケープ)を含む規則だけ IGNORECASE にする(#30)。大文字が無ければ大小区別の有無で一致は
+    変わらず、IGNORECASE はリテラル前方一致の最適化を失って遅い(実測 256 件で 1 要求 +40%)。
+    エスケープの英字(\\S \\W \\D \\B 等)は大文字に数えない。"""
+    body = re.sub(r"\\.", "", pattern)
+    if body != body.lower() or re.search(r"\\[xuUN0-7]", pattern):
+        return re.IGNORECASE
+    return 0
+
+
+def _custom_pattern_warnings(pattern) -> list:
+    """カスタム規則が走査面(正規化・小文字化済み)では当たり得ない書き方への警告(拒否はしない)。
+    大文字は IGNORECASE で照合するので対象外(#30)。"""
+    if not isinstance(pattern, str):
+        return []
+    return [msg for rx, msg in _CUSTOM_LITERAL_LINTS if rx.search(pattern)]
+
+
+class _SigScan:
+    """1 要求(または 1 本文)ぶんの署名走査の集計(#31)。
+    組込署名+構造検知は従来どおり『最初のヒット』で確定する(組込の採点は変えない)。カスタム署名は
+    それに隠されず全窓で評価し、最も重いものが組込より重ければそちらを採る(旧版は組込が先に当たると
+    weight 1000 の規則も評価されず、組込の 50 点だけが入った)。逆に weight 0(監視のみ)の規則が
+    当たっても組込の走査は止めない(止めると他フィールドの攻撃を見逃す)。"""
+    __slots__ = ("hit", "weight", "c_hit", "c_weight", "rules")
+
+    def __init__(self, rules):
+        self.hit, self.weight = None, 0.0           # 組込/構造の初出ヒット
+        self.c_hit, self.c_weight = None, -1.0      # カスタムの最重ヒット(-1=未。weight 0 も拾う)
+        self.rules = rules                          # weight 降順のカスタム規則(走査中は固定)
+
+    def floor(self) -> float:
+        """これを超える weight のカスタム規則だけが結果を変えうる。"""
+        return max(self.c_weight, self.weight if self.hit is not None else -1.0)
+
+    def done(self) -> bool:
+        """組込は確定し、結果を変えうるカスタム規則も残っていない。"""
+        return self.hit is not None and not (self.rules and self.rules[0][3] > self.floor())
+
+    def result(self):
+        if self.c_hit is not None and (self.hit is None or self.c_weight > self.weight):
+            return self.c_hit, self.c_weight
+        return self.hit, self.weight
 
 
 def _norm_path_limits(rules, default_rate: float):
@@ -1076,20 +1880,42 @@ def _luhn_ok(digits: bytes) -> bool:
     return total % 10 == 0
 
 
-def scan_secret_leak(data) -> list:
+def _card_issuer_ok(d: bytes) -> bool:
+    """主要ブランドの IIN(発行者番号の先頭)か(#26)。旧実装は先頭 3/4/5/6 なら何でも通したため、
+    13 桁の JAN/EAN コード(45/49 始まり)や 16 桁の注文番号の約 1 割が Luhn を満たして
+    credit_card と判定され、DLP block で商品一覧の応答が切れていた。
+    Visa 4 / Mastercard 51-55・2221-2720 / Amex 34・37 / Discover 6011・644-649・65 /
+    JCB 3528-3589 / Diners 300-305・36・38 / UnionPay 62。d は 14 桁以上の数字列。"""
+    if d[:1] == b"4":
+        return True
+    p2, p3, p4 = int(d[:2]), int(d[:3]), int(d[:4])
+    return (51 <= p2 <= 55 or 2221 <= p4 <= 2720 or p2 in (34, 37, 36, 38, 62, 65)
+            or p4 == 6011 or 644 <= p3 <= 649 or 3528 <= p4 <= 3589 or 300 <= p3 <= 305)
+
+
+def scan_secret_leak(data, start: int = 0, limit: int = None) -> list:
     """応答バイト列から *高確度の* 秘密情報漏洩を検出し、種別名のリストを返す(無ければ空)。
-    資格情報は固有接頭辞、クレカは Luhn+主要ブランド接頭(3/4/5/6)で誤検知を抑える。
+    資格情報は固有接頭辞、クレカは 14〜19 桁+主要ブランドの IIN+Luhn で誤検知を抑える
+    (13 桁は JAN/EAN と衝突するので対象外・#26)。
+    start/limit はストリームを窓に分けて走査する呼び出し側(proxy._pipe)用(#48): 一致の *開始位置*
+    を [start, limit) に限り、data[start-1] と data[limit:] は前後の文脈としてだけ使う。窓の端を
+    語境界(\\b)とみなさないので、読取の切れ目で長い数字列の途中がカード番号に見えることも、
+    境界跨ぎの秘密を取りこぼすこともない(limit 以降に始まる一致は次の窓で判定する)。
     正直: 鍵を要する独自暗号で包まれた秘密は復号できない=対象外(register_scan_decoder の領域)。"""
     if isinstance(data, str):
         data = data.encode("utf-8", "replace")
+    if limit is None:
+        limit = len(data)
     found = []
     for name, rgx in _SECRET_RES:
-        if rgx.search(data):
+        m = rgx.search(data, start)
+        if m is not None and m.start() < limit:
             found.append(name)
-    for m in _CC_RE.finditer(data):
+    for m in _CC_RE.finditer(data, start):
+        if m.start() >= limit:
+            break
         digits = bytes(c for c in m.group(0) if 48 <= c <= 57)
-        if 13 <= len(digits) <= 19 and digits[:1] in (b"3", b"4", b"5", b"6") \
-                and _luhn_ok(digits):
+        if 14 <= len(digits) <= 19 and _card_issuer_ok(digits) and _luhn_ok(digits):
             found.append("credit_card")
             break
     return found
@@ -1109,6 +1935,7 @@ class NetShield:
         self._metrics = {"requests": 0, "allow": 0, "throttle": 0, "block": 0}
         self._ewma = 0.0                # 全体レートのEWMA(ダッシュボード用テレメトリ)
         self._ewma_last = _now()
+        self._ewma_n = 0                # 直近の畳み込み以降に来た要求数(同時刻の要求も数える・#41)
         self._started = _now()          # プロセス稼働開始時刻(uptime 算出・ダッシュボード)
         # 既知BAN IP の確率的プリスキャン(真O(k)・bytearray)。BAN時に add、判定は lock-free。
         self._ban_bloom = BloomFilter(capacity=max(2000, _MAX_IPS // 4))
@@ -1185,10 +2012,12 @@ class NetShield:
             self._event("system", w["code"], {"note": w["message"]})
 
     # ── 永続化 ───────────────────────────────────────────────────
-    def _read_state(self, path: str, default, what: str):
+    def _read_state(self, path: str, default, what: str, status_out: list | None = None):
         """署名付き状態を読み (value, migrate) を返す(#52)。改竄(署名不一致)は安全側 default に
         フェイルセーフし system イベントで警報。無署名(旧来)は生値を使いつつ migrate=True を返し、
-        呼び出し側が再保存で署名済みへ移行する。攻撃者が書き換えた状態を *信頼しない* のが要点。"""
+        呼び出し側が再保存で署名済みへ移行する。攻撃者が書き換えた状態を *信頼しない* のが要点。
+        status_out(list)を渡すと最終判定(ok/unsigned/missing/tampered/rolled_back/invalid)を
+        1 件追記する(cfg の復元元・fail-closed 起動の判断用)。"""
         status, val = read_signed_json(path, self._state_key, default)
         seen = status
         if status in ("missing", "unsigned"):
@@ -1206,7 +2035,11 @@ class NetShield:
         # 無署名の旧形式が配列/文字列/None でも呼び出し側は mapping 前提で .get() する。
         # 期待した形でなければ安全側の default に倒す(呼び出し側を全部守る)。
         if val is not None and not isinstance(val, type(default)):
+            if status_out is not None:
+                status_out.append("invalid")
             return default, False
+        if status_out is not None:
+            status_out.append(status)
         if status in ("tampered", "rolled_back"):
             # rolled_back = 古い正署名ファイルへの巻き戻し(#102)。署名は正しいが版が後退=拒否。
             reason = ("rollback(古い正署名への巻き戻し)" if status == "rolled_back"
@@ -1233,54 +2066,116 @@ class NetShield:
         except Exception:
             pass
 
-    def _load(self):
-        d, migrate = self._read_state(self.path, {}, "config")
+    def _load(self, into: dict | None = None) -> str:
+        """署名済み cfg を読み込む。into を渡すとその dict へ適用し(self.cfg には触れない)、
+        無署名からの移行保存も呼び出し側に任せる。戻り値=state.json の判定(ok=署名検証済み /
+        unsigned=旧来の無署名で移行が要る / missing / tampered / rolled_back / invalid)。
+        起動時(into=None)に改竄・巻き戻し・署名実績のある欠損で読めず、しかも初回起動でない
+        (この鍵で保存した実績 .hw か、起動前からの .state_signed マーカーがある)ときは、既定値の
+        うえで shield を有効にして起動する(利用者判断の fail-closed。旧版は enabled=False の既定値で
+        起動し、state.json を壊すだけで WAF を止められた)。警報は _read_state が出す。初回起動
+        (実績なし)と、一度も保存していない欠損は従来どおり既定値(OFF)・警報なし。"""
+        cfg = self.cfg if into is None else into
+        st: list = []
+        d, migrate = self._read_state(self.path, {}, "config", status_out=st)
+        status = st[0] if st else "missing"
         d = d or {}
+        # 版なし(=旧版)の保存値は cred_rate_score を読まない(#39)。旧版は cfg を全キー保存する
+        # ので未配線だった頃の既定 40 が必ず残っており、配線後にそれを効かせると既存の導入で
+        # 加点(=共有キーでの BAN 第三者転嫁)が突然有効になる。新版で明示した値は版付きで残る。
+        legacy = not isinstance(d.get("rev"), int) or d["rev"] < _CFG_REV
+        dropped = []
         for k, v in (d.get("cfg") or {}).items():
+            if legacy and k == "cred_rate_score":
+                continue
             # 署名が正しくても値が壊れている場合がある(旧版の set_config は構造/NaN を素通しで
             # 保存していた)。API と同じ検証を通し、壊れた保存値で起動直後から全断させない。
-            ok, v = self._coerce_cfg(k, v, strict=False) if k in self.cfg else (False, None)
+            ok, v = self._coerce_cfg(k, v, strict=False, base=cfg) if k in cfg else (False, None)
             if ok:
-                self.cfg[k] = v
+                cfg[k] = v
+            elif k in cfg:
+                dropped.append(k)                 # 不正な保存値=既定値のまま(黙って捨てない)
+        if dropped:                               # どのキーを捨てたかだけ記録(値は載せない)
+            self._event("system", "cfg_load_rejected",
+                        {"keys": sorted(dropped),
+                         "note": "保存済みの不正な設定値は読まず既定値を使う"})
         # BANは安全側で揮発(再起動でリセット)・設定のみ永続
-        if migrate:                               # 旧来の無署名→署名済みへ移行
+        if migrate and into is None:              # 旧来の無署名→署名済みへ移行
             self._save()
+        if into is None and status in ("tampered", "rolled_back"):
+            from ..core.signed_state import has_signed_history
+            if self._state_signed_before or has_signed_history(self.path, self._state_key):
+                cfg["enabled"] = True             # 改竄で読めない=直前の値は不明。止めない側へ
+                self._event("system", "cfg_fail_closed",
+                            {"file": os.path.basename(self.path), "status": status,
+                             "note": "state.json を検証できないため既定値+防御有効で起動"})
+        return status
 
     def _save(self) -> bool:
         with self._lock:
-            ok = write_signed_json(self.path, {"cfg": self.cfg, "saved": _now()},
-                                   self._state_key)
+            ok = write_signed_json(self.path, {"cfg": self.cfg, "saved": _now(),
+                                               "rev": _CFG_REV}, self._state_key)
             self._refresh_cfg_mac()           # #85: 正規変更のたびに整合 MAC を更新
             return ok
 
-    def _compute_cfg_mac(self) -> str:
+    def _cfg_blob(self) -> bytes:
+        return json.dumps(self.cfg, sort_keys=True, separators=(",", ":"),
+                          default=str).encode("utf-8", "replace")
+
+    def _compute_cfg_mac(self, blob: bytes | None = None) -> str:
         """in-memory cfg の整合 MAC(#85)。プロセス毎ランダムな _secret で HMAC=メモリを書き換える
         攻撃者は MAC も併せて偽造する必要がある(secret もメモリから探さねばならない)。"""
-        blob = json.dumps(self.cfg, sort_keys=True, separators=(",", ":"),
-                          default=str).encode("utf-8", "replace")
-        return hmac.new(self._secret, blob, hashlib.sha256).hexdigest()
+        return hmac.new(self._secret, self._cfg_blob() if blob is None else blob,
+                        hashlib.sha256).hexdigest()
 
     def _refresh_cfg_mac(self):
-        self._cfg_mac = self._compute_cfg_mac()
+        # MAC を取った正規 cfg の直列化も保持する。ディスクの cfg を検証できない復元で既定値
+        # (enabled=False)へ倒さず、ここへ戻す(使う前に同じ MAC で照合=すり替えは使わない)。
+        blob = self._cfg_blob()
+        self._cfg_mac = self._compute_cfg_mac(blob)
+        self._cfg_good = blob
 
     def verify_cfg_integrity(self) -> dict:
         """in-memory cfg が *API を通さない out-of-band 改変*(デバッガ/プロセス注入によるメモリ
         すり替え)で書き換えられていないか検査する(#85)。正規変更は _save 時に MAC を更新するので、
         MAC 不一致=正規経路を通らない改変。検出したら署名検証済みディスク state から cfg を復元し
-        (=最後の正規状態へ戻す)、memory_tamper を警報する。AsyncEdgeGuard の独立した
+        (=最後の正規状態へ戻す)、memory_tamper を警報する。ディスクを検証できなければ最後に MAC が
+        一致した cfg を保つ(戻り値 source=disk/memory/defaults)。AsyncEdgeGuard の独立した
         定期チェックループから呼ぶ。"""
         with self._lock:
             if hmac.compare_digest(self._compute_cfg_mac().encode("ascii", "ignore"),
                                    str(self._cfg_mac).encode("ascii", "ignore")):
                 return {"ok": True, "tampered": False}   # #19: 定数時間 bytes 比較
-            self.cfg = dict(_DEFAULTS)        # クリーン基準へリセット(型改変も確実に上書き)
-            self._load()                      # 署名済みディスクから cfg を再適用(=正規状態へ復元)
+            # 復元した cfg はローカルに組み立て、*1 回の代入* で差し替える(#42)。旧実装は先に
+            # self.cfg を既定値(enabled=False)へ替えてからディスクを読んでいたため、その間に
+            # ロック無しで is_enabled() を読む inspect()/proxy が『shield OFF』で素通ししていた。
+            new = dict(_DEFAULTS)             # クリーン基準(型改変も確実に上書き)
+            src = "disk"
+            if self._load(into=new) != "ok":  # 署名検証済みディスクから再適用(=正規状態へ復元)
+                # ディスクも欠損/改竄/巻き戻し/無署名で検証できない(メモリとの同時改竄)。旧実装は
+                # 既定値(enabled=False)へ倒れて WAF が止まっていた。最後に MAC が一致した cfg を
+                # 保ち、それも照合できなければ既定値+防御有効にする(利用者判断の fail-closed)。
+                good = getattr(self, "_cfg_good", b"")
+                try:
+                    if not (good and hmac.compare_digest(
+                            self._compute_cfg_mac(good).encode("ascii", "ignore"),
+                            str(self._cfg_mac).encode("ascii", "ignore"))):
+                        raise ValueError("unverified")
+                    new, src = json.loads(good), "memory"
+                    if not isinstance(new, dict):
+                        raise ValueError("unverified")
+                except Exception:
+                    new, src = dict(_DEFAULTS), "defaults"
+                    new["enabled"] = True
+            self.cfg = new
             self._refresh_cfg_mac()
+        action = {"disk": "restored-from-disk", "memory": "kept-last-verified",
+                  "defaults": "fail-closed(defaults+enabled)"}[src]
         try:
-            self.report_tamper("memory_tamper", "cfg", "restored-from-disk")
+            self.report_tamper("memory_tamper", "cfg", action)
         except Exception:
             pass
-        return {"ok": True, "tampered": True, "restored": True}
+        return {"ok": True, "tampered": True, "restored": True, "source": src}
 
     # ── カスタムシグネチャ(ユーザー追加 / AI生成・SaaS継続アップデート) ──
     def _load_sigs(self):
@@ -1288,14 +2183,39 @@ class NetShield:
         d = d or {}
         # pattern が文字列であることも長さも見ずに再コンパイルへ渡していた。数値や巨大な
         # 文字列が入っていると _compile_custom で例外/過大コストになる。入口で弾く。
-        # weight も同様: 旧版は NaN/負値を保存できた(スコアが永久に NaN=BAN 不能、かつ一覧 API が
-        # NaN を返して管理画面から消せない)。不正な weight の規則は読み込まない。
-        self._custom = [s for s in (d.get("signatures") or [])
-                        if isinstance(s, dict)
-                        and isinstance(s.get("pattern"), str)
-                        and 0 < len(s["pattern"]) <= 2000
-                        and _sig_weight(s.get("weight", 40)) is not None]
+        # 名前も同様(#54): name 欠落は KeyError で NetShield() ごと起動不能、リスト名は inspect() の
+        # ヒット集計で TypeError(=全要求が落ちる)になっていた。規則として成り立たない要素だけを
+        # 捨て、*どれを* 捨てたかを system イベントで名指しする。weight 不正/長すぎ/ReDoS 等の
+        # 『形は正しいが載せられない』規則は消さずに残し、無効として一覧へ出す(_compile_custom・#55。
+        # 旧版は不正 weight の規則を黙って読み捨て、次の保存で rules.json からも消していた)。
+        raw = d.get("signatures")
+        report = []
+        if raw is not None and not isinstance(raw, list):
+            report.append({"name": None, "reason": "signatures が配列でない(全体を無視)"})
+            raw = []
+        custom = []
+        for i, s in enumerate(raw or []):
+            nm = s.get("name") if isinstance(s, dict) else None
+            if not isinstance(s, dict):
+                why = "規則がオブジェクトでない"
+            elif not isinstance(nm, str) or not _CUSTOM_NAME_RE.fullmatch(nm):
+                why = "name が不正(英数・._- の 1〜64 文字)"
+            elif not isinstance(s.get("pattern"), str) or not 0 < len(s["pattern"]) <= 2000:
+                why = "pattern が文字列でない/空/長すぎ(<=2000)"
+            else:
+                custom.append(s)
+                continue
+            report.append({"index": i, "reason": why,
+                           "name": re.sub(r"[^A-Za-z0-9._-]", "?", nm)[:64]
+                           if isinstance(nm, str) else None})
+        self._custom = custom
         self._compile_custom()
+        report += [{"name": v["name"], "reason": v["reason"]} for v in self._custom_view
+                   if not v["active"] and v.get("enabled", True)]
+        if report:
+            self._event("system", "custom_sig_rejected",
+                        {"count": len(report), "rules": report[:32],
+                         "note": "読み込めない/無効なカスタムシグネチャ(一覧の active/reason を参照)"})
         if migrate:
             self._save_sigs()
 
@@ -1309,21 +2229,44 @@ class NetShield:
         # 改竄/レガシーな署名ファイルを _load_sigs が直接読んだ場合でも、ReDoS パターンを
         # live エンジンへ載せない(Python の re は実行タイムアウトが無く、壊滅的バックトラッキングは
         # WAF 自身の自己DoSになる)。危険/不正なものは無効化して skip。
-        out, blocked = [], 0
+        # 載せない規則も消さずに残し、理由付きで一覧(list_signatures)へ出す(#55。旧版は件数しか
+        # 出さず、どの規則が効いていないのか分からなかった)。件数上限(#59)も超過分を無効化する。
+        # 大文字を含む規則は IGNORECASE でコンパイルする: 走査面は小文字化済みなので、旧版では
+        # 永久に当たらなかった(#30・_custom_re_flags)。
+        out, blocked, view = [], 0, []
         for s in self._custom:
-            if not s.get("enabled", True):
-                continue
             w = _sig_weight(s.get("weight", 40))
-            if self.validate_pattern(s.get("pattern", "")) or w is None:  # 危険(ReDoS等)/不正は載せない
-                blocked += 1
-                continue
-            try:
-                rgx = re.compile(s["pattern"])
-            except re.error:
-                continue
-            out.append((s["name"], s.get("category", "custom"), rgx, w))
+            why, rgx = "", None
+            if not s.get("enabled", True):
+                why = "無効(enabled=false)"
+            elif w is None:
+                why = f"weight が不正(0〜{_SIG_WEIGHT_MAX:g} の有限の数値)"
+            else:
+                why = self.validate_pattern(s.get("pattern", ""))   # 危険(ReDoS等)/長すぎは載せない
+                if not why and len(out) >= _CUSTOM_SIG_MAX:
+                    why = f"件数上限({_CUSTOM_SIG_MAX})超過"
+                if not why:
+                    try:
+                        rgx = re.compile(s["pattern"], _custom_re_flags(s["pattern"]))
+                    except re.error as e:
+                        why = f"正規表現エラー: {e}"
+                if why:
+                    blocked += 1
+            v = dict(s)
+            if w is None:
+                v["weight"] = None             # NaN/inf をそのまま返すと管理画面の JSON が壊れる
+            v["active"] = not why
+            if why:
+                v["reason"] = why
+            view.append(v)
+            if rgx is not None:
+                cat = s.get("category", "custom")
+                out.append((s["name"], cat if isinstance(cat, str) else "custom", rgx, w))
+        # weight の降順(同値は登録順)。走査は重い順に当て、それ以下しか残らなければ打ち切る(#31)。
+        out.sort(key=lambda t: -t[3])
         self._custom_re = out
         self._custom_blocked = blocked
+        self._custom_view = view
 
     @staticmethod
     def validate_pattern(pattern: str) -> str:
@@ -1334,55 +2277,67 @@ class NetShield:
             return "パターンが空/長すぎ(<=400)"
         return saferegex.lint(pattern)     # ネスト量化子/不正 → 理由文字列(安全なら "")
 
-    def _all_patterns(self) -> list:
-        """既存(組込+カスタム)の全パターン文字列(重複検知用)。"""
-        return [p for _n, p in _SIGNATURES] + [s["pattern"] for s in self._custom]
-
-    def is_duplicate_pattern(self, pattern: str) -> bool:
-        """完全一致 or 挙動同値(同一コーパスで一致集合が完全一致)なら重複。"""
-        if pattern in self._all_patterns():
+    def is_duplicate_pattern(self, pattern: str, exclude_name: str = "") -> bool:
+        """完全一致 or 挙動同値(同一コーパスで一致集合が完全一致)なら重複。
+        比べるのは組込と *稼働中* のカスタム規則のコンパイル済みパターンだけ(#32: 読込時に無効化した
+        ReDoS パターンまで再コンパイルして実行し、追加のたびにプロセスが数秒止まっていた)。
+        exclude_name の規則は置換される本人なので比べない(#58: 同名の編集が自分自身との重複で
+        拒否されていた)。候補は live と同じフラグ(_custom_re_flags)で評価する。"""
+        live = [rgx for n, _c, rgx, _w in self._custom_re if n != exclude_name]
+        if any(pattern == p for p, _st in _SIG_CORPUS_SETS) or any(
+                pattern == rgx.pattern for rgx in live):
             return True
         try:
-            cand = re.compile(pattern)
+            cand = re.compile(pattern, _custom_re_flags(pattern))
         except re.error:
             return False
         corpus = _DEDUP_CORPUS
         cand_set = frozenset(i for i, s in enumerate(corpus) if cand.search(s))
         if not cand_set:
             return False                       # 何も当たらない物は同値判定しない
-        for _n, p in _SIGNATURES + [(s["name"], s["pattern"]) for s in self._custom]:
-            try:
-                ex = re.compile(p)
-            except re.error:
-                continue
-            if frozenset(i for i, s in enumerate(corpus) if ex.search(s)) == cand_set:
-                return True                    # 挙動が同一=重複
-        return False
+        if any(st == cand_set for _p, st in _SIG_CORPUS_SETS):
+            return True                        # 組込と挙動が同一=重複
+        return any(frozenset(i for i, s in enumerate(corpus) if rgx.search(s)) == cand_set
+                   for rgx in live)
 
     def add_signature(self, name: str, pattern: str, category: str = "custom",
                       weight: float = 40, source: str = "user") -> dict:
         """カスタムシグネチャを追加(検証+重複拒否+永続化+再コンパイル)。
         name は管理画面のテーブル/onclick属性へ後で埋め込まれるため、ここで許容文字を
         絞る(英数・._- のみ、1〜64字)。誤って緩めても呼び出し側(admin.py)は必ずエスケープ
-        すること=多層防御(#111)。"""
-        if not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", name or ""):
+        すること=多層防御(#111)。
+        同名の規則があれば置き換える(=編集)。組込と同名は不可(#29: 理由表示とヒット数が組込と
+        混ざる)。件数は _CUSTOM_SIG_MAX まで(#59)。走査面の正規化で当たらなくなる字面には
+        warnings を返す(#30・拒否はしない)。"""
+        if not isinstance(name, str) or not _CUSTOM_NAME_RE.fullmatch(name):
             return {"ok": False, "error": "name は英数・._- のみ、1〜64文字"}
+        if name.lower() in _BUILTIN_SIG_NAMES:
+            return {"ok": False, "error": f"name '{name}' は組込シグネチャと同名(別の名前にする)"}
         w = _sig_weight(weight)
         if w is None:
             return {"ok": False, "error": f"weight は 0〜{_SIG_WEIGHT_MAX:g} の有限の数値"}
-        err = self.validate_pattern(pattern)
+        err = self.validate_pattern(pattern) if isinstance(pattern, str) else "pattern は文字列"
         if err:
             return {"ok": False, "error": err}
-        if self.is_duplicate_pattern(pattern):
-            return {"ok": False, "error": "重複(既存と同一/挙動同値)のため不採用"}
         with self._lock:
-            self._custom = [s for s in self._custom if s.get("name") != name]
-            self._custom.append({"name": name, "category": category,
-                                 "pattern": pattern, "weight": w,
-                                 "enabled": True, "source": source})
+            # 重複判定・上限確認・置換を同じロック下で行う(#58: 判定がロック外だと、同じパターンの
+            # 並行追加が別名で両方通った)。比較は live のコンパイル済みだけ=軽い(#32)。
+            if self.is_duplicate_pattern(pattern, exclude_name=name):
+                return {"ok": False, "error": "重複(既存と同一/挙動同値)のため不採用"}
+            others = [s for s in self._custom if s.get("name") != name]
+            if len(others) >= _CUSTOM_SIG_MAX:
+                return {"ok": False, "error": f"カスタムシグネチャは最大 {_CUSTOM_SIG_MAX} 件"
+                        "(不要な規則を削除してから追加)"}
+            self._custom = others + [{"name": name, "category": category,
+                                      "pattern": pattern, "weight": w,
+                                      "enabled": True, "source": source}]
             self._save_sigs()
             self._compile_custom()
-        return {"ok": True, "added": name, "total_custom": len(self._custom)}
+            out = {"ok": True, "added": name, "total_custom": len(self._custom)}
+        warns = _custom_pattern_warnings(pattern)
+        if warns:
+            out["warnings"] = warns
+        return out
 
     def remove_signature(self, name: str) -> dict:
         with self._lock:
@@ -1399,14 +2354,40 @@ class NetShield:
                              "enabled": (n not in _OPTIONAL_SIGS) or bool(opt.get(n))}
                             for n, _p in _SIGNATURES],
                 "optional_signatures": sorted(_OPTIONAL_SIGS),
-                "custom": list(self._custom), "custom_active": len(self._custom_re),
-                "custom_blocked": self._custom_blocked}
+                # 各規則に active(稼働中か)と、無効なら reason を付ける(#55)
+                "custom": list(self._custom_view), "custom_active": len(self._custom_re),
+                "custom_blocked": self._custom_blocked, "custom_max": _CUSTOM_SIG_MAX}
+
+    def dry_run_signature(self, pattern, sample) -> dict:
+        """カスタムシグネチャの試験(状態は一切変更しない)。live と同じ照合をする: サンプルを走査面と
+        同じ正規化(_scan_windows)に通し、live と同じフラグでコンパイルしたパターンを当てる。旧版は生の
+        サンプルへ re.search しており、%XX や大文字を含む『実際には永久に当たらない』規則を一致と
+        表示していた(#30)。危険なパターン(ReDoS)は validate_pattern で弾き、コンパイルも照合もしない。"""
+        if not isinstance(pattern, str):
+            return {"ok": True, "matches": False, "error": "pattern は文字列"}
+        err = self.validate_pattern(pattern)
+        if err:
+            return {"ok": True, "matches": False, "error": err}
+        try:
+            rgx = re.compile(pattern, _custom_re_flags(pattern))
+        except re.error as e:
+            return {"ok": True, "matches": False, "error": str(e)}
+        wins = _scan_windows(str("" if sample is None else sample)[:4096])
+        out = {"ok": True, "error": None,
+               "matches": any(saferegex.search(rgx, w, _MAX_SCAN) for w in wins),
+               "normalized": wins[0][:512]}           # 照合した走査面(先頭)
+        warns = _custom_pattern_warnings(pattern)
+        if warns:
+            out["warnings"] = warns
+        return out
 
     def set_optional_signature(self, name: str, enabled: bool) -> dict:
         """高FPの任意シグネチャ(_OPTIONAL_SIGS)を個別にON/OFF。永続化する。"""
         if name not in _OPTIONAL_SIGS:
             return {"ok": False, "error": f"{name} はオプション対象でない(対象: "
                     f"{', '.join(sorted(_OPTIONAL_SIGS))})"}
+        if not isinstance(enabled, bool):        # "false" を真値=ON と読まない(#57)
+            return {"ok": False, "error": "enabled は true/false"}
         with self._lock:
             opt = dict(self.cfg.get("optional_sigs", {}))
             opt[name] = bool(enabled)
@@ -1417,12 +2398,14 @@ class NetShield:
     def set_paranoia(self, level) -> dict:
         """検知の段階的厳格度(1=保守〜4=最大)を1ダイヤルで設定。レベルに応じて高FPの任意
         シグネチャを一括ON(誤検知許容度に合わせる)。set_optional_signature で個別微調整も可
-        (その場合 paranoia 値は最後に適用したプリセットを指す)。永続化する。"""
-        try:
-            level = int(level)
-        except Exception:
-            level = 1
-        level = max(1, min(4, level))
+        (その場合 paranoia 値は最後に適用したプリセットを指す)。永続化する。
+        検証は set_config と同じ _coerce_cfg(整数のみ・1〜4 へ clamp)。不正値は ok:False で拒否して
+        現状を保つ(#56: 旧版は 'max'/null/3.7 等を 1(または切り捨て)に落として任意署名を全 OFF にし、
+        apply_config はそれを applied と報告していた=宣言的設定の綴り違いで黙って検知が弱まった)。"""
+        ok, level = self._coerce_cfg("paranoia", level)
+        if not ok:
+            return {**self.paranoia_status(), "ok": False,
+                    "error": "paranoia は 1〜4 の整数"}
         with self._lock:
             self.cfg["paranoia"] = level
             self.cfg["optional_sigs"] = {n: True for n in _PARANOIA_TIERS[level]}
@@ -1454,7 +2437,7 @@ class NetShield:
             self._save()
         return {"ok": True, "enabled": False}
 
-    def _coerce_cfg(self, k: str, v, strict: bool = True):
+    def _coerce_cfg(self, k: str, v, strict: bool = True, base: dict | None = None):
         """設定 1 キーの値を検証・正規化して (受理可否, 値) を返す。管理 API(/api/shield/config)・
         宣言的設定(apply_config)・保存済み state の読込(_load)は *すべて* ここを通る
         (入口ごとに検証が違うと、緩い入口から壊れた値が入って inspect() が毎回例外=全断になる)。
@@ -1464,12 +2447,30 @@ class NetShield:
         if k not in _DEFAULTS or v is None:
             return False, None
         dflt = _DEFAULTS[k]
-        if k == "path_limits":
-            n = _norm_path_limits(v, float(self.cfg.get("rate_per_sec", 20.0)))
+        if k == "path_limits":                # base=組み立て中の cfg(_load(into=…)・#42)
+            n = _norm_path_limits(v, float((self.cfg if base is None else base)
+                                           .get("rate_per_sec", 20.0)))
             return n is not None, n
         if k == "blocked_methods":
             n = _norm_blocked_methods(v)
             return n is not None, (n[0] if n is not None else None)
+        if k == "optional_sigs":
+            # 任意シグネチャ名 → bool のみ(#57)。汎用の dict 規則(文字列/数値も可)のままだと、
+            # 走査側は真偽値で ON/OFF を見るため "false"/"off"/"0" が ON になっていた(高FP署名を
+            # 切ったつもりで点ける=正規の要求を遮断)。API(strict)は未知名・非 bool を含めば丸ごと
+            # 拒否。保存済みの旧値(_load)は数値と明白な真偽語だけ読み替え、他は捨てる。
+            if not isinstance(v, dict):
+                return False, None
+            good = {}
+            for a, b in v.items():
+                if a not in _OPTIONAL_SIGS:
+                    continue
+                if not isinstance(b, bool) and not strict:
+                    b = (bool(b) if _finite_number(b) else
+                         _BOOL_WORDS.get(b.strip().lower()) if isinstance(b, str) else None)
+                if isinstance(b, bool):
+                    good[a] = b
+            return (len(good) == len(v) or not strict), good
         if isinstance(dflt, bool):          # bool は int の部分型。数値枠と相互に入らないよう先に判定
             return isinstance(v, bool), v
         if isinstance(dflt, (int, float)):
@@ -1480,8 +2481,31 @@ class NetShield:
                 v = max(1, min(4, v))                         # set_paranoia と同じ範囲
             elif k in _RATE_COUNT_KEYS and v > _RATE_COUNT_MAX:
                 return False, None
+            elif k == "cadence_min_samples" and v > _CADENCE_SAMPLES:
+                # 間隔は _CADENCE_SAMPLES 個しか溜まらない=超える値は周期性検知を黙って永久に
+                # 無効化していた(#40)。API では拒否して知らせ、保存済みの旧値は上限へ丸める。
+                if strict:
+                    return False, None
+                v = _CADENCE_SAMPLES
+            if k in _POSITIVE_KEYS and v <= 0:
+                return False, None
+            if k in _NONNEG_KEYS and v < 0:
+                if strict:
+                    return False, None
+                v = 0.0 if isinstance(dflt, float) else 0     # 旧版の保存値は読む側と同じく 0 へ
             return True, v
         if isinstance(dflt, str):
+            if k in _ENUM_KEYS:
+                c = _ENUM_CANON[k].get(v.strip().lower()) if isinstance(v, str) else None
+                return c is not None, c
+            if k in _HEADER_STR_KEYS:         # ヘッダへ書く値: 制御文字を拒否(_load では既定値へ)
+                if not isinstance(v, str) or _CTRL_CHARS_RE.search(v):
+                    return False, None
+                if k == "origin_header":      # 名前の前後の空白は落とし、token だけ受理
+                    v = v.strip(" ")
+                    if not _HDR_TOKEN_RE.fullmatch(v):
+                        return False, None
+                return True, v
             return isinstance(v, str), v
         if isinstance(dflt, list):          # path_limits 以外のリストは文字列の配列
             if not isinstance(v, list):
@@ -1597,7 +2621,8 @@ class NetShield:
                   "window": deque(), "score": 0.0, "score_ts": _now(),
                   "ban_until": 0.0, "seen": _now(),
                   "hits": 0, "first": _now(), "last_req": 0.0,
-                  "intervals": deque(maxlen=24), "ban_started": 0.0, "ban_count": 0,
+                  "intervals": deque(maxlen=_CADENCE_SAMPLES), "ban_started": 0.0,
+                  "ban_count": 0,
                   # ゾーンは IP から一意に決まる不変値。ここで 1 度だけ解決して持ち回る
                   # (ダッシュボードが 2 秒ごとに全 IP ぶん ipaddress 解析するのを防ぐ)。
                   "zone": _zone_of(ip)}
@@ -1612,19 +2637,26 @@ class NetShield:
         # 非BANを古い順に間引き、それで足りない(=大半がBAN中)場合のみ最古BANも間引いて境界を維持。
         now = _now()
         target = max(1, _MAX_IPS // 10)
-        nonban = sorted((kv for kv in self._ips.items() if not (kv[1]["ban_until"] > now)),
-                        key=lambda kv: kv[1]["seen"])
-        for ip, _ in nonban[:target]:
+        nonban = heapq.nsmallest(target, (kv for kv in self._ips.items()
+                                          if not (kv[1]["ban_until"] > now)),
+                                 key=lambda kv: kv[1]["seen"])
+        for ip, _ in nonban:
             self._ips.pop(ip, None)
-        if len(self._ips) >= _MAX_IPS:           # 非BANだけで足りない時のみ時限BANも間引く
+        # 時限BANも間引くのは、非BANだけでは *低水位(上限-1割)* に届かない時だけ(#15)。旧実装は
+        # 『まだ満杯なら』だけ見ていたため、非BANが 1〜target-1 件だとそれだけ消して表は満杯の手前で
+        # 止まり、以後は新規 IP 1 件ごとにロック下で全件走査し、直前に来た正規クライアントの状態まで
+        # 次の新規 IP 1 件で消えていた。低水位まで落とせば 1 回の走査を多数の新規 IP で償却する。
+        over = len(self._ips) - (_MAX_IPS - target)
+        if over > 0:
             # (#8) 運用者の永続BANは決して捨てず、時限BANは *期限の近い順* に捨てる(失うBAN残り
             # 時間を最小に)。旧実装は最古 seen 順で、BAN 中は seen が更新されないため永続BANや
             # 長期制限が真っ先に消え、blocklist.json からも落ちていた(=表を埋めるだけで解ける)。
             inf = float("inf")
-            rest = sorted((kv for kv in self._ips.items()
-                           if kv[1]["ban_until"] != inf and not kv[1].get("permanent")),
-                          key=lambda kv: kv[1]["ban_until"])
-            for ip, _ in rest[:target]:
+            rest = heapq.nsmallest(over, (kv for kv in self._ips.items()
+                                          if kv[1]["ban_until"] != inf
+                                          and not kv[1].get("permanent")),
+                                   key=lambda kv: kv[1]["ban_until"])
+            for ip, _ in rest:
                 self._ips.pop(ip, None)
 
     def _decayed_score(self, st: dict) -> float:
@@ -1641,6 +2673,24 @@ class NetShield:
         st["score"] = self._decayed_score(st) + amount
         st["score_ts"] = _now()
 
+    def _set_score(self, st: dict, value: float):
+        """スコアを値で置き換える(即時BAN 系)。score_ts も必ず今にする(#37): 旧実装は score
+        だけ書き、休んでいた IP では直後の読み戻しが休止時間ぶん減衰して 0 と報告されていた。"""
+        st["score"] = float(value)
+        st["score_ts"] = _now()
+
+    def _early_block(self, ip: str, st: dict, reason: str, *, kind: str) -> dict:
+        """inspect() の早期 return する遮断枝(メソッド/オーバーライド/Range/cred/ポリシー)の
+        出口(#16)。その要求は flood 窓/トークンへ計上済みなので、それでスコアが block_score に
+        達していれば通常経路の 5) と同じく BAN する(遮断され続けるクライアントも文書どおり
+        flood→自動BAN に至り、以後は BAN 済みのプリスキャンで落ちる=毎回のフル走査を払わせない)。"""
+        if self._decayed_score(st) >= float(self.cfg["block_score"]):
+            return self._enforce_or_audit(
+                ip, "block", st,
+                f"スコア超過→BAN: {reason}(窓内 {len(st['window'])} 要求)",
+                kind="ban", do_ban=True)
+        return self._enforce_or_audit(ip, "block", st, reason, kind=kind)
+
     def _credential_rate(self, cred: str) -> int:
         """クレデンシャル(Bearer トークン/API キー)単位の窓内リクエスト数を返す(#70)。
         生のトークンは保持せず sha256 短縮ハッシュをキーにする(漏洩面/メモリ抑制)。マップは
@@ -1650,7 +2700,8 @@ class NetShield:
         now = _now()
         win = float(self.cfg.get("cred_rate_window_sec", 60))
         # deque の長さ=数えられる上限。固定 8192 だと cred_rate_limit>8192 が永久に不発だった。
-        cap = max(8192, min(int(self.cfg.get("cred_rate_limit", 600)), _RATE_COUNT_MAX))
+        # 判定は『上限を *超えた* か』なので上限+1 件まで数えられる長さにする(#38)。
+        cap = max(8192, min(int(self.cfg.get("cred_rate_limit", 600)), _RATE_COUNT_MAX) + 1)
         dq = self._cred_rate.get(h)
         if dq is None:
             if len(self._cred_rate) >= _CRED_RATE_CAP:    # 有界化: 最古挿入を1件落とす
@@ -2005,24 +3056,76 @@ class NetShield:
                 continue
         self._geo_nets = nets
 
-    def _scan_field(self, text: str, *, only: frozenset | None = None):
+    def _scan_field(self, text: str, *, only: frozenset | None = None, acc=None,
+                    body: bool = False):
         """1 フィールドを *全域* 走査する([[_scan_windows]] の各窓へ署名照合)。
-        返値は _scan_signatures と同形 (name, weight) / (None, 0.0)。"""
-        for _w in _scan_windows(text):
-            hit, weight = self._scan_signatures(_w, only=only)
-            if hit is not None:
-                return hit, weight
-        return None, 0.0
+        返値は _scan_signatures と同形 (name, weight) / (None, 0.0)。acc(_SigScan)を渡すと
+        複数フィールド/本文の窓をまたいで集計する(組込は初出・カスタムは最重・#31)。
+        body=True は要求本文用の正規化で窓を作り(改行を ';' にしない・[[_normalize_full]])、
+        ';' 前提の検知に文脈を要求する本文用の照合で走査する(#2・[[_SIG_RE_BODY]])。
+        本文の crlf だけは、値に符号化して入れた改行(%0D%0A 等)を ';' にした見え方でも照合する
+        (値がリダイレクト先/Cookie に反映される時の注入=head の crlf と同じ形)。その見え方は
+        [[_BODY_CRLF_GATE]] が通った時だけ作り直す(良性の本文の正規化は 1 回のまま)。生の改行
+        (YAML/テキスト/multipart の枠・部ヘッダの行の区切り)は ';' にしない=正規にヘッダの形をした
+        部ヘッダの並びが crlf に当たることはない。"""
+        if acc is None:
+            acc = _SigScan(self._custom_re)
+        # 値の改行は復号でしか現れない('%'・'&'・'\\' のどれかが要る。全角 ％ 等は NFKC でそれらに
+        # なるので非 ASCII は常に通す。登録デコーダの出力も別扱い)
+        nl_ok = body and (only is None or "crlf" in only) and (
+            bool(_SCAN_DECODERS) or "%" in text or "&" in text or "\\" in text
+            or not text.isascii())
+        nl = False
+        for _w in _scan_windows(text, body=body):
+            self._scan_into(_w, acc, only=only, body=body)
+            if acc.hit is not None and (only is not None or acc.done()):
+                break
+            if (nl_ok and not nl and acc.hit is None
+                    and any(_n in _w for _n in _BODY_CRLF_NAMES) and _BODY_CRLF_GATE.search(_w)):
+                nl = True
+        if nl and acc.hit is None:
+            for _w in _scan_windows(text, body=True, nl=True):
+                if saferegex.search(_BODY_CRLF_RE, _w, _MAX_SCAN):
+                    acc.hit, acc.weight = "crlf", _SIG_WEIGHT.get("crlf", 30)
+                    break
+        return acc.result()
 
-    def _scan_signatures(self, blob: str, *, only: frozenset | None = None):
-        """1走査面(正規化済み文字列)への署名/構造検知。(name, weight) or (None, 0.0)を返す。
-        prescan ゲート付き builtin署名 + 常時カスタム署名 + 構造検知(恒真式/スタック/XSSハンドラ)。
+    def _scan_into(self, blob: str, acc, *, only: frozenset | None = None, body: bool = False):
+        """1 窓を acc(_SigScan)へ走査する。組込は未ヒットの間だけ当て、カスタム規則は結果を
+        変えうる(現在の最重より重い)ものだけを当てる。規則は weight 降順=最初の一致が最重(#31)。
+        カスタム規則は prescan ゲートを通さず常時評価(needle に無いため)。body は組込へ渡す。"""
+        if acc.hit is None:
+            acc.hit, acc.weight = self._scan_builtin(blob, only=only, body=body)
+        if only is None and acc.rules and blob:
+            floor = acc.floor()
+            # 未ヒット(良性トラフィックの大半)は全規則が対象=weight 比較を省いた素の走査
+            rules = (acc.rules if floor < 0 else
+                     [r for r in acc.rules if r[3] > floor])
+            for name, _cat, rgx, w in rules:
+                if saferegex.search(rgx, blob, _MAX_SCAN):
+                    acc.c_hit, acc.c_weight = name, w
+                    break
+
+    def _scan_signatures(self, blob: str, *, only: frozenset | None = None, body: bool = False):
+        """1 窓の最終判定(組込の初出ヒットと、それより重いカスタム署名の重い方)。
+        (name, weight) or (None, 0.0)。weight は常に具体値(カスタムの 0=監視のみ を含む)。
+        body=True は要求本文用の照合(';' 前提の検知に文脈を要求する・#2)。"""
+        acc = _SigScan(self._custom_re)
+        self._scan_into(blob, acc, only=only, body=body)
+        return acc.result()
+
+    def _scan_builtin(self, blob: str, *, only: frozenset | None = None, body: bool = False):
+        """1走査面(正規化済み文字列)への組込署名/構造検知。(name, weight) or (None, 0.0)を返す。
+        prescan ゲート付き builtin署名 + 構造検知(恒真式/スタック/XSSハンドラ)。カスタム署名は
+        _scan_into が別に集計する(組込の初出ヒットに隠されないように・#31)。
         evolution #39 でフィールド独立走査のため inspect から切り出した(挙動は従来どおり)。
         only: 指定時はこの名前集合の builtin 署名『だけ』を判定する専用フィールド走査
         (#FP: scanner_ua/sensitive_path・_FIELD_SCOPED_SIGS)。カスタム署名/構造検知はスキップ
         (専用フィールド走査は特定カテゴリの的確な判定が目的で、汎用の意味的検知とは別関心)。
         only=None(既定=汎用走査)では _FIELD_SCOPED_SIGS に属す名は評価しない(専用呼び出し
-        でのみ判定=フィールド混成による誤検知を避ける)。"""
+        でのみ判定=フィールド混成による誤検知を避ける)。
+        body=True は要求本文用: rce の ';' 分岐・crlf・スタック複文に文脈を要求する(#2。本文の ';' は
+        CSV の区切りや地の文の句読点でもある)。head(URL/ヘッダ)の判定は変えない。"""
         if not blob:
             return None, 0.0
         # 高速プレフィルタ(Rust継ぎ目でnative化可)。核語が皆無なら高価な正規表現を丸ごとスキップ
@@ -2030,7 +3133,7 @@ class NetShield:
         from ..core import accel
         if accel.prescan_suspicious(blob.encode("utf-8", "replace")) > 0:
             opt = self.cfg.get("optional_sigs", {})
-            for name, rgx in _SIG_RE:
+            for name, rgx in (_SIG_RE_BODY if body else _SIG_RE):
                 if only is not None:
                     if name not in only:
                         continue                 # 専用フィールド走査=指定カテゴリのみ判定
@@ -2045,15 +3148,11 @@ class NetShield:
                     return name, _SIG_WEIGHT.get(name, 30)
         if only is not None:
             return None, 0.0                     # 専用フィールド走査はここまで(カスタム/構造検知は対象外)
-        # カスタムシグネチャ(ユーザー/AI追加)は prescanゲートを通さず常時評価(needleに無いため)。
-        for name, _cat, rgx, w in self._custom_re:
-            if saferegex.search(rgx, blob, _MAX_SCAN):
-                return name, w
         # 意味的検知: literal シグネチャをすり抜けた恒真式 SQLi(2=2 / 'x'='x')/スタック複文 /
         # ハンドラ型 XSS(<svg onload=)を *構造* で捕捉。
         if _tautology_suspect(blob):
             return "sqli-tautology", _SIG_WEIGHT.get("sqli-tautology", 35)
-        if _stacked_query_suspect(blob):
+        if _stacked_query_suspect(blob, body=body):
             return "sqli-stacked", _SIG_WEIGHT.get("sqli-stacked", 40)
         if _xss_event_handler_suspect(blob):
             return "xss", _SIG_WEIGHT.get("xss", 45)
@@ -2092,26 +3191,31 @@ class NetShield:
         _targets.extend(h for h in (headers or "").split("\n") if h)
         _wins0 = _scan_windows(_targets[0])        # 主走査面(全域を窓分割=切り詰めない)
         blob = _wins0[0]                           # reason/後続参照の後方互換用(先頭窓)
-        sig_hit, sig_weight = (None, 0.0)
+        # 組込は初出ヒットで確定、カスタムは全フィールドで最重を集計(#31・_SigScan)
+        _acc = _SigScan(self._custom_re)
         for _w in _wins0:
-            sig_hit, sig_weight = self._scan_signatures(_w)
-            if sig_hit is not None:
+            self._scan_into(_w, _acc)
+            if _acc.done():
                 break
         # フィールド限定シグネチャ(#FP: scanner_ua/sensitive_path・_FIELD_SCOPED_SIGS)は上の汎用
         # 走査面(path+query+UA混成)からは除外済み。ここで各々の専用フィールド *単体* を対象に
         # 個別判定する(scanner_ua=user_agentのみ/sensitive_path=pathのみ)。bio等の自由記述
         # フィールド内の言及や、query/headers越しの言及では判定しない=意味論どおりのスコープ。
-        if sig_hit is None and user_agent:
-            sig_hit, sig_weight = self._scan_field(user_agent, only=_UA_ONLY_SIGS)
-        if sig_hit is None and path:
-            sig_hit, sig_weight = self._scan_field(path, only=_PATH_ONLY_SIGS)
+        if _acc.hit is None and user_agent:
+            _acc.hit, _acc.weight = self._scan_field(user_agent, only=_UA_ONLY_SIGS)
+        if _acc.hit is None and path:
+            _acc.hit, _acc.weight = self._scan_field(path, only=_PATH_ONLY_SIGS)
         for _t in _targets[1:_MAX_SCAN_FIELDS]:    # ヘッダ各値を独立面として(必要分だけ)走査
-            if sig_hit is not None:
+            if _acc.done():
                 break
-            sig_hit, sig_weight = self._scan_field(_t)   # 各値も全域(切り詰めない)
+            self._scan_field(_t, acc=_acc)         # 各値も全域(切り詰めない)
+        sig_hit, sig_weight = _acc.result()
         # テレメトリ(ロック外で算出=ロック保持時間を伸ばさない)。method は攻撃者入力ゆえ
         # 既知メソッド名のみ採用し OTHER に畳む(辞書の無制限肥大を防ぐ)。
-        mkey = method.upper() if (method and method.isalpha() and len(method) <= 10) else "OTHER"
+        # 旧実装は『英字 10 文字以下』なら何でも新しいキーにしていた=要求ごとに辞書が伸びた(#14)。
+        mkey = method.upper() if method and len(method) <= 16 else ""
+        if mkey not in _KNOWN_METHODS and mkey not in (self.cfg.get("blocked_methods") or ()):
+            mkey = "OTHER"
         with self._lock:
             self._metrics["requests"] += 1
             if sig_hit:                       # シグネチャ別ヒットの累積内訳(テレメトリ・推移用)
@@ -2127,6 +3231,20 @@ class NetShield:
             if st["ban_until"] > now:
                 return self._out(ip, "block", st, "BAN中", remain=st["ban_until"] - now)
             reasons = []
+            # 3)/4) の *計上*(flood 窓・+25 加点・トークン消費)は、下の早期 return する遮断枝より
+            #      前で済ませる(#16)。旧実装は枝で返った要求を窓にもバケツにも数えなかったため、
+            #      遮断され続けるクライアントは flood→自動BAN に至らず、BAN 済みを落とすプリスキャン
+            #      (is_banned_fast)にも載らないまま、毎回フル走査+ロックを払わせていた。枝の出口
+            #      (_early_block)はスコアが block_score に達していれば通常経路の 5) と同じく BAN する。
+            #      理由文字列の並びは従来どおり(flood の理由は 3) の位置で足す)。
+            w = st["window"]; w.append(now)
+            ws = float(self.cfg["window_sec"])
+            while w and w[0] < now - ws:
+                w.popleft()
+            flooding = len(w) > int(self.cfg["flood_threshold"])
+            if flooding:
+                self._add_score(st, 25)
+            throttled = not self._take_token(st)
             # 1.2) サブネット集約防御(evolution #25・既定OFF): 同一サブネット(/24・v6 /64)で多数の
             #      *別IP* がBAN済み=分散攻撃の温床。新規IPに *一度だけ* ソフト加点して早期に絞る
             #      (ハードBANはしない=NAT/CGNAT 巻き添え回避)。flag で1回限り=加点の暴走なし。
@@ -2141,7 +3259,7 @@ class NetShield:
             #       異常メソッドを遮断。アプリ前段にまず正規には来ない=低FP。空配列で無効化。
             mb = self.cfg.get("blocked_methods")
             if mb and (method or "").upper() in mb:
-                return self._enforce_or_audit(ip, "block", st,
+                return self._early_block(ip, st,
                     f"メソッド遮断: {(method or '').upper()[:16]}", kind="method_block")
             # 1.255) メソッドオーバーライド悪用(evolution #72): X-HTTP-Method-Override 等で実効
             #        メソッドを差し替える回避を塞ぐ。オーバーライド先にも blocked_methods を適用し、
@@ -2149,15 +3267,15 @@ class NetShield:
             ovr = (override_method or "").strip().upper()[:16]
             if ovr:
                 if self.cfg.get("method_override_block"):
-                    return self._enforce_or_audit(ip, "block", st,
+                    return self._early_block(ip, st,
                         f"メソッドオーバーライド禁止: {ovr}", kind="method_override")
                 if mb and self.cfg.get("method_override_check", True) and ovr in mb:
-                    return self._enforce_or_audit(ip, "block", st,
+                    return self._early_block(ip, st,
                         f"メソッド遮断(override): {ovr}", kind="method_block")
             # 1.256) パスオーバーライド ACL バイパス(evolution #73): X-Original-URL/X-Rewrite-URL は
             #        内部 rewrite 用。前段エッジにクライアントが送る=パス ACL 回避の手口=遮断。
             if override_path and self.cfg.get("path_override_block", True):
-                return self._enforce_or_audit(ip, "block", st,
+                return self._early_block(ip, st,
                     f"パスオーバーライド: {override_path[:60]}", kind="path_override")
             # 1.257) Range DoS(evolution #76): 多数レンジ(Apache Killer 系)でサーバに大量バッファを
             #        確保させる DoS を、レンジ数の上限で遮断。正規は 1〜2 レンジ=低FP。
@@ -2165,7 +3283,7 @@ class NetShield:
                 if range_header.strip().lower().startswith("bytes="):
                     nr = range_header.count(",") + 1
                     if nr > int(self.cfg.get("range_max_ranges", 8)):
-                        return self._enforce_or_audit(ip, "block", st,
+                        return self._early_block(ip, st,
                             f"過大な Range({nr} ranges): Apache Killer 系", kind="range_dos")
             # 1.26) ヘッダ整合性ボット検知(evolution #63): UA はブラウザを名乗るのに実ブラウザが
             #       常時送るヘッダを欠く=偽装ツールの手掛かり。低FPのため *加点のみ*(単独では落とさず
@@ -2176,56 +3294,68 @@ class NetShield:
                 self._metrics["bot_inconsistency"] = self._metrics.get("bot_inconsistency", 0) + 1
                 reasons.append("ua-header不整合(ブラウザ偽装の疑い)")
             # 1.28) クレデンシャル単位レート(evolution #70): Bearer トークン/API キーの識別子単位で
-            #       レートを集計。IP をローテーションしても同一キーの濫用は絞る。超過で加点。
+            #       レートを集計。IP をローテーションしても同一キーの濫用は絞る。上限を *超えた*
+            #       要求を遮断する(旧実装は >= で、上限 N に対し N-1 件しか通さなかった・#38)。
             #       cred は単一の識別子(str)か、要求に載った識別子の列。列なら *各々に* 計上し
             #       最大値で判定する(1 つだけ数えると、捨て値の Bearer を毎回変えて盗んだ
             #       X-API-Key で認証させる手口で識別子がローテーションし、上限が発動しなかった)。
             if self.cfg.get("cred_rate_enabled") and (_creds := _cred_ids(cred)):
                 cr = max(self._credential_rate(c) for c in _creds)
-                if cr >= int(self.cfg.get("cred_rate_limit", 600)):
+                if cr > int(self.cfg.get("cred_rate_limit", 600)):
                     self._metrics["cred_rate_hit"] = self._metrics.get("cred_rate_hit", 0) + 1
                     # カウンタは *クレデンシャル共有* なのに、加点先は要求元 IP だった。
                     # 共有キー(モバイルアプリ埋込・フロントエンド公開キー・流出トークン)を
                     # 攻撃者が自分のホストから回して窓を超えさせ続ければ、同じキーを使う
                     # *正規利用者* の IP に毎回 +40 が乗り、数リクエストで BAN できた
-                    # (第三者への BAN 転嫁)。加点はやめ、超過した *その要求だけ* を絞る。
+                    # (第三者への BAN 転嫁)。既定は加点せず、超過した *その要求だけ* を絞る。
                     # BAN もスコアも残さないので巻き添えは一時的で回復する。IP 単位の濫用は
                     # 既存のレート制限/脅威スコアが引き続き担当する=検知能力は落ちない。
-                    return self._enforce_or_audit(
-                        ip, "block", st,
-                        f"クレデンシャル単位のレート超過({cr})", kind="cred_rate")
+                    # キーが利用者ごとに固有の配備だけは cred_rate_score>0 で加点できる(#39)。
+                    _crs = float(self.cfg.get("cred_rate_score", 0) or 0)
+                    if _crs > 0:
+                        self._add_score(st, _crs)
+                    return self._early_block(
+                        ip, st, f"クレデンシャル単位のレート超過({cr})", kind="cred_rate")
             # 1.265) JWT 検査(evolution #68): Bearer JWT の alg:none(無署名=認証バイパス)/
             #        許可外 alg(alg 混同攻撃)を遮断。署名検証はアプリ(鍵が無い)、ここは構造点検のみ。
             if self.cfg.get("jwt_inspect_enabled") and auth:
                 jv = _jwt_violation(auth, self.cfg.get("jwt_allowed_algs"))
                 if jv:
-                    st["score"] = float(self.cfg["block_score"])
+                    self._set_score(st, self.cfg["block_score"])     # score_ts も更新(#37)
                     return self._enforce_or_audit(ip, "block", st, "JWT: " + jv,
                                                   kind="jwt_block", do_ban=True)
             # 1.3) ポリシー(拡張子/URL/正規TLS以外/海外CIDR/サイト許可遮断)。監査なら通過+アラート。
             pol = (self._policy_block(ip, path, tls) or self._site_block(host)
                    or self._ip_list_block(ip))
             if pol:
-                return self._enforce_or_audit(ip, "block", st, "ポリシー: " + pol,
-                                              kind="policy_block")
+                return self._early_block(ip, st, "ポリシー: " + pol, kind="policy_block")
             # 2) 侵入シグネチャ(ロック外で判定済み・組込/カスタム共通)を反映
             if sig_hit:
-                self._add_score(st, sig_weight or _SIG_WEIGHT.get(sig_hit, 30))
+                # weight は走査が常に具体値で返す。`or 既定` は weight 0(監視のみ)を『未設定』と
+                # 取り違えて 30 点(組込と同名ならその weight)を足していた(#22/#29)。
+                self._add_score(st, float(sig_weight))
                 reasons.append(f"signature:{sig_hit}")
             # 2.5) 低速・規則性(ステルスBot): 機械的に等間隔なアクセスを炙る(Floodに掛からない型)
+            #      加点は *検知エピソードにつき 1 回*(規則的でない→規則的 に変わった時だけ。リズムが
+            #      崩れたら再武装)。旧実装は間隔サンプルが規則的な間 *毎要求* 加点し、1 秒間隔の
+            #      ポーリング(正規ブラウザの通知取得等)が約 10 秒で単発拒否→BAN になっていた。
+            #      前回の加点が 1/16 に減衰する(半減期 x4・既定 120 秒)までは次のエピソードを加点
+            #      しない: 休止を挟むポーリングでも、規則性だけで積み上がるのは cadence_score の
+            #      約 1.07 倍まで(既定 35→37 < deny_score 40)。
             if self._cadence_botlike(st, now):
-                self._add_score(st, float(self.cfg["cadence_score"]))
-                reasons.append("cadence:botlike")
-            # 3) flood(スライディングウィンドウ)
-            w = st["window"]; w.append(now)
-            ws = float(self.cfg["window_sec"])
-            while w and w[0] < now - ws:
-                w.popleft()
-            if len(w) > int(self.cfg["flood_threshold"]):
-                self._add_score(st, 25)
+                if (not st.get("cadence_on")
+                        and now - st.get("cadence_ts", 0.0)
+                        >= 4.0 * max(1.0, float(self.cfg["score_halflife_sec"]))):
+                    st["cadence_on"] = True
+                    st["cadence_ts"] = now
+                    self._add_score(st, float(self.cfg["cadence_score"]))
+                    reasons.append("cadence:botlike")
+            else:
+                st["cadence_on"] = False
+            # 3) flood(スライディングウィンドウ)。窓と加点は早期 return の前で計上済み(#16)。
+            if flooding:
                 reasons.append(f"flood:{len(w)}/{int(ws)}s")
-            # 4) レート制限(トークンバケット)
-            throttled = not self._take_token(st)
+            # 4) レート制限(トークンバケット)。消費は早期 return の前で計上済み(#16)。
             throttle_reason = "レート超過(トークン枯渇)"
             # 4.5) パス別レート制限(任意・既定[]=無効ゼロコスト): 認証/高コスト経路を構造的に
             #      厳格化。グローバルが緩くても /login 等への連射(credential stuffing 等)を
@@ -2257,8 +3387,11 @@ class NetShield:
         """完全なリクエストに至らない不正(slowloris=ヘッダをだらだら送る接続 等)へ
         スコアだけ加点する。単発では落とさず(誤遮断回避=正規の低速回線を守る)、
         反復で累積し block_score 超で BAN。監査モードは遮断しない(_enforce_or_audit 経由)。
-        既存のスコア/減衰/BAN-TTL/bloom/イベントを再利用=新しい状態を増やさない。"""
-        if not ip:
+        既存のスコア/減衰/BAN-TTL/bloom/イベントを再利用=新しい状態を増やさない。
+        シールド OFF(完全パススルー)の間は何もしない(#28): inspect() と同じく本体スイッチに従う。
+        旧実装は OFF でも slow-read/slowloris 等で加点・BAN・blocklist 保存まで行い、ON に戻した
+        瞬間に OFF の間の BAN で正規利用者が 403 になった。"""
+        if not ip or not self.is_enabled():
             return {"action": "ignore", "banned": False}
         with self._lock:
             st = self._state(ip)
@@ -2293,6 +3426,10 @@ class NetShield:
             self._resp_code_hits[band] = self._resp_code_hits.get(band, 0) + 1
             if not self.cfg.get("resp_score_enabled") or not ip:
                 return {"action": "track"}              # 既定で集計はするが加点は opt-out 可
+            if not self.is_enabled():
+                # シールド OFF(完全パススルー)は集計のみ(#28)。旧実装は OFF でも加点・BAN して
+                # blocklist に保存し、ON に戻した直後の要求を 403 にしていた。
+                return {"action": "track"}
             if not (400 <= code < 500):
                 return {"action": "track"}              # 加点対象はクライアントエラー(4xx)のみ
             now = _now()
@@ -2322,41 +3459,61 @@ class NetShield:
         return {"action": "block" if banned else "score", "banned": banned,
                 "score": round(score, 1)}
 
-    def inspect_body(self, ip: str, body: bytes) -> dict:
+    def inspect_body(self, ip: str, body: bytes, *, content_type: str = "") -> dict:
         """要求ボディ先頭(有界)をシグネチャ走査して脅威スコアへ還元する(evolution #61)。
         head と同じ正規化+署名エンジンを使い、POST/JSON/GraphQL 本文に潜む SQLi/XSS/RCE/SSTI
         など head-only 検査の死角を捉える。block_score 超で BAN(enforce 時)。監査モードは記録のみ。
-        proxy が本文先頭を読んでから(転送前に)呼ぶ。空/無効/ヒット無しは allow。"""
+        proxy が本文先頭を読んでから(転送前に)呼ぶ。空/無効/ヒット無しは allow。
+        content_type(要求の Content-Type・省略可)がバイナリ型で、走査する先頭の中身もバイナリなら
+        署名走査せず allow(skipped="binary")にして metrics の body_binary_skipped に数える(T1)。"""
         if not self.is_enabled() or not self.cfg.get("body_scan_enabled") or not body:
             return {"action": "allow"}
         cap = int(self.cfg.get("body_scan_max_bytes", 65536))
         data = bytes(body[:cap])
+        if content_type and _binary_ctype(content_type) and _BINARY_BYTE_RE.search(data):
+            with self._lock:
+                self._metrics["body_binary_skipped"] = (
+                    self._metrics.get("body_binary_skipped", 0) + 1)
+            return {"action": "allow", "skipped": "binary"}
         # 重複ウィンドウ走査(#61): _normalize_for_scan は _MAX_SCAN(8192)で頭打ちなので、本文を
         # _MAX_SCAN 窓 + 重複で刻んで *全域* を走査する。これが無いと先頭を無害パディングで埋めて
         # 後段の payload を走査外へ押し出す回避(#39 と同種)が本文で成立してしまう。窓数は cap で有界。
+        # 本文は UTF-8 として読む(不正なバイトだけ latin-1・#8)。multipart は枠を外し、部の中身と
+        # 部ヘッダを別フィールドにする(#0)。窓は本文用の正規化で作る(改行を ';' にしない・#0/#2)。
+        try:
+            text = _body_text(data)
+            fields = _multipart_fields(text) or (text,)
+        except Exception:
+            fields = (data.decode("latin1", "replace"),)
         win, overlap = _MAX_SCAN, 256
-        sig_hit, weight, i = None, 0.0, 0
-        while i < len(data):
-            try:
-                # 正規化 *後* を再度窓分割する: NFKC 展開(1 文字→最大 18 文字)で後半が
-                # 1 窓の外へ押し出されるのを防ぐ(生バイト窓の刻みだけでは足りない)。
-                sig_hit, weight = self._scan_field(
-                    data[i:i + win].decode("latin1", "replace"))
-            except Exception:
+        _acc = _SigScan(self._custom_re)             # 組込は初出・カスタムは全窓の最重(#31)
+        for field in fields:
+            i = 0
+            while i < len(field):
+                try:
+                    # 正規化 *後* を再度窓分割する: NFKC 展開(1 文字→最大 4 文字)で後半が
+                    # 1 窓の外へ押し出されるのを防ぐ(生の窓の刻みだけでは足りない)。
+                    self._scan_field(field[i:i + win], acc=_acc, body=True)
+                except Exception:
+                    break
+                if _acc.done():
+                    break
+                if i + win >= len(field):
+                    break
+                i += win - overlap                   # 重複=窓境界を跨ぐ payload も捉える
+            if _acc.done():
                 break
-            if sig_hit:
-                break
-            if i + win >= len(data):
-                break
-            i += win - overlap                       # 重複=窓境界を跨ぐ payload も捉える
+        sig_hit, weight = _acc.result()
         if not sig_hit:
             return {"action": "allow"}
         with self._lock:
             self._sig_hits[sig_hit] = self._sig_hits.get(sig_hit, 0) + 1
             st = self._state(ip)
-            base = float(weight) or float(_SIG_WEIGHT.get(sig_hit, 30))
-            factor = float(self.cfg.get("body_sig_weight_factor", 1.0) or 1.0)
-            self._add_score(st, base * factor)       # 本文由来は確度を下げて誤BANを抑制
+            # weight 0(監視のみ)も係数 0(本文ヒットは記録のみ)も、`or 既定` で『未設定』扱いに
+            # されて満額加点されていた(#22/#36)。係数は有限の 0 以上ならそのまま使う。
+            factor = self.cfg.get("body_sig_weight_factor", 1.0)
+            factor = max(0.0, float(factor)) if _finite_number(factor) else 1.0
+            self._add_score(st, float(weight) * factor)   # 本文由来は確度を下げて誤BANを抑制
             score = self._decayed_score(st)
             reason = f"body signature: {sig_hit}"
             if score >= float(self.cfg["block_score"]):
@@ -2370,22 +3527,45 @@ class NetShield:
         return {"action": act if act in ("block", "throttle") else "score",
                 "banned": banned, "signature": sig_hit, "score": round(score, 1)}
 
-    def scan_upload(self, ip: str, body: bytes) -> dict:
+    def scan_upload(self, ip: str, body: bytes, content_type: str = "", *,
+                    disposition=()) -> dict:
         """multipart アップロードの危険拡張子(webshell/実行体)を拒否する(evolution #66)。
-        #61(本文シグネチャ)とは別関心=ファイル種別ポリシー。filename= から危険拡張子を見つけたら
-        加点(block_score 超で BAN)。二重拡張子も全セグメント検査で捉える。無効/該当無しは allow。"""
-        if not self.is_enabled() or not self.cfg.get("upload_scan_enabled") or not body:
+        #61(本文シグネチャ)とは別関心=ファイル種別ポリシー。multipart の *パートヘッダ* の
+        Content-Disposition(filename= / filename*= / RFC 2231 継続)だけを見る(フォーム値や本文中の
+        'filename=' という文字列は対象外・#10)。content_type が multipart 以外なら対象外、空なら本文
+        先頭行から境界を推定する。見るのは body の先頭 body_scan_max_bytes(proxy は残りを転送しながら
+        upload_scanner で検査する・#33)。見つけたら加点(単発で遮断水準=BAN)。無効/該当無しは allow。
+        disposition は *要求ヘッダ* の Content-Disposition の値(1 本の str か出現ごとの並び)。生本文
+        アップロードの保存名として同じ拡張子規則で見る(T2・本文が空でも見る)。"""
+        if not self.is_enabled() or not self.cfg.get("upload_scan_enabled"):
             return {"action": "allow"}
-        cap = int(self.cfg.get("body_scan_max_bytes", 65536))
-        hit = _dangerous_upload_filename(body, self.cfg.get("upload_deny_ext"), cap)
+        deny = self.cfg.get("upload_deny_ext")
+        hit = _disposition_upload_filename(disposition, deny) if disposition else None
+        if not hit and body:
+            cap = int(self.cfg.get("body_scan_max_bytes", 65536))
+            hit = _dangerous_upload_filename(body, deny, cap, content_type)
         if not hit:
             return {"action": "allow"}
-        fn, ext = hit
+        return self.upload_violation(ip, *hit)
+
+    def upload_scanner(self, content_type: str, sample: bytes = b"", chunked: bool = False):
+        """本文を転送しながら全パートのヘッダを検査する逐次スキャナ(_UploadScan)を返す(#33)。
+        アップロード検査が無効/拒否リストが空/multipart でない(境界が取れない)なら None。
+        feed(生の本文バイト) が (filename, ext) を返したら upload_violation へ渡す。"""
+        if not self.is_enabled() or not self.cfg.get("upload_scan_enabled"):
+            return None
+        deny = {str(e).lower().lstrip(".") for e in (self.cfg.get("upload_deny_ext") or [])}
+        bnds = _mp_boundaries(content_type, sample) if deny else []
+        return _UploadScan(bnds, deny, chunked) if bnds else None
+
+    def upload_violation(self, ip: str, fn: str, ext: str) -> dict:
+        """危険なアップロード(ext="" は検査できない壊れた/過大な multipart)を加点し遮断する。"""
         with self._lock:
             st = self._state(ip)
             self._add_score(st, float(self.cfg["block_score"]))   # 危険UL=単発で遮断水準
             score = self._decayed_score(st)
-            reason = f"危険なアップロード拡張子(.{ext}): {fn}"
+            reason = (f"危険なアップロード拡張子(.{ext}): {fn}" if ext
+                      else f"検査できない multipart: {fn}")
             r = self._enforce_or_audit(ip, "block", st, reason, kind="upload_block",
                                        do_ban=True)
             act = r.get("action", "block")
@@ -2393,24 +3573,65 @@ class NetShield:
         return {"action": act if act in ("block", "throttle") else "score",
                 "banned": banned, "ext": ext, "filename": fn, "score": round(score, 1)}
 
-    def inspect_graphql(self, ip: str, path: str, body: bytes) -> dict:
+    def graphql_max_bytes(self, path: str) -> int:
+        """この要求パスに GraphQL ガードが効くなら本文の上限(graphql_max_bytes)、効かなければ 0。
+        proxy は >0 のとき本文をこの長さまで読み切って inspect_graphql へ渡す(#4)。"""
+        if not self.is_enabled() or not self.cfg.get("graphql_enabled"):
+            return 0
+        if not _graphql_path(path, self.cfg.get("graphql_paths")):
+            return 0
+        try:
+            return max(1, int(self.cfg.get("graphql_max_bytes", 262144)))
+        except (TypeError, ValueError):
+            return 262144
+
+    def inspect_graphql(self, ip: str, path: str, body: bytes = b"", content_type: str = "",
+                        complete: bool = True) -> dict:
         """GraphQL エンドポイントへの問い合わせを上限照合する(evolution #67)。深いネスト/複雑度/
         イントロスペクション/バッチ過大を遮断(リゾルバコスト爆発 DoS とスキーマ漏洩を防ぐ)。
-        graphql_paths のパスにだけ適用。違反は block_score 加点(単発で遮断水準)。proxy が本文先頭を渡す。"""
-        if not self.is_enabled() or not self.cfg.get("graphql_enabled") or not body:
+        graphql_paths(正規化パスで前方一致・#6)にだけ適用。見るもの(#5): path のクエリ文字列の
+        query=(GET)、本文(JSON/application/graphql/urlencoded の query 欄/multipart の operations 欄)。
+        本文は全体(graphql_max_bytes まで)を解析する(#4)。上限を超える/読み切れない本文
+        (complete=False)は検査できないので {"action": "reject", "status": 413}(加点しない・監査
+        モードは記録のみ)。JSON の封筒なのに読めない本文と上限違反は block_score 加点(単発で遮断水準)。"""
+        lim = self.graphql_max_bytes(path)
+        if not lim:
             return {"action": "allow"}
-        p = (path or "").split("?", 1)[0]
-        paths = self.cfg.get("graphql_paths") or ["/graphql"]
-        if not any(p == gp or p.startswith(gp.rstrip("/") + "/") or p == gp.rstrip("/")
-                   for gp in paths):
-            return {"action": "allow"}
-        from .graphql import extract_queries, check
-        cap = int(self.cfg.get("body_scan_max_bytes", 65536))
-        res = check(extract_queries(bytes(body[:cap])),
-                    max_depth_limit=int(self.cfg.get("graphql_max_depth", 12)),
-                    max_complexity=int(self.cfg.get("graphql_max_complexity", 100)),
-                    block_introspection=bool(self.cfg.get("graphql_block_introspection", True)),
-                    max_batch=int(self.cfg.get("graphql_max_batch", 10)))
+        from .graphql import parse_body, form_queries, check
+        body = bytes(body or b"")
+        qs = (path or "").split("?", 1)[1].split("#", 1)[0] if "?" in (path or "") else ""
+        url_q = form_queries(qs) if qs else []
+        body_q, err, too_big = [], "", False
+        bnds = _mp_boundaries(content_type) if content_type else []
+        if bnds:              # graphql-multipart-request-spec: operations 欄が GraphQL(ファイルは対象外)
+            ops = _multipart_field(body[:lim + 1], bnds, "operations")
+            if ops is False:
+                too_big = len(body) > lim or not complete    # operations が上限内で完結しない
+            elif ops is not None:
+                body_q, err = parse_body(ops, "application/json")
+        elif not complete or len(body) > lim:
+            too_big = True
+        elif body:
+            body_q, err = parse_body(body, content_type)
+        if too_big:
+            with self._lock:
+                if self.cfg.get("mode") == "audit":
+                    self._event(ip, "audit", {"would": "reject", "rule": "graphql_too_large",
+                                              "reason": f"GraphQL 本文が graphql_max_bytes({lim})超"})
+                    return {"action": "allow"}
+                self._event(ip, "graphql_too_large", {"limit": lim})
+            return {"action": "reject", "status": 413, "reason": "too-large"}
+        if err:
+            res = {"allowed": False, "reason": err}
+        else:
+            lims = dict(max_depth_limit=int(self.cfg.get("graphql_max_depth", 12)),
+                        max_complexity=int(self.cfg.get("graphql_max_complexity", 1000)),
+                        block_introspection=bool(self.cfg.get("graphql_block_introspection",
+                                                              True)),
+                        max_batch=int(self.cfg.get("graphql_max_batch", 10)))
+            res = check(body_q, **lims)
+            if res["allowed"] and url_q:
+                res = check(url_q, **lims)
         if res["allowed"]:
             return {"action": "allow"}
         with self._lock:
@@ -2479,19 +3700,44 @@ class NetShield:
         """DLP が有効か(本体ON かつ dlp_enabled)。"""
         return self.is_enabled() and bool(self.cfg.get("dlp_enabled"))
 
-    def scan_leak(self, data) -> list:
-        """応答チャンクから秘密情報漏洩の種別を返す(DLP有効時のみ)。"""
-        return scan_secret_leak(data) if self.cfg.get("dlp_enabled") else []
+    def scan_leak(self, data, start: int = 0, limit: int = None) -> list:
+        """応答チャンクから秘密情報漏洩の種別を返す(DLP有効時のみ)。start/limit は
+        scan_secret_leak と同じ(ストリームの窓走査・#48)。"""
+        return scan_secret_leak(data, start, limit) if self.cfg.get("dlp_enabled") else []
+
+    def dlp_effective_action(self) -> str:
+        """DLP の *実効* 動作("block" / "audit")。全体 mode=audit(遮断せず記録のみ)の間は
+        dlp_action=block でも記録だけにする(#51・旧実装は DLP だけが audit モードを無視して切断)。"""
+        if self.cfg.get("dlp_action") == "block" and self.cfg.get("mode") != "audit":
+            return "block"
+        return "audit"
 
     def note_leak(self, ip: str, kinds: list) -> dict:
         """漏洩検出をイベント/メトリクス/種別内訳へ記録。action=block なら呼び出し側が残りを送らず切断。"""
         kinds = list(dict.fromkeys(kinds))[:8]      # 重複除去・上限
+        action = self.dlp_effective_action()
+        ev = {"kinds": kinds}
+        if action != "block" and self.cfg.get("dlp_action") == "block":
+            ev["would"] = "block"                   # 全体 audit モードで遮断を見送った(#51)
         with self._lock:
             self._metrics["dlp_leak"] = self._metrics.get("dlp_leak", 0) + 1
             for k in kinds:                         # 漏洩した秘密種別の累積内訳(テレメトリ)
                 self._dlp_kinds[k] = self._dlp_kinds.get(k, 0) + 1
-            self._event(ip, "dlp_leak", {"kinds": kinds})
-        return {"action": self.cfg.get("dlp_action", "audit"), "kinds": kinds}
+            self._event(ip, "dlp_leak", ev)
+        return {"action": action, "kinds": kinds}
+
+    def note_unscannable(self, ip: str, encoding: str) -> dict:
+        """DLP が読めない符号化(gzip/br 等)の応答本文を記録する(#1)。DLP 有効時は backend へ
+        Accept-Encoding: identity を渡すので通常は起きない。それでも圧縮で返った本文は秘密の有無を
+        確かめられない=dlp_action どおり(block は送らず切断・audit は記録して通す)に扱う。"""
+        action = self.dlp_effective_action()
+        ev = {"encoding": str(encoding)[:40]}
+        if action != "block" and self.cfg.get("dlp_action") == "block":
+            ev["would"] = "block"
+        with self._lock:
+            self._metrics["dlp_unscannable"] = self._metrics.get("dlp_unscannable", 0) + 1
+            self._event(ip, "dlp_unscannable", ev)
+        return {"action": action}
 
     def _enforce_or_audit(self, ip, action, st, reason, *, kind="",
                           do_ban=False, ban_perm=False, **kw):
@@ -2653,14 +3899,22 @@ class NetShield:
 
     # ── 全体レートEWMA(ダッシュボード用テレメトリ) ──
     def _tick_ewma(self):
+        # 要求を 1 件数え、時刻が進んだ時に『前回からの件数 / 経過』でまとめて畳み込む(#41)。
+        # 旧実装は dt<=0 で何も数えずに返していたため、粗い壁時計(Windows の 15.625ms 刻み等)で
+        # 同じ時刻を共有した要求が全部捨てられ、1000 req/s でも EWMA が ~60 で頭打ちになっていた。
+        self._ewma_n += 1
         now = _now()
         dt = now - self._ewma_last
-        if dt <= 0:
+        if dt < 0:                           # 壁時計の巻き戻し(NTP 補正等): 基準を付け替える
+            self._ewma_last = now            # (追い付くまで凍結→追い付いた瞬間に跳ねる、を防ぐ)
             return
-        inst = 1.0 / dt
+        if dt == 0:
+            return                           # 同じ刻み: 件数だけ溜めて次の刻みで畳み込む
+        inst = self._ewma_n / dt
         alpha = 1 - 0.5 ** (dt / 5.0)        # 5秒半減のEWMA
         self._ewma = (1 - alpha) * self._ewma + alpha * inst
         self._ewma_last = now
+        self._ewma_n = 0
 
     # ── 低速規則性 ──
     def _cadence_botlike(self, st: dict, now: float) -> bool:
@@ -2697,10 +3951,13 @@ class NetShield:
         with self._lock:
             thr = _now() - gap                      # ≈ 停止開始時刻(これより後に切れる=停止時点で有効)
             n_ban = 0
-            for st in self._ips.values():
+            for ip, st in self._ips.items():
                 bu = st.get("ban_until", 0.0)
                 if bu and bu != float("inf") and bu > thr:   # 停止時点で有効だった時限BAN
                     st["ban_until"] = bu + gap; n_ban += 1
+                    # 停止中に wall-clock で切れた BAN は、復帰後の再構築でブルームから落ちている
+                    # ことがある。延長したら戻さないと is_banned_fast が偽陰性になる(#45)。
+                    self._ban_bloom.add(ip)
             self._event("system", "suspend_absorbed",
                         {"gap_sec": round(gap, 1), "bans": n_ban})
         return {"ok": True, "absorbed": round(gap, 1), "bans": n_ban}
@@ -3180,6 +4437,24 @@ class NetShield:
             self._ban_bloom = nb
         return {"ok": True, "bloom": nb.info()}
 
+    def maintain_ban_bloom(self) -> dict:
+        """BAN ブルームの周期保守(#46)。周期 tick(traffic_stall_check)から呼ぶ。
+          · 解除の連打で間引いた再構築(_bloom_dirty)を最小間隔の経過後に消化する。以前は
+            『次回の呼び出し』=次の unban まで誰も消化せず、陳腐ビットが残り続けた。
+          · 自然失効した BAN は unban を通らないので一度もブルームから落ちず、長期稼働で飽和して
+            (est_fp_rate→1)安価な否定フィルタとして効かなくなっていた。前回の再構築から
+            bloom_refresh_sec(既定 300 秒)経つか、追加数が設計容量に達したら作り直す。
+        O(追跡IP数) の作り直しは高々この周期ごと=要求のホットパスには載せない。"""
+        if self._bloom_dirty:
+            return self.rebuild_ban_bloom()    # 最小間隔内なら再び deferred=次の tick で消化
+        bf = self._ban_bloom
+        if not bf.n:
+            return {"ok": True, "idle": True}
+        refresh = float(self.cfg.get("bloom_refresh_sec", 300.0) or 0)
+        if bf.n >= bf.capacity or (refresh > 0 and _now() - self._bloom_rebuilt >= refresh):
+            return self.rebuild_ban_bloom()
+        return {"ok": True, "idle": True}
+
     # ── 記録/指標 ──
     def _event(self, ip, kind, extra):
         self._events.append({"ts": _now(), "ip": ip, "kind": kind, **extra})
@@ -3189,7 +4464,12 @@ class NetShield:
         周期的に呼ぶ。直近の区間が busy
         (>= stall_min_rate)だったのに *今区間で1件も通っていない* なら、再ルーティング等で
         DuckNet を迂回された疑いとして警報する。busy→ゼロ の遷移のみ=自然な低トラフィックや
-        graceful な停止では鳴らない。返り値 {"stall": bool, ...}。"""
+        graceful な停止では鳴らない。返り値 {"stall": bool, ...}。
+        周期 tick に便乗して BAN ブルームの保守(maintain_ban_bloom・#46)も回す。"""
+        try:
+            self.maintain_ban_bloom()            # 失敗しても迂回検知は続ける
+        except Exception:
+            pass
         now = _now() if now is None else now
         with self._lock:
             cur = self._metrics.get("requests", 0)

@@ -219,7 +219,11 @@ def test_c27_persisted_nan_weight_signature_is_dropped():
                        "weight": 30.0, "enabled": True, "source": "user"}]
         sh._save_sigs()
         sh2 = _shield(d)
-        assert [s["name"] for s in sh2.list_signatures()["custom"]] == ["good"]
+        # 不正 weight の規則は稼働させないが、黙って消さず無効(active=false)として一覧に残す
+        # (det_signatures #55: 旧版は読み捨てて次の保存で rules.json からも消していた)
+        listed = {s["name"]: s for s in sh2.list_signatures()["custom"]}
+        assert [n for n, s in listed.items() if s["active"]] == ["good"]
+        assert listed["bad"]["active"] is False and listed["bad"]["weight"] is None
         json.dumps(sh2.list_signatures(), allow_nan=False)      # UI が読める
         r = sh2.inspect("198.51.100.13", path="/zzqq1")
         assert r["score"] == r["score"]                          # NaN ではない
@@ -302,7 +306,7 @@ def test_c86_cred_rate_limit_above_internal_cap_still_fires():
         sh.set_config(cred_rate_enabled=True, cred_rate_limit=9000)
         assert sh.cfg["cred_rate_limit"] == 9000
         with sh._lock:
-            for _ in range(8999):
+            for _ in range(9000):              # 上限 9000 件までは通す(#38: 超えた 9001 件目で遮断)
                 sh._credential_rate("tok-busy")
         r = sh.inspect("198.51.100.14", path="/", cred="tok-busy")
         assert r["action"] == "block", r

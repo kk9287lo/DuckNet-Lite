@@ -167,8 +167,19 @@ class _Sink:
         pass
 
 
+class _Reads:
+    """backend の読取 1 回ごとに chunk を 1 つ返す。asyncio.StreamReader に先に流し込むと
+    read(65536) が全 chunk を 1 回に結合し、『分割読取』のつもりのテストが分割を通らない(#53)。"""
+
+    def __init__(self, chunks):
+        self.q = list(chunks)
+
+    async def read(self, n=65536):
+        return self.q.pop(0) if self.q else b""
+
+
 def _run_pipe(chunks, *, setup=None, req_host="app.example", **cfg):
-    """backend 応答 chunks を _pipe(scan=True)へ流し、client へ出たバイトと shield を返す。"""
+    """backend 応答 chunks を _pipe(scan=True)へ 1 読取ずつ流し、client へ出たバイトと shield を返す。"""
     with _shield(**cfg) as sh:
         if setup:
             setup(sh)
@@ -176,11 +187,7 @@ def _run_pipe(chunks, *, setup=None, req_host="app.example", **cfg):
         out = _Sink()
 
         async def go():
-            r = asyncio.StreamReader()
-            for c in chunks:
-                r.feed_data(c)
-            r.feed_eof()
-            await g._pipe(r, out, scan=True, ip="203.0.113.70", tls=False,
+            await g._pipe(_Reads(chunks), out, scan=True, ip="203.0.113.70", tls=False,
                           req_host=req_host)
 
         asyncio.run(go())
@@ -242,7 +249,7 @@ def test_c57_duplicate_authorization_does_not_rotate_cred_rate_key():
                                f"Authorization: Bearer stolen-key\r\n"
                                f"Authorization: Bearer junk{i}\r\n\r\n").encode()])
         passed = sum(1 for d in be.got if b"/api" in d)
-        assert passed <= 2, passed
+        assert passed <= 3, passed                 # 上限 3 件までは通す(#38)
     finally:
         be.close()
 
@@ -356,11 +363,25 @@ def test_c59_dlp_scans_response_head_when_head_processing_on():
 
 
 def test_c59_dlp_scans_oversized_response_head():
-    # 64KiB 超の head(加工を諦める経路)も DLP は通す。
+    # 64KiB 超の head(加工を諦める経路)も DLP は通す。終端より前に 64KiB 超が届く分割にして、
+    # 実際にその経路(head 書換なし)を通ったことも確かめる(#53: 旧入力は通常の書換経路だった)。
+    import dataplane.engine.services.proxy as P
     resp = (b"HTTP/1.1 200 OK\r\nX-Debug-Key: " + _LEAK + b"\r\nX-Pad: " + b"p" * 70000
             + b"\r\n\r\nok")
-    out, sh = _run_pipe([resp[:40000], resp[40000:]], dlp_enabled=True, dlp_action="block",
-                        cookie_harden_enabled=True)
+    calls = []
+    orig = P.inject_security_headers
+
+    def spy(*a, **k):
+        calls.append(1)
+        return orig(*a, **k)
+
+    P.inject_security_headers = spy
+    try:
+        out, sh = _run_pipe([resp[:66000], resp[66000:]], dlp_enabled=True,
+                            dlp_action="block", cookie_harden_enabled=True)
+    finally:
+        P.inject_security_headers = orig
+    assert not calls, "oversized-head branch was not taken"
     assert _LEAK not in out
     assert sh.metrics().get("dlp_leak", 0) >= 1
 

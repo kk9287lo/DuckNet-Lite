@@ -12,6 +12,7 @@ from dataplane.engine.lifeform.pipeline import NetShield, _now
 
 def _shield(d, **cfg):
     sh = NetShield(state_dir=d)
+    sh.cfg["enabled"] = True        # 加点はシールド ON のときだけ(OFF=集計のみ・#28)
     sh.cfg.update(cfg)
     return sh
 

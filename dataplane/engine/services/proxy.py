@@ -173,6 +173,178 @@ def _is_interim(code: int) -> bool:
     return 100 <= code < 200 and code != 101
 
 
+# ── 出口 DLP の応答本文走査(#1/#27/#42/#47/#48) ───────────────────────────────
+# 窓走査で一致の開始を判定するのに要る右側の文脈長。最長の判定幅(カード番号 19 桁+区切り 19+
+# 後続 1 = 39B、github_token 40+1B)より長く取る。各読取の末尾この長さは次の読取と合わせて判定する。
+_DLP_LOOK = 64
+# block で保留した未判定の末尾を、backend が黙ってからこの秒数で放出する(#27)。保留は『境界を跨ぐ
+# 秘密の頭を先に送らない』ため(#42)だが、無期限に抱えると long-poll/逐次応答が EOF まで止まる。
+_DLP_HOLD_IDLE = 0.2
+
+
+class _Dechunk:
+    """chunked 応答本文から *DLP の走査対象* になるバイト範囲を逐次に取り出す(#47)。
+    feed(data) は data 内の範囲 [(s, e), …] を返す(chunk-size 行と data 直後の CRLF は含めない)。
+    転送は呼び出し側が wire のまま行う(ここは走査面を作るだけ=枠は 1 バイトも変えない)。
+    last-chunk 以降(trailer)と、枠が読めなくなった以降は全バイトを範囲に含める=取りこぼさない側。"""
+    __slots__ = ("_st", "_line", "_left")
+
+    def __init__(self):
+        self._st = "size"             # size → data → crlf → size … / last-chunk・枠崩れ → raw
+        self._line = bytearray()      # 読取を跨いだサイズ行の断片
+        self._left = 0
+
+    def feed(self, data: bytes) -> list:
+        runs, i, n = [], 0, len(data)
+        while i < n:
+            st = self._st
+            if st == "raw":
+                runs.append((i, n))
+                break
+            if st == "data":
+                take = min(self._left, n - i)
+                runs.append((i, i + take))
+                i += take
+                self._left -= take
+                if not self._left:
+                    self._st = "crlf"
+                continue
+            j = data.find(b"\n", i)
+            if j < 0:
+                self._line += data[i:]
+                if len(self._line) > _CHUNK_LINE_MAX:   # 過大な行=枠ではない。以降はそのまま走査
+                    self._st = "raw"
+                    runs.append((i, n))
+                break
+            ln, ls, i = (bytes(self._line) + data[i:j]).rstrip(b"\r"), i, j + 1
+            self._line.clear()
+            if st == "crlf":
+                if ln:                                  # data 直後が CRLF でない=枠崩れ
+                    self._st = "raw"
+                    runs.append((ls, n))
+                    break
+                self._st = "size"
+                continue
+            sz = ln.split(b";", 1)[0].strip(b" \t")     # chunk-ext(;...)は捨てる
+            if not _CHUNK_HEX.match(sz):
+                self._st = "raw"
+                runs.append((ls, n))
+                break
+            size = int(sz, 16)
+            if size:
+                self._left, self._st = size, "data"
+            else:
+                self._st = "raw"                        # last-chunk: trailer 以降もそのまま走査
+        return runs
+
+
+def _dlp_body_mode(head: bytes):
+    """最終応答 head(CRLFCRLF 抜き)から DLP の本文の扱いを読む: (chunked, streaming, 解けない符号化)。
+    streaming=SSE(text/event-stream)と 101 切替=逐次届くこと自体が仕様の応答(保留しない・#27)。
+    解けない符号化=identity 以外の Content-Encoding と chunked 以外の Transfer-Encoding(#1)。"""
+    lines = head.split(b"\r\n")
+    streaming = _resp_status(lines[0]) == 101
+    chunked, bad = False, []
+    for ln in lines[1:]:
+        k, sep, v = ln.partition(b":")
+        if not sep:
+            continue
+        k = k.strip().lower()
+        if k == b"content-type":
+            streaming = streaming or v.strip().lower().startswith(b"text/event-stream")
+        elif k in (b"content-encoding", b"transfer-encoding"):
+            for c in v.lower().split(b","):
+                c = c.strip()
+                if c == b"chunked" and k == b"transfer-encoding":
+                    chunked = True
+                elif c and c != b"identity":
+                    bad.append(c.decode("latin-1")[:16])
+    return chunked, streaming, ",".join(bad[:4])
+
+
+class _DlpStream:
+    """出口 DLP の応答本文走査(1 応答ぶんの状態)。feed(chunk) は (今送ってよいバイト, 停止) を返す。
+    · 走査面: chunked なら枠を外した本文(#47)、それ以外は受けたバイトそのもの。
+    · 窓走査: 直前の走査の末尾(未判定 _DLP_LOOK B+左文脈 1B)を重ねて次の読取と合わせて判定する。
+      読取の切れ目を語境界とみなさない=判定がパケット分割に依存しない(#48)。EOF で残りを判定。
+    · 保留: block かつ非ストリーミングの応答だけ、未判定の末尾に当たる wire バイトを次の読取まで
+      送らない(境界を跨ぐ秘密の頭を先に出さない・#42)。audit とストリーミングは保留しない(#27)。
+    · 解けない符号化(gzip/br 等)の本文は走査できない=dlp_unscannable として dlp_action どおり(#1)。
+    · budget(dlp_max_scan_bytes)を読み切ったら保留を放出して以降は素通し。"""
+    __slots__ = ("sh", "ip", "budget", "hold", "dech", "bad", "carry", "cst",
+                 "pending", "pruns", "active")
+
+    def __init__(self, sh, ip, budget):
+        self.sh, self.ip, self.budget = sh, ip, budget
+        self.hold = sh.dlp_effective_action() == "block"
+        self.dech, self.bad = None, ""
+        self.carry, self.cst = b"", 0     # 走査済み本文の末尾と、その中で未判定の開始位置
+        self.pending, self.pruns = b"", []   # 保留中の wire と、その中の本文範囲
+        self.active = True
+
+    def head(self, head: bytes):
+        chunked, streaming, self.bad = _dlp_body_mode(head)
+        self.dech = _Dechunk() if chunked else None
+        if streaming:
+            self.hold = False
+
+    def release(self) -> bytes:
+        """保留分を放出する(backend が黙った・#27)。未判定の判定は次の読取で続ける。"""
+        out, self.pending, self.pruns = self.pending, b"", []
+        return out
+
+    def _stop(self, action, wire):
+        self.active, self.pending, self.pruns = False, b"", []
+        if action == "block":
+            return b"", True              # 保留分(秘密の頭になり得る)も送らず切断
+        return wire, False                # audit: 記録して走査停止。保留分も含め流す
+
+    def feed(self, chunk: bytes):
+        if self.dech is not None:
+            runs = self.dech.feed(chunk)
+            pay = chunk if runs == [(0, len(chunk))] else b"".join(chunk[s:e] for s, e in runs)
+        else:
+            runs, pay = [(0, len(chunk))], chunk
+        wire = self.pending + chunk if self.pending else chunk
+        if self.bad and pay:
+            return self._stop(self.sh.note_unscannable(self.ip, self.bad).get("action"), wire)
+        self.budget -= len(chunk)
+        seg = self.carry + pay
+        lim = max(self.cst, len(seg) - _DLP_LOOK)
+        kinds = self.sh.scan_leak(seg, self.cst, lim) if lim > self.cst else None
+        if kinds:
+            return self._stop(self.sh.note_leak(self.ip, kinds).get("action"), wire)
+        k = max(0, lim - 1)
+        self.carry, self.cst = seg[k:], lim - k
+        if self.budget <= 0:              # 走査終了=保留を放出し以降は素通し
+            return self._stop("audit", wire)
+        if not self.hold:
+            return wire, False
+        # 未判定の本文(seg[lim:])を含む wire の末尾を保留する(枠の中でも本文位置で切る)
+        base = len(wire) - len(chunk)
+        allr = self.pruns + [(s + base, e + base) for s, e in runs]
+        u, cut = len(seg) - lim, len(wire)
+        if u:
+            cut = 0                       # 既に放出済みの未判定がある=wire 内の本文は全部保留
+            for s, e in reversed(allr):
+                if u <= e - s:
+                    cut = e - u
+                    break
+                u -= e - s
+        self.pending = wire[cut:]
+        self.pruns = [(max(s, cut) - cut, e - cut) for s, e in allr if e > cut]
+        return wire[:cut], False
+
+    def eof(self):
+        """EOF=本当の終端。未判定の末尾を、終端を境界として判定する(#48)。"""
+        wire = self.release()
+        if self.active and self.cst < len(self.carry):
+            kinds = self.sh.scan_leak(self.carry, self.cst)
+            if kinds:
+                return self._stop(self.sh.note_leak(self.ip, kinds).get("action"), wire)
+        return wire, False
+
+
 def _strip_request_headers(buf: bytes, names_lower) -> bytes:
     """転送リクエスト head から指定ヘッダ(小文字名の集合)を除去する(#75)。リクエストライン/
     body は保持。head 不完全は不変。キャッシュ汚染を招く unkeyed ヘッダ(X-Forwarded-Host 等)を
@@ -410,6 +582,15 @@ def _framing_ambiguous(buf: bytes) -> bool:
     return False
 
 
+# 訪問者向けページ(遮断ページ・案内ページ)共通の見た目。外部リソースは使わない。
+_PAGE_CSS = (
+    "body{font-family:system-ui,sans-serif;background:#0d1117;color:#c9d1d9;"
+    "display:flex;min-height:100vh;margin:0;align-items:center;justify-content:center}"
+    ".card{max-width:480px;padding:32px;background:#161b22;border:1px solid #30363d;"
+    "border-radius:14px;text-align:center}.dim{color:#8b949e;font-size:13px}"
+    "h2{color:#f85149}.logo{font-size:13px;color:#58a6ff;margin-bottom:8px}")
+
+
 def _block_page(info: dict, submitted: bool = False, msg: str = "") -> bytes:
     """アクセス遮断ページ(商用WAF風)。数分後に解除リクエスト(異議申立)フォームを出す。
     表示名は環境変数 DUCKNET_COVER で差し替え可(ステルス時=製品名を露見させない)。
@@ -443,15 +624,232 @@ def _block_page(info: dict, submitted: bool = False, msg: str = "") -> bytes:
     page = (
         f"<!doctype html><html lang='{lg}'><head><meta charset='utf-8'>"
         "<meta name='viewport' content='width=device-width,initial-scale=1'>"
-        f"<title>{t('block.title')} — " + brand + "</title><style>"
-        "body{font-family:system-ui,sans-serif;background:#0d1117;color:#c9d1d9;"
-        "display:flex;min-height:100vh;margin:0;align-items:center;justify-content:center}"
-        ".card{max-width:480px;padding:32px;background:#161b22;border:1px solid #30363d;"
-        "border-radius:14px;text-align:center}.dim{color:#8b949e;font-size:13px}"
-        "h2{color:#f85149}.logo{font-size:13px;color:#58a6ff;margin-bottom:8px}"
+        f"<title>{t('block.title')} — " + brand + "</title><style>" + _PAGE_CSS +
         "</style></head><body><div class='card'>"
         "<div class='logo'>🛡 " + brand + "</div>" + center + "</div></body></html>")
     return page.encode("utf-8")
+
+
+# ── 訪問者(ブラウザ)向けの案内ページ ─────────────────────────────────────────
+# 拒否応答(429/502/400/413/415/431 ほか)は、ブラウザの画面遷移(Accept に text/html)には
+# 『何が起きたか・次に何をすればよいか』の短い HTML を返す。API クライアント(Accept:
+# application/json・*/*・Accept 無し)には従来どおりの JSON を返す(機械が読む本文は 1 バイトも
+# 変えない)。ページは拒否経路でだけ組み立てる=ホットパス無関係。文言は _block_page と同じく
+# DUCKNET_LANG(lang())で日英を選ぶ。内部の判定理由・規則名・スコア・パス・製品名
+# (DUCKNET_COVER 設定時)は出さない。
+
+def _wants_html(buf) -> bool:
+    """要求が HTML を優先しているか(=ブラウザの画面遷移)。text/html の q が正で、
+    application/json の q より大きいときだけ True。Accept 無し・*/*(curl)・JSON 優先は False。"""
+    try:
+        acc = _header_value(bytes(buf), b"accept").lower()
+    except Exception:
+        return False
+    if "text/html" not in acc:
+        return False
+    qs = {}
+    for part in acc.split(","):
+        mt, _, params = part.partition(";")
+        mt = mt.strip()
+        if mt not in ("text/html", "application/json"):
+            continue
+        q = 1.0
+        for p in params.split(";"):
+            k, _, v = p.partition("=")
+            if k.strip() == "q":
+                try:
+                    q = float(v.strip())
+                except ValueError:
+                    q = 0.0
+        qs[mt] = max(qs.get(mt, 0.0), q)
+    return qs.get("text/html", 0.0) > max(0.0, qs.get("application/json", 0.0))
+
+
+_PG = {
+    "time": {"ja": "発生時刻: {ts}(サイトの管理者に問い合わせるときにお伝えください)",
+             "en": "Time: {ts} (please mention this if you contact the site administrator)"},
+    "contact": {"ja": "問題が続く場合は、サイトの管理者にお問い合わせください。",
+                "en": "If this keeps happening, please contact the site administrator."},
+    "reload": {"ja": "再読み込み", "en": "Reload"},
+    "home": {"ja": "トップページへ", "en": "Go to the home page"},
+    # 429
+    "rate.h": {"ja": "アクセスが集中しています", "en": "Too many requests"},
+    "rate.p": {"ja": "短い時間に多くのリクエストが届いたため、一時的に受け付けを止めています。",
+               "en": "We received too many requests in a short time, so they are paused for a moment."},
+    "rate.when": {"ja": "約 {n} 秒後に、また利用できるようになります。",
+                  "en": "You can continue in about {n} seconds."},
+    "rate.auto": {"ja": "このページは自動で再読み込みします。待てない場合は下のボタンを押してください。",
+                  "en": "This page will reload automatically. You can also use the button below."},
+    "rate.retry": {"ja": "今すぐ再試行", "en": "Try again now"},
+    # 502
+    "down.h": {"ja": "サイトに一時的に接続できません", "en": "The site is temporarily unreachable"},
+    "down.p": {"ja": "このサイトのサーバーが一時的に応答していません。しばらく待ってから、"
+                     "もう一度お試しください。",
+               "en": "The site's server is not responding right now. Please wait a moment "
+                     "and try again."},
+    # 400
+    "bad.h": {"ja": "リクエストを処理できませんでした", "en": "Your request could not be processed"},
+    "bad.framing": {"ja": "ブラウザから届いたリクエストの形式に問題がありました。",
+                    "en": "The request from your browser was not in a form this site accepts."},
+    "bad.conflict": {"ja": "リクエストに、同じ情報が食い違う内容で複数含まれていました。",
+                     "en": "The request contained the same information more than once, with "
+                           "different values."},
+    "bad.body": {"ja": "送信されたデータが途中で途切れているか、形式が正しくありませんでした。",
+                 "en": "The data you sent was cut off or not in a valid format."},
+    "bad.next": {"ja": "ページを再読み込みしてください。ブラウザの拡張機能やプロキシを使っている"
+                       "場合は、それらを止めると解決することがあります。",
+                 "en": "Please reload the page. If you use browser extensions or a proxy, "
+                       "turning them off may help."},
+    "bad.resend": {"ja": "もう一度送信してください。", "en": "Please send it again."},
+    # 413
+    "big.h": {"ja": "送信したデータが大きすぎます", "en": "The data you sent is too large"},
+    "big.lim": {"ja": "このサイトが受け付けられる大きさ(最大 {limit})を超えています。",
+                "en": "It is larger than this site accepts (up to {limit})."},
+    "big.p": {"ja": "このサイトが受け付けられる大きさを超えています。",
+              "en": "It is larger than this site accepts."},
+    "big.next": {"ja": "データを小さくしてから、もう一度送信してください。",
+                 "en": "Please make it smaller and send it again."},
+    # 415
+    "enc.h": {"ja": "送信したデータの形式に対応していません",
+              "en": "The data format is not supported"},
+    "enc.p": {"ja": "このサイトは、送信されたデータの圧縮形式を受け付けていません。",
+              "en": "This site does not accept the compression used for the data you sent."},
+    "enc.next": {"ja": "圧縮せずに送信し直してください。",
+                 "en": "Please send it again without compression."},
+    # 431
+    "hdr.h": {"ja": "ブラウザから届いた情報が大きすぎます",
+              "en": "Your browser sent too much information"},
+    "hdr.p": {"ja": "Cookie などのリクエストに付く情報が大きすぎるため、処理できませんでした。",
+              "en": "The information sent with the request, such as cookies, is too large "
+                    "to process."},
+    "hdr.next": {"ja": "ブラウザの設定から、このサイトの Cookie を削除してから、もう一度"
+                       "アクセスしてください。",
+                 "en": "Please delete this site's cookies in your browser settings, then "
+                       "try again."},
+    # 解除リクエスト経路(BAN されていない)
+    "nb.h": {"ja": "このアドレスは現在ブロックされていません",
+             "en": "This address is not currently blocked"},
+    "nb.p": {"ja": "解除のリクエストは必要ありません。前のページに戻って再読み込みしてください。",
+             "en": "There is nothing to unblock. Go back to the previous page and reload it."},
+}
+
+
+def _pg(key: str, lg: str, **fmt) -> str:
+    """案内ページの文言(生テキスト)。"""
+    m = _PG[key]
+    s = m.get(lg) or m["ja"]
+    return s.format(**fmt) if fmt else s
+
+
+def _pgh(key: str, lg: str, **fmt) -> str:
+    """案内ページの文言(HTML エスケープ済み。差し込む値ごとエスケープされる)。"""
+    import html as _html
+    return _html.escape(_pg(key, lg, **fmt))
+
+
+def _page_lang() -> str:
+    try:
+        from ..core.i18n import lang
+        return lang()
+    except Exception:
+        return "ja"
+
+
+def _human_size(n: int) -> str:
+    """上限バイト数を人が読める形に(切り捨て=実際より大きくは言わない)。"""
+    n = int(n)
+    if n >= 1 << 20:
+        return f"{((n * 10) >> 20) / 10:g} MB"        # 小数 1 桁で切り捨て(1.95MB→1.9 MB)
+    if n >= 1 << 10:
+        return f"{n >> 10} KB"
+    return f"{n} B"
+
+
+_PAGE_CSS_EXTRA = (
+    "p{line-height:1.6}.wait h2{color:#d29922}.ok h2{color:#3fb950}"
+    "a.btn{display:inline-block;margin-top:4px;padding:10px 18px;border-radius:8px;"
+    "background:#238636;color:#fff;text-decoration:none}")
+
+
+def _guard_page(lg: str, head_key: str, body: str, tone: str = "",
+                head: str = "", tail: str = "") -> bytes:
+    """案内ページの外枠(_block_page と同じ見た目・ブランドの扱い・外部リソース無し)。
+    body/head/tail は呼び出し側でエスケープ済みの HTML 断片。末尾に発生時刻(UTC)を添える
+    (訪問者が管理者へ伝えられるように)。"""
+    import html as _html
+    brand = _html.escape(os.environ.get("DUCKNET_COVER", "DuckNet-Lite"))
+    h = _pgh(head_key, lg)
+    ts = time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime())
+    page = (
+        f"<!doctype html><html lang='{lg}'><head><meta charset='utf-8'>"
+        "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+        f"<title>{h} — {brand}</title>{head}<style>{_PAGE_CSS}{_PAGE_CSS_EXTRA}</style>"
+        f"</head><body><div class='{('card ' + tone) if tone else 'card'}'>"
+        f"<div class='logo'>🛡 {brand}</div>"
+        f"<h2>{h}</h2>{body}<p class='dim'>{_pgh('time', lg, ts=ts)}</p></div>{tail}"
+        "</body></html>")
+    return page.encode("utf-8")
+
+
+def _btn(label_key: str, lg: str, href: str = "") -> str:
+    """リンクボタン。href='' は *いま表示している URL* (=元の URL をそのまま再要求)。"""
+    import html as _html
+    return f"<p><a class='btn' href='{_html.escape(href)}'>{_pgh(label_key, lg)}</a></p>"
+
+
+# 静的な案内(見出し, 説明…, ボタン)。説明は _PG のキー。
+_NOTICES = {
+    "down": ("down.h", ("down.p", "contact"), ("reload", "")),
+    "framing": ("bad.h", ("bad.framing", "bad.next", "contact"), ("reload", "")),
+    "conflict": ("bad.h", ("bad.conflict", "bad.next", "contact"), ("reload", "")),
+    "body": ("bad.h", ("bad.body", "bad.resend", "contact"), None),
+    "encoding": ("enc.h", ("enc.p", "enc.next", "contact"), None),
+    "headers": ("hdr.h", ("hdr.p", "hdr.next"), None),
+    "not_banned": ("nb.h", ("nb.p",), ("home", "/")),
+}
+
+
+def _notice_page(kind: str) -> bytes:
+    """静的な案内ページ(_NOTICES の kind)。"""
+    lg = _page_lang()
+    hk, paras, btn = _NOTICES[kind]
+    body = "".join(f"<p>{_pgh(k, lg)}</p>" for k in paras)
+    if btn:
+        body += _btn(btn[0], lg, btn[1])
+    return _guard_page(lg, hk, body)
+
+
+def _too_large_page(limit=None) -> bytes:
+    """413: 大きすぎる(上限が分かれば添える)。"""
+    lg = _page_lang()
+    why = (_pgh("big.lim", lg, limit=_human_size(limit)) if limit
+           else _pgh("big.p", lg))
+    return _guard_page(lg, "big.h", f"<p>{why}</p><p>{_pgh('big.next', lg)}</p>")
+
+
+def _rate_page(retry_after) -> bytes:
+    """429: N 秒後にまた使える。N 秒後(+揺らぎ)に元の URL を自動で再要求し、手動の再試行
+    ボタンも出す。JS 無効でも meta refresh で再読み込みする。0 秒でも即時ループにしない。"""
+    lg = _page_lang()
+    try:
+        n = max(1, int(retry_after))
+    except (TypeError, ValueError):
+        n = 1
+    body = (f"<p>{_pgh('rate.p', lg)}</p><p>{_pgh('rate.when', lg, n=n)}</p>"
+            f"<p class='dim'>{_pgh('rate.auto', lg)}</p>" + _btn("rate.retry", lg))
+    head = f"<noscript><meta http-equiv='refresh' content='{n}'></noscript>"
+    tail = ("<script>setTimeout(function(){location.replace(location.href)},"
+            f"({n}+Math.random())*1000)</script>")
+    return _guard_page(lg, "rate.h", body, tone="wait", head=head, tail=tail)
+
+
+def _reject_response(status: str, json_body, page=None, extra=None) -> bytes:
+    """拒否応答。page(HTML)があれば人向けページ、無ければ従来と同一の JSON 応答。
+    HTML はキャッシュさせない(再読み込みで古い案内が出続けないように)。"""
+    if page is None:
+        return _http_response(status, json_body, extra=extra)
+    return _http_response(status, page, "text/html; charset=utf-8",
+                          extra=list(extra or ()) + [("Cache-Control", "no-store")])
 
 
 _CONN_RATE_CAP = 50000      # 接続レート窓テーブルの上限(メモリ有界)
@@ -932,8 +1330,10 @@ class AsyncEdgeGuard:
             except Exception:
                 pass
             try:
-                writer.write(_http_response("431 Request Header Fields Too Large",
-                                            '{"ok":false,"error":"header too large"}'))
+                writer.write(_reject_response(
+                    "431 Request Header Fields Too Large",
+                    '{"ok":false,"error":"header too large"}',
+                    _notice_page("headers") if _wants_html(buf) else None))
             except Exception:
                 pass
             return self._close(writer)
@@ -968,9 +1368,10 @@ class AsyncEdgeGuard:
         #     バイト透過プロキシで『WAF 素通り→上流が隠し要求を実行』を構造的に封じる。
         if _framing_ambiguous(buf):
             self.metrics["dropped"] += 1
-            writer.write(_http_response("400 Bad Request",
-                                        '{"error":"ambiguous message framing"}',
-                                        extra=deception.headers_for(ip)))
+            writer.write(_reject_response("400 Bad Request",
+                                          '{"error":"ambiguous message framing"}',
+                                          _notice_page("framing") if _wants_html(buf) else None,
+                                          extra=deception.headers_for(ip)))
             try:
                 await writer.drain()
             except Exception:
@@ -1025,7 +1426,8 @@ class AsyncEdgeGuard:
             # 解除リクエスト(異議申立)経路はBAN判定の手前=遮断中のユーザーでも到達できる。
             if _p == _APPEAL_PATH:
                 try:
-                    return await self._handle_appeal(ip, path, sh, writer)
+                    return await self._handle_appeal(ip, path, sh, writer,
+                                                      html=_wants_html(buf))
                 except Exception:
                     # _handle は try/finally のみ(except無し)で、ここで漏らすと接続が
                     # 誰にも close されないまま残る(#111 の副作用で新たに生じた握り漏れ)。
@@ -1058,9 +1460,10 @@ class AsyncEdgeGuard:
             if len(_auths) > 1 or len(_keys) > 1 or len(_ovrs) > 1:
                 self.metrics["dropped"] += 1
                 self.metrics["dup_header"] = self.metrics.get("dup_header", 0) + 1
-                writer.write(_http_response("400 Bad Request",
-                                            '{"error":"conflicting header values"}',
-                                            extra=deception.headers_for(ip)))
+                writer.write(_reject_response(
+                    "400 Bad Request", '{"error":"conflicting header values"}',
+                    _notice_page("conflict") if _wants_html(buf) else None,
+                    extra=deception.headers_for(ip)))
                 try:
                     await writer.drain()
                 except Exception:
@@ -1102,8 +1505,9 @@ class AsyncEdgeGuard:
                 # opt-out(throttle_response=False)で従来挙動へ。応答後は即 close=Fail Fast。
                 if sh.cfg.get("throttle_response", True):
                     ra = max(0, int(sh.cfg.get("throttle_retry_after", 1) or 0))
-                    writer.write(_http_response("429 Too Many Requests", _jsonify(
+                    writer.write(_reject_response("429 Too Many Requests", _jsonify(
                         {"ok": False, "defense": "rate-limit", "retry_after": ra}),
+                        _rate_page(ra) if _wants_html(buf) else None,
                         extra=list(deception.headers_for(ip)) + [("Retry-After", ra)]))
                     try:
                         await writer.drain()
@@ -1124,8 +1528,9 @@ class AsyncEdgeGuard:
             # 指標にも構造的に残す(このLite版は txnlog を持たないため metrics のみ)。
             self.metrics["backend_unreachable"] = (
                 self.metrics.get("backend_unreachable", 0) + 1)
-            writer.write(_http_response("502 Bad Gateway", _jsonify(
+            writer.write(_reject_response("502 Bad Gateway", _jsonify(
                 {"ok": False, "error": "backend unreachable"}),
+                _notice_page("down") if _wants_html(buf) else None,
                 extra=deception.headers_for(ip)))
             try:
                 await writer.drain()
@@ -1182,12 +1587,33 @@ class AsyncEdgeGuard:
                             origin_token(_okey, window=float(_scfg.get("origin_window_sec", 30))))
             except Exception:
                 pass
+            # #1: 出口 DLP が有効なら backend に *無圧縮* で返させる(Accept-Encoding: identity)。
+            #   ブラウザは常に gzip/br を広告するので、素通しすると圧縮された応答本文を DLP が
+            #   読めず、block でも秘密がそのまま届いていた。それでも圧縮で返ってきた本文は _pipe が
+            #   dlp_unscannable として dlp_action どおりに扱う(応答を検査する WAF の通例)。
+            try:
+                from ..lifeform.pipeline import net_shield as _ns3
+                if _ns3().dlp_active():
+                    fwd = _set_request_header(fwd, "Accept-Encoding", "identity")
+            except Exception:
+                pass
             # #46: 本文皆無(CL/TE 無し)の要求は head 以降のバイトがパイプライン第2要求=
             #   未検査でバックエンドへ届く。head のみに切り詰め、client→backend パイプも張らず
             #   write_eof で『要求完了』を半クローズで通知する。これで *backend が
             #   Connection: close を尊重するか否かに依存せず* smuggle 第2要求が上流に到達しない
             #   (#31 が「準拠サーバ前提」と明記していた残余リスクを DuckNet 側で能動的に塞ぐ)。
             bodyless = not _request_declares_body(buf)
+            if bodyless and "?" in path:
+                # #5: GET /graphql?query=… も GraphQL 上限の対象(本文走査を通らない経路)。
+                #   判定不能(例外)は素通しにしない(#111 と同じフェイルクローズ)。
+                try:
+                    from ..lifeform.pipeline import net_shield as _ns4
+                    _gq = _ns4().inspect_graphql(ip, path, b"").get("action")
+                except Exception:
+                    _gq = "block"
+                if _gq in ("block", "reject"):
+                    self.metrics["dropped"] += 1
+                    return self._close(writer)
             if bodyless:
                 _h, _sep, _ = fwd.partition(b"\r\n\r\n")
                 if _sep:
@@ -1203,16 +1629,33 @@ class AsyncEdgeGuard:
             else:
                 # #61: 要求ボディ検査。本文先頭を有界に読み、署名走査してから転送する
                 #   (head-only の死角=POST/JSON/GraphQL 本文の SQLi/XSS/RCE/SSTI を塞ぐ)。
-                extra, blocked = await self._scan_request_body(buf, reader, ip, path)
+                _bctx = {}
+                extra, blocked = await self._scan_request_body(buf, reader, ip, path, _bctx)
                 if blocked:
                     self.metrics["dropped"] += 1
-                    if blocked == "unscannable":
-                        # #93: 解けない Content-Encoding は 415 を返す(writer を持つここで送る)。
+                    _rej = {"unscannable": ("415 Unsupported Media Type",
+                                            '{"ok":false,"error":"unsupported content-encoding"}'),
+                            "too_large": ("413 Payload Too Large",
+                                          '{"ok":false,"error":"graphql request too large"}')
+                            }.get(blocked) if isinstance(blocked, str) else None
+                    if _rej:
+                        # #93: 解けない Content-Encoding は 415、#4: graphql_max_bytes 超の GraphQL
+                        #   本文は 413 を返す(writer を持つここで送る)。走査中の総時間超過
+                        #   ("timeout"・#13)と悪性本文は黙って切断する。
                         try:
-                            writer.write(_http_response(
-                                "415 Unsupported Media Type",
-                                '{"ok":false,"error":"unsupported content-encoding"}',
-                                extra=deception.headers_for(ip)))
+                            _page = None
+                            if _wants_html(buf):          # 人向け: 何が駄目で次に何をするか
+                                if blocked == "too_large":
+                                    try:
+                                        from ..lifeform.pipeline import net_shield as _ns5
+                                        _lim = _ns5().graphql_max_bytes(path)
+                                    except Exception:
+                                        _lim = None
+                                    _page = _too_large_page(_lim)
+                                else:
+                                    _page = _notice_page("encoding")
+                            writer.write(_reject_response(_rej[0], _rej[1], _page,
+                                                          extra=deception.headers_for(ip)))
                             await writer.drain()
                         except Exception:
                             pass
@@ -1237,8 +1680,9 @@ class AsyncEdgeGuard:
                         # 枠の壊れた chunked=どこで終わるか backend と一致させられない。転送しない。
                         self.metrics["dropped"] += 1
                         try:
-                            writer.write(_http_response(
+                            writer.write(_reject_response(
                                 "400 Bad Request", '{"error":"malformed chunked body"}',
+                                _notice_page("body") if _wants_html(buf) else None,
                                 extra=deception.headers_for(ip)))
                             await writer.drain()
                         except Exception:
@@ -1263,9 +1707,14 @@ class AsyncEdgeGuard:
                     inbound += len(extra)
                 else:
                     # 本文が cap 超で未読=宣言長ぶんだけ有界転送(#64 の総受信デッドライン尊重)。
+                    #   #33: multipart はここでも全パートのヘッダを検査し、危険なパートは流さない。
+                    #   #13: body_max_sec は本文 *全体* の受信時間=走査フェーズと同じデッドラインを使う
+                    #   (旧実装は新しい body_max_sec を与え、最大ほぼ 2 倍まで保持できた)。
                     res = await asyncio.gather(
                         self._pipe_body_bounded(reader, bwr, remaining, trk,
-                                                self._body_deadline()),
+                                                _bctx["deadline"] if "deadline" in _bctx
+                                                else self._body_deadline(),
+                                                on_body=_bctx.get("on_body")),
                         self._pipe(bre, writer, scan=True, ip=ip, tls=tls, req_host=host))
                     inbound += len(extra) + res[0]
                     outbound += res[1]
@@ -1408,13 +1857,16 @@ class AsyncEdgeGuard:
             i = end + 2                            # チャンク末尾 CRLF を飛ばす
         return bytes(out[:max_out])
 
-    async def _pipe_body_bounded(self, reader, bwr, remaining, chunked, deadline):
+    async def _pipe_body_bounded(self, reader, bwr, remaining, chunked, deadline, on_body=None):
         """宣言された本文長ぶんだけ client→backend へ転送し、それ以降(パイプライン化された後続
         要求)は流さない(#D3)。remaining=残り本文バイト数(Content-Length 時)。chunked=それまでの
         本文を食わせた _ChunkedEnd(終端=last-chunk+trailer の *ちょうど末尾* まで転送。#18)。
         True なら新しい追跡器で始める。総受信デッドライン(#64 body_max_sec)も尊重する。返り値=
-        転送バイト数。本文完了後に write_eof=半クローズ(#46 の bodyless 保証を body 有り要求へ拡張)。"""
+        転送バイト数。本文完了後に write_eof=半クローズ(#46 の bodyless 保証を body 有り要求へ拡張)。
+        on_body(chunk) が True を返したら(#33: 走査 prefix より後ろに危険なパート)そのチャンクから
+        先を流さず backend 接続を閉じる=backend は本文の途中で切れた要求として捨てる。"""
         total = 0
+        aborted = False
         loop = asyncio.get_event_loop()
         if isinstance(chunked, bool):
             chunked = _ChunkedEnd() if chunked else None
@@ -1443,6 +1895,9 @@ class AsyncEdgeGuard:
                     if chunked.bad:
                         break
                 if chunk:
+                    if on_body is not None and on_body(chunk):
+                        aborted = True
+                        break
                     bwr.write(chunk)
                     await bwr.drain()
                     total += len(chunk)
@@ -1454,30 +1909,106 @@ class AsyncEdgeGuard:
                     if remaining <= 0:
                         break
         finally:
-            try:
-                if bwr.can_write_eof():
-                    bwr.write_eof()
-            except Exception:
-                pass
+            if aborted:
+                self._close(bwr)                       # 完了を通知しない=backend へ要求を成立させない
+            else:
+                try:
+                    if bwr.can_write_eof():
+                        bwr.write_eof()
+                except Exception:
+                    pass
         return total
 
-    async def _scan_request_body(self, buf, reader, ip, path=""):
-        """要求ボディの先頭を有界に読んで署名走査する(#61)。返り値 (extra, blocked):
+    @staticmethod
+    def _empty_stream_ok(data: bytes, encoding: str) -> bool:
+        """data が *中身が空のまま正しく終端した* gzip/deflate ストリームか(#35)。途中で切れた
+        ストリーム(_decompress_bounded はこれも b"" を返す)と区別する。"""
+        import zlib
+        enc = (encoding or "").strip().lower()
+        try:
+            if enc in ("gzip", "x-gzip"):
+                rest = data
+                while rest:                            # 連結 gzip(#58)は全メンバが空で終端すること
+                    d = zlib.decompressobj(16 + zlib.MAX_WBITS)
+                    if d.decompress(rest, 1) or not d.eof:
+                        return False
+                    rest = d.unused_data.lstrip(b"\x00")
+                return bool(data)
+            if enc == "deflate":
+                for wbits in (zlib.MAX_WBITS, -zlib.MAX_WBITS):
+                    try:
+                        d = zlib.decompressobj(wbits)
+                        if not d.decompress(data, 1) and d.eof and not d.unused_data:
+                            return True
+                    except zlib.error:
+                        continue
+        except zlib.error:
+            pass
+        return False
+
+    def _upload_stream_check(self, us, sh, ip):
+        """転送中のアップロード検査(#33)。_pipe_body_bounded の on_body に渡すコールバックを返す。
+        危険なパートを見つけたら upload_violation(加点/BAN)し、遮断なら True=そこで転送を止める。
+        監査モード(遮断しない)は 1 回記録したら以後は見ない。検査中の例外は止める側(#111)。"""
+        fired = []
+
+        def on_body(chunk):
+            if fired:
+                return False
+            try:
+                hit = us.feed(chunk)
+                if not hit:
+                    return False
+                fired.append(1)
+                act = sh.upload_violation(ip, *hit).get("action")
+            except Exception:
+                act = "block"
+            if act != "block":
+                return False
+            self.metrics["dropped"] = self.metrics.get("dropped", 0) + 1
+            return True
+        return on_body
+
+    async def _scan_request_body(self, buf, reader, ip, path="", ctx=None):
+        """要求ボディの先頭を有界に読んで検査する(#61 署名・#66 アップロード・#67 GraphQL)。
+        返り値 (extra, blocked):
           · extra … buf を *超えて* 読んだ本文先頭バイト(クリーン時に backend へ転送する分)。
-          · blocked … 悪性(block)と判定=本文を上流へ流さず接続を切るべきか。走査できない
-            Content-Encoding のときは "unscannable"(呼び出し側が 415 を返す・#93)。
-        body_scan 無効なら即 (b"", False)=従来のストリーミングと同一(extra を読まない)。
-        正直な限界: 走査は先頭 cap バイトのみ(巨大本文を全バッファしない)。chunked 本文は走査面
-        では有界復号してから走査する(#D5。backend へは raw 転送)。本文を極端に小出しする回避は
-        slowloris 同様の残余(per-read timeout)。"""
+          · blocked … 本文を上流へ流さず接続を切るべきか。True=悪性。"unscannable"=走査できない
+            Content-Encoding(呼び出し側が 415・#93)。"too_large"=graphql_max_bytes を超える GraphQL
+            本文(413・#4)。"timeout"=走査中に総受信時間(body_max_sec)を超えた(黙って切断・#13)。
+        ctx(dict)を渡すと、本文が prefix の先へ続く multipart のために逐次アップロード検査
+        ctx["on_body"](chunk)->bool(True=そこで転送を止める・#33)を入れて返す。
+        要求ヘッダ Content-Disposition のファイル名(生本文アップロード・T2)は本文を読む前に見る。
+        署名走査・アップロード検査(本文は multipart のみ)・GraphQL ガード(graphql_paths のみ)はそれぞれ
+        自分のキーで効く(#12)。どれも効かない要求は即 (b"", False)=従来のストリーミングと同一。
+        正直な限界: 署名走査は先頭 body_scan_max_bytes のみ(巨大本文を全バッファしない)。GraphQL
+        パスの本文は graphql_max_bytes まで読み切って解析する。chunked 本文は走査面では有界復号して
+        から走査する(#D5。backend へは raw 転送)。Content-Encoding 付きの multipart は解凍できた
+        先頭だけをアップロード検査する。"""
         try:
             from ..lifeform.pipeline import net_shield
             sh = net_shield()
             body_scan_enabled = sh.cfg.get("body_scan_enabled")
+            # #12: アップロード検査(本文を読むのは multipart/* の要求だけ・#10)と GraphQL ガード
+            #   (graphql_paths だけ)は body_scan_enabled と独立に効く。本文を読むのはどれかが効くときだけ。
+            #   Content-Type の重複はどれかが multipart なら multipart とみなす(backend 依存を残さない)。
+            cts = _header_values(buf, b"content-type")
+            mp_ct = next((v for v in cts if v.strip().lower().startswith("multipart/")), "")
+            # T1: 署名走査へ渡す本文の型(バイナリ型+バイナリの中身は走査しない)。重複していたら
+            #   backend がどれを採るか分からないので渡さない(=省略を効かせず走査する)。
+            body_ct = cts[0] if len(cts) == 1 else ""
+            upload_on = bool(mp_ct) and sh.is_enabled() and bool(sh.cfg.get("upload_scan_enabled"))
+            gql_lim = sh.graphql_max_bytes(path)
+            # T2: 生本文アップロード(WordPress REST の /wp/v2/media 等)は要求ヘッダの
+            #   Content-Disposition の filename / filename* が保存名になる。multipart のパートと同じ
+            #   拡張子ポリシーで本文を読む前に見て、拒否なら backend へ何も送らない。
+            req_cd = _header_values(buf, b"content-disposition")
+            if req_cd and sh.scan_upload(ip, b"", disposition=req_cd).get("action") == "block":
+                return b"", True
         except Exception:
             return b"", True   # フェイルクローズ: net_shield 到達不能を「スキャンなし」にしない(#111)。
                                 # 下の走査例外ハンドラと同じ方針(素通しは本文検査の丸ごとバイパスになる)。
-        if not body_scan_enabled:
+        if not (body_scan_enabled or upload_on or gql_lim):
             return b"", False
         try:
             cap = int(sh.cfg.get("body_scan_max_bytes", 65536))
@@ -1488,7 +2019,15 @@ class AsyncEdgeGuard:
         # cap まで read() がブロック=全 POST に head_timeout 分の遅延が乗る(性能バグ)。
         _cl = _header_value(buf, b"content-length")
         content_len = int(_cl) if _cl.isdigit() else None
-        target = cap if content_len is None else min(cap, content_len)
+        chunked_te = "chunked" in _header_value(buf, b"transfer-encoding").lower()
+        # #4: GraphQL パスの本文は graphql_max_bytes まで読み切って *全体* を解析する(prefix で切ると
+        #   JSON が読めず深さ/バッチ上限を素通りした)。宣言長が上限を超える本文は読み足さない
+        #   (inspect_graphql が complete=False で拒否=413)。chunked は枠の分だけ余裕を持って読む。
+        #   multipart は先頭の operations 欄だけが GraphQL なので上限ぶんの先頭を読む。
+        want = cap
+        if gql_lim and (mp_ct or content_len is None or content_len <= gql_lim):
+            want = max(cap, gql_lim + 1 + (65536 if chunked_te else 0))
+        target = want if content_len is None else min(want, content_len)
         prefix = bytearray(body_in_buf)
         extra = bytearray()
         # #82: 走査読取にも *総* デッドラインを課す。per-read だけだと走査フェーズでボディを小出しして
@@ -1496,12 +2035,14 @@ class AsyncEdgeGuard:
         loop = asyncio.get_event_loop()
         deadline = (loop.time() + float(sh.cfg.get("body_max_sec", 60))
                     if sh.cfg.get("body_timeout_enabled", True) else None)
+        if ctx is not None:
+            ctx["deadline"] = deadline                 # 残りの転送も同じ総デッドラインで(#13)
         timed_out = False
         # chunked は枠を逐次解析し、本文の終端(trailer 込み)に達したら読み止める(#18)。旧実装は
         # 読取が '0\r\n\r\n' で *ちょうど終わる* ときしか完了と見なさず、終端の後ろにパイプライン
         # 第2要求が続くと head_timeout まで待って正規の送信者を slow_body 加点までしていた。
         trk = None
-        if content_len is None and "chunked" in _header_value(buf, b"transfer-encoding").lower():
+        if content_len is None and chunked_te:
             trk = _ChunkedEnd()
             trk.feed(body_in_buf)
         while len(prefix) < target and not (trk is not None and (trk.done or trk.bad)):
@@ -1524,7 +2065,10 @@ class AsyncEdgeGuard:
             if trk is not None:
                 trk.feed(chunk)                        # 終端/破損に達したら次の周回で止まる
         if timed_out:
-            self._on_slow_body(ip)                     # 総時間超過=切断+加点(R-U-Dead-Yet 走査版)
+            # 総時間超過=切断+加点(R-U-Dead-Yet 走査版)。旧実装は加点だけして部分本文を backend へ
+            # 転送し、続きを新しい body_max_sec で待っていた(#13)。ここで切る(backend は受信せず)。
+            self._on_slow_body(ip)
+            return bytes(extra), "timeout"
         blocked = False
         try:
             pb = bytes(prefix)
@@ -1534,23 +2078,28 @@ class AsyncEdgeGuard:
                 pb = pb[:content_len]
             elif trk is not None and trk.done:
                 pb = pb[:trk.consumed]
+            raw = pb                                   # 転送する生の本文(逐次アップロード検査の起点)
+            complete = (len(prefix) >= content_len if content_len is not None
+                        else (trk.done if trk is not None else True))
+            dmax = max(cap, gql_lim + 1) if gql_lim else cap   # GraphQL は上限+1 まで復号して超過を知る
             # #D5: chunked 本文は *復号後* を走査する(境界分割による body-scan 回避封じ)。
             #   Content-Encoding 解凍より前に行う(ワイヤ上は chunk 枠の内側に gzip 等が入る)。
             #   原本(extra)は backend へ raw のまま転送。破損チャンクは fail closed。
-            if sh.cfg.get("body_decode_enabled", True) \
-                    and "chunked" in _header_value(buf, b"transfer-encoding").lower():
-                dec = self._dechunk_bounded(pb, cap)
+            if sh.cfg.get("body_decode_enabled", True) and chunked_te:
+                dec = self._dechunk_bounded(pb, dmax)
                 if dec is None:
                     return bytes(extra), True      # 破損チャンクストリーム=フェイルクローズ(#111)
                 pb = dec
             # #74: Content-Encoding で圧縮された本文は解凍後を走査する(gzip 化 payload の回避封じ)。
             #   解凍は有界(max_length)=zip bomb 耐性。原本(pb)は backend へそのまま転送する。
+            enc = _header_value(buf, b"content-encoding").strip().lower()
+            encoded = enc not in ("identity", "")
             if sh.cfg.get("body_decode_enabled", True):
-                enc = _header_value(buf, b"content-encoding")
-                if enc and enc.strip().lower() not in ("identity", ""):
-                    dec = self._decompress_bounded(pb, enc,
-                                                   int(sh.cfg.get("body_scan_max_bytes", 65536)))
-                    if dec:
+                if encoded:
+                    dec = self._decompress_bounded(pb, enc, dmax)
+                    # 解凍結果 b"" は『正しく終端した空の本文』のときだけ走査可能(#35)。途中で切れた/
+                    # 巨大な gzip ヘッダで prefix 内に中身が出ない本文まで空とみなすと素通りになる。
+                    if dec or (dec == b"" and complete and self._empty_stream_ok(pb, enc)):
                         pb = dec                       # 解凍できたら解凍後を走査面に
                     elif sh.cfg.get("body_reject_unscannable_encoding", True):
                         # 解けない符号化(br 等)のボディを *圧縮バイトのまま* 走査しても
@@ -1562,11 +2111,25 @@ class AsyncEdgeGuard:
                         self.metrics["body_unscannable"] = self.metrics.get(
                             "body_unscannable", 0) + 1
                         return bytes(extra), "unscannable"
-            blocked = sh.inspect_body(ip, pb).get("action") == "block"
-            if not blocked:                            # #66: 危険なアップロード拡張子も拒否
-                blocked = sh.scan_upload(ip, pb).get("action") == "block"
-            if not blocked:                            # #67: GraphQL の深さ/複雑度/イントロスペクション
-                blocked = sh.inspect_graphql(ip, path, pb).get("action") == "block"
+            kw = {"content_type": body_ct} if body_ct else {}   # 型の無い要求は従来どおりの呼び方
+            blocked = sh.inspect_body(ip, pb, **kw).get("action") == "block"   # 無効なら allow
+            if not blocked and upload_on:              # #66: 危険なアップロード拡張子も拒否
+                us = None if encoded else sh.upload_scanner(mp_ct, pb, chunked_te)
+                if us is None:
+                    # 圧縮された multipart は解凍できた先頭だけを見る(逐次解凍はしない=正直な限界)
+                    blocked = sh.scan_upload(ip, pb, mp_ct).get("action") == "block"
+                else:
+                    hit = us.feed(raw)                 # 生の本文(chunked は枠を解いて)のパートヘッダ
+                    if hit:
+                        blocked = sh.upload_violation(ip, *hit).get("action") == "block"
+                    elif not complete and ctx is not None:
+                        ctx["on_body"] = self._upload_stream_check(us, sh, ip)
+            if not blocked and gql_lim:                # #67: GraphQL の深さ/複雑度/イントロスペクション
+                g = sh.inspect_graphql(ip, path, pb, mp_ct or _header_value(buf, b"content-type"),
+                                       complete=complete).get("action")
+                if g == "reject":
+                    return bytes(extra), "too_large"   # #4: 上限超=読み切れない=検査できない(413)
+                blocked = g == "block"
         except Exception:
             # フェイルクローズ: 走査中の例外を「非悪性」にしない(#111)。素通しすると
             # 本文スキャン(SQLi/アップロード/GraphQL検査)が丸ごとバイパスされる。
@@ -1589,13 +2152,16 @@ class AsyncEdgeGuard:
             pass
         return self._close(writer)
 
-    async def _handle_appeal(self, ip, path, sh, writer):
+    async def _handle_appeal(self, ip, path, sh, writer, html: bool = False):
         """解除リクエスト(異議申立)を受け付ける。?reason=... を submit_appeal へ。
         判定の手前にある経路ゆえ、CPU枯渇フラッド対策として **BAN されていないIPには
-        重い遮断ページ(_block_page)を生成せず**、bloom O(1) で軽量拒否する。"""
+        重い遮断ページ(_block_page)を生成せず**、bloom O(1) で軽量拒否する。
+        html=True(ブラウザ)には『ブロックされていない・戻って再読み込み』の短い案内
+        (state を読まない静的な文言のみ=軽量のまま)。"""
         if not sh.is_banned_fast(ip):            # bloom: 確実に未BAN→state も作らず即軽量応答
-            writer.write(_http_response("403 Forbidden",
-                                        '{"error":"no active ban for this address"}'))
+            writer.write(_reject_response("403 Forbidden",
+                                          '{"error":"no active ban for this address"}',
+                                          _notice_page("not_banned") if html else None))
             try:
                 await writer.drain()
             except Exception:
@@ -1655,9 +2221,9 @@ class AsyncEdgeGuard:
                     deadline: float = None, tls: bool = False, req_host: str = "") -> int:
         total = 0
         # 出口DLP(evolution #6): 応答方向のみ、先頭を有界走査して秘密情報漏洩を検出。
-        # pending = 走査済みだが *まだ送っていない* 末尾窓(#42)。境界を跨ぐ秘密の頭を先に
-        # 送ってしまわないため、末尾64Bは次チャンクで安全確認できるまで保留する(block で確実に止める)。
-        sh, budget, pending = None, 0, b""
+        # 本文の走査・保留・符号化の扱いは _DlpStream(#1/#27/#42/#47/#48)。head は CRLFCRLF で
+        # 閉じるので丸ごと走査して即送る(#59)。dlp=None=走査しない(既定=従来とバイト完全同一)。
+        dlp = None
         sec_cfg = None                            # 応答 head 加工(#12/#65/#69)の cfg
         add_sec, harden_ck, harden_cors, harden_redir = False, False, False, False
         if scan:
@@ -1665,7 +2231,9 @@ class AsyncEdgeGuard:
                 from ..lifeform.pipeline import net_shield
                 s = net_shield()
                 if s.dlp_active():
-                    sh, budget = s, int(s.cfg.get("dlp_max_scan_bytes", 262144))
+                    budget = int(s.cfg.get("dlp_max_scan_bytes", 262144))
+                    if budget > 0:
+                        dlp = _DlpStream(s, ip, budget)
                 add_sec = bool(s.cfg.get("sec_headers_enabled"))
                 harden_ck = bool(s.cfg.get("cookie_harden_enabled"))
                 harden_cors = bool(s.cfg.get("cors_harden_enabled"))
@@ -1680,8 +2248,10 @@ class AsyncEdgeGuard:
                 except Exception:
                     pass
             except Exception:
-                sh, sec_cfg = None, None
-        head_done = sec_cfg is None               # 無効なら head 処理を飛ばし従来とバイト完全同一
+                dlp, sec_cfg = None, None
+        # head 加工も DLP も無効なら head 処理を飛ばし従来とバイト完全同一。DLP は本文の扱い
+        # (chunked/SSE/Content-Encoding)を最終 head から読むので head を区切る(無加工で送る)。
+        head_done = sec_cfg is None and dlp is None
         hbuf = b""
         # 応答アウェア脅威スコア(#60): 応答ステータス行を *覗き見* して NetShield へ還元する。
         # sec_headers/DLP の有無に依らず動く軽量ピーク(先頭行のみ・バイトは一切改変しない)。
@@ -1700,16 +2270,32 @@ class AsyncEdgeGuard:
                     except asyncio.TimeoutError:
                         self._on_slow_body(ip)
                         break
+                elif dlp is not None and dlp.pending:
+                    # block の保留窓がある: backend が黙ったら保留分を放出する(#27)。読取は
+                    # 取り消さずに待ち続ける(取り消すと届きかけのデータを失い得る)。
+                    rd = asyncio.ensure_future(src.read(65536))
+                    try:
+                        done, _ = await asyncio.wait((rd,), timeout=_DLP_HOLD_IDLE)
+                        if not done:
+                            await self._send(dst, dlp.release(), ip)
+                        chunk = await rd
+                    except BaseException:
+                        rd.cancel()
+                        raise
                 else:
                     chunk = await src.read(65536) # 64KiB=syscall/await 往復を削減(I/O律速)
                 if not chunk:
                     if hbuf:                      # head 未完のまま EOF=残りを取りこぼさず放出
-                        if sh is not None and budget > 0:   # ただし DLP は通す(#59)
-                            kinds = sh.scan_leak(hbuf)
-                            if kinds and sh.note_leak(ip, kinds).get("action") == "block":
+                        if dlp is not None:       # ただし DLP は通す(#59)
+                            kinds = dlp.sh.scan_leak(hbuf)
+                            if kinds and dlp.sh.note_leak(ip, kinds).get("action") == "block":
                                 break
                         await self._send(dst, hbuf, ip)
                         hbuf = b""
+                    elif dlp is not None:         # EOF=本当の終端: 未判定の末尾を判定して放出
+                        out, stop = dlp.eof()
+                        if out and not stop:
+                            await self._send(dst, out, ip)
                     break
                 total += len(chunk)               # 転送バイトを計上(漏洩量算定)
                 if report_status and not st_done:   # 応答ステータス行を覗き見て #60 へ
@@ -1760,10 +2346,14 @@ class AsyncEdgeGuard:
                             # リダイレクト無害化がまとめて外れた。
                             out_head, hbuf = hbuf[:idx + 4], hbuf[idx + 4:]
                         else:
-                            new_head = inject_security_headers(hbuf[:idx], sec_cfg, tls=tls,
-                                                               add_headers=add_sec,
-                                                               harden_cookies=harden_ck,
-                                                               harden_cors=harden_cors)
+                            new_head = hbuf[:idx]
+                            if dlp is not None:       # 本文の扱い(chunked/SSE/符号化)を読む
+                                dlp.head(new_head)
+                            if sec_cfg is not None:
+                                new_head = inject_security_headers(new_head, sec_cfg, tls=tls,
+                                                                   add_headers=add_sec,
+                                                                   harden_cookies=harden_ck,
+                                                                   harden_cors=harden_cors)
                             if harden_redir:          # #71: オープンリダイレクト無害化
                                 new_head = self._apply_redirect_policy(new_head, req_host, ip)
                             out_head, chunk = new_head + b"\r\n\r\n", hbuf[idx + 4:]
@@ -1772,43 +2362,29 @@ class AsyncEdgeGuard:
                         # 送っていたため、head 加工が有効(cookie/CORS 加工は既定 ON)だと応答
                         # ヘッダの秘密(X-Debug-Key・Set-Cookie のトークン等)が素通りした。
                         # head は CRLFCRLF で閉じるので body 側の保留窓は要らない=従来どおり即送る。
-                        if sh is not None and budget > 0:
-                            kinds = sh.scan_leak(out_head)
+                        if dlp is not None:
+                            kinds = dlp.sh.scan_leak(out_head)
                             if kinds:
-                                if sh.note_leak(ip, kinds).get("action") == "block":
+                                if dlp.sh.note_leak(ip, kinds).get("action") == "block":
                                     leak_stop = True
                                     break
-                                sh = None         # audit: 記録したら走査停止(body 経路と同じ)
+                                dlp = None        # audit: 記録したら走査停止(body 経路と同じ)
                         await self._send(dst, out_head, ip)
                     if leak_stop:
                         break
                     if not chunk:
                         continue
-                if sh is not None and budget > 0:
-                    seg = pending + chunk         # 保留(未送信)末尾窓 + 今回 を一括走査
-                    kinds = sh.scan_leak(seg)
-                    if kinds:
-                        # block: 保留分(=境界跨ぎ秘密の頭になり得る)も送らず切断=秘密を一切出さない。
-                        if sh.note_leak(ip, kinds).get("action") == "block":
-                            pending = b""
-                            break
-                        sh = None                 # audit: 記録したら走査停止。保留含め流す。
-                        await self._send(dst, seg, ip)
-                        pending = b""
-                        continue
-                    # clean: 末尾64B(次チャンクと跨ぐ秘密の頭になり得る)を保留、それ以外を送出。
-                    budget -= len(chunk)
-                    out, pending = seg[:-64], seg[-64:]
+                if dlp is not None:
+                    # 本文: 走査して送ってよい分だけ送る(block の漏洩=保留分も含め送らず切断)。
+                    out, stop = dlp.feed(chunk)
+                    if stop:
+                        break
                     if out:
                         await self._send(dst, out, ip)
-                    if budget <= 0:               # 走査終了=保留を放出し以降は素通し
-                        if pending:
-                            await self._send(dst, pending, ip)
-                        pending = b""; sh = None
+                    if not dlp.active:            # audit で記録済み / budget 終了=以降は素通し
+                        dlp = None
                     continue
                 await self._send(dst, chunk, ip)
-            if pending:                           # EOF: 保留していた末尾窓を最後に放出
-                await self._send(dst, pending, ip)
         except Exception:
             pass
         finally:

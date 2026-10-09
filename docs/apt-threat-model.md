@@ -78,8 +78,10 @@ export DUCKNET_ORIGIN_KEY="$(vault read -field=k secret/ducknet/origin)"
 ## 5. 状態改竄検知(#52–#55)
 
 状態ファイル(BAN/設定)は HMAC 署名され、無署名/改竄されたものは fail-safe で破棄されます(`state_tamper` イベント)。
-in-memory の cfg すり替えも MAC で検知し、ディスクの署名済み状態から自動復元します(`memory_tamper`)。ダッシュボード
-`GET /api/shield/tamper` で要約と直近イベントを確認できます。
+in-memory の cfg すり替えも MAC で検知し、ディスクの署名済み状態から自動復元します(`memory_tamper`)。ディスクも
+同時に改竄されていて検証できなければ最後に MAC が一致した cfg を保ち(それも照合できなければ既定値+防御 ON)、
+起動時に署名保存の実績がある設定ファイルを検証できないときも既定値+防御 ON で起動します(fail-closed・
+docs/hardening.md 1.4)。ダッシュボード `GET /api/shield/tamper` で要約と直近イベントを確認できます。
 
 ## 6. ホスト侵害後の横展開抑止(DuckNet を中継地点/C2 として使わせない)
 

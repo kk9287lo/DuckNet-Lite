@@ -155,10 +155,13 @@ def test_on_slow_body_penalizes():
     from dataplane.engine.lifeform.pipeline import net_shield
     g = AsyncEdgeGuard()
     sh = net_shield()
+    prev = sh.cfg.get("enabled")
+    sh.cfg["enabled"] = True                 # 加点はシールド ON のときだけ(OFF=完全パススルー・#28)
     try:
         g._on_slow_body("198.51.100.77")
         assert sh._decayed_score(sh._state("198.51.100.77")) > 0   # 加点された
     finally:
+        sh.cfg["enabled"] = prev
         with sh._lock:
             sh._ips.pop("198.51.100.77", None)
 

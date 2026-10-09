@@ -7,6 +7,9 @@ __main__.py — DuckNet-Lite: システムトレイ常駐(トレイのみ・依�
   · About              … 製品/版の情報(Win32 MessageBox)
   · 無料版でできること   … このエディションで使える機能一覧(上位版との差は README/❓ヘルプ参照)
   · 終了               … 本launcher が起動した本体を停止し、トレイを外してプロセス終了
+防御の状態は 5 秒ごとに管理APIから読み、アイコン(ON=通常 / それ以外=淡色)とツールチップで示す
+(「防御 ON」「防御 OFF」「ゲートウェイに接続できません」「状態を確認できません(トークン不一致)」)。
+ON/OFF の切替そのものはダッシュボードで行う(トレイには持たせない)。
 起動時、本体(ゲートウェイ)が未起動なら子プロセスとして一緒に立ち上げる(既に稼働中なら起動しない)。
 backend/listen は env DUCKNET_BACKEND / DUCKNET_LISTEN で上書き可(既定 127.0.0.1:8080 / 8443)。
 上位版のようなコントロールパネルは持たない(Lite=最小構成)。Windows 専用(他 OS はトレイ非対応の旨を表示)。
@@ -25,7 +28,7 @@ import urllib.error
 import urllib.request
 from urllib.parse import urlparse
 
-from . import tray, ASSET_ICO
+from . import tray, ASSET_ICO, ASSET_ICO_OFF
 
 # 接続先・表示名は main() の中で(app.env の取り込み後に)読む。import 時に固めていた頃は
 # `python -m dataplane.gui` で app.env の DUCKNET_ADMIN_URL / DUCKNET_COVER が効かなかった。
@@ -78,6 +81,109 @@ def _asset_path(name: str) -> str:
         except Exception:
             pass
     return bundled
+
+
+def _status_icons():
+    """(通常, 淡色) アイコンのパス。淡色版は通常版と *同じ場所* から探す: DUCKNET_ICON_DIR で
+    独自のアイコン(偽装名運用など)に差し替えているのに、OFF の時だけ同梱の鴨が出ると製品が
+    露見する。同じ場所に淡色版が無ければ通常アイコンのまま(状態はツールチップで分かる)。"""
+    on = _asset_path(ASSET_ICO)
+    off = os.path.join(os.path.dirname(on), ASSET_ICO_OFF)
+    try:
+        return on, (off if os.path.isfile(off) else on)
+    except Exception:
+        return on, on
+
+
+# ── 防御状態の表示(トレイのアイコン/ツールチップ) ──────────────────────
+STATE_ON, STATE_OFF, STATE_DOWN, STATE_AUTH = "on", "off", "unreachable", "auth"
+_POLL_SEC = 5.0                    # 状態の再取得間隔(秒)。初回は起動直後に即時
+_FETCH_TIMEOUT = 2.0
+_METRICS_MAX = 64 * 1024           # 読む上限(ducknet_shield_enabled は先頭近くにある)
+_STATUS_TEXT = {
+    STATE_ON: "防御 ON / Protection ON",
+    STATE_OFF: "防御 OFF(ダッシュボードで ON にできます)/ Protection OFF",
+    STATE_DOWN: "ゲートウェイに接続できません / Gateway unreachable",
+    STATE_AUTH: "状態を確認できません(管理トークン不一致)/ Status unknown (token mismatch)",
+}
+
+
+def _status_view(state: str, brand=None):
+    """防御状態 → (ツールチップ, アイコン名)。ON だけ通常アイコン、それ以外(OFF・接続不可・
+    トークン不一致)は淡色=「守られていない/守られているか分からない」を同じ見た目にまとめる。
+    想定外の値は接続不可と同じ扱い(ON と誤表示しない)。ブランド名は DUCKNET_COVER に従い、
+    長すぎる名前はブランド側を詰めて状態の文言を残す(szTip は 127 文字)。"""
+    if state not in _STATUS_TEXT:
+        state = STATE_DOWN
+    b = _brand() if brand is None else brand
+    return (tray.fit_tip(b, " — " + _STATUS_TEXT[state]),
+            ASSET_ICO if state == STATE_ON else ASSET_ICO_OFF)
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """リダイレクトに従わない(管理トークンを載せた要求を別の宛先へ持ち出させない。urllib の
+    既定は X-Token ごと追従する)。3xx はそのまま HTTPError になり「接続できない」扱い。"""
+
+    def redirect_request(self, *a, **kw):
+        return None
+
+
+def _parse_shield_enabled(body: bytes) -> str:
+    """/api/metrics(plain-text の露出形式)から `ducknet_shield_enabled 1|0` を読む。
+    見つからない・値が 0/1 でない応答は「接続できない」扱い(本製品の応答ではない)。"""
+    for line in body.decode("utf-8", "replace").splitlines():
+        parts = line.split()
+        if len(parts) == 2 and parts[0] == "ducknet_shield_enabled":
+            return {"1": STATE_ON, "0": STATE_OFF}.get(parts[1], STATE_DOWN)
+    return STATE_DOWN
+
+
+def _fetch_shield_state(base_url: str, token: str, timeout: float = _FETCH_TIMEOUT) -> str:
+    """管理APIからシールドの有効状態を 1 回読む。戻り値は STATE_*(例外は出さない)。
+    使うのは GET /api/metrics: 認証付きで shield_enabled を返す中で最も軽い(/api/state は
+    イベント・上位送信元・BAN 一覧まで組み立てる)。プロキシは通さない(_admin_is_ours と同じ
+    理由に加え、ここは X-Token を載せる=トークンがプロキシとそのログへ平文で渡る)。"""
+    try:
+        from ..engine.core.netaddr import url as _url
+        host, port = _admin_addr(base_url)
+        req = urllib.request.Request(_url(host, port, "/api/metrics"))
+        if token:
+            req.add_header("X-Token", token)
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect())
+        with opener.open(req, timeout=timeout) as r:
+            body = r.read(_METRICS_MAX)
+    except urllib.error.HTTPError as e:
+        try:
+            e.close()
+        except Exception:
+            pass
+        return STATE_AUTH if e.code == 401 else STATE_DOWN
+    except Exception:
+        return STATE_DOWN                         # 接続拒否・タイムアウト・URL 不正など
+    if not token:
+        return STATE_DOWN                         # 本製品は無認証に 200 を返さない=別物の待受
+    return _parse_shield_enabled(body)
+
+
+def _poll_status(fetch, show, stop, interval: float = _POLL_SEC) -> None:
+    """fetch() で防御状態を取り、*変わった時だけ* show(state) を呼ぶ。初回は即時、以後 interval
+    秒ごと、stop(threading.Event)が立ったら抜ける。fetch/show の例外ではループを止めない
+    (fetch の例外は接続不可として表示し、show が失敗した状態は次の周回でもう一度表示する)。"""
+    last = None
+    while not stop.is_set():
+        try:
+            state = fetch()
+        except Exception:
+            state = STATE_DOWN
+        if state not in _STATUS_TEXT:
+            state = STATE_DOWN
+        if state != last and not stop.is_set():  # 終了後に消えかけのトレイを触らない
+            try:
+                show(state)
+                last = state
+            except Exception:
+                pass
+        stop.wait(interval)
 
 
 def _msgbox(text: str, title: str) -> None:
@@ -300,7 +406,8 @@ def main(argv=None) -> int:
                 stop.set()
 
     try:
-        ti = tray.TrayIcon(_asset_path(ASSET_ICO), brand, items, _on_action)
+        on_ico, off_ico = _status_icons()
+        ti = tray.TrayIcon(on_ico, brand, items, _on_action)
     except BaseException:                          # 構築失敗でも起動した本体を孤児にしない
         _stop_child(gw)
         raise
@@ -308,11 +415,27 @@ def main(argv=None) -> int:
         print("トレイの起動に失敗しました。", file=sys.stderr)
         _stop_child(gw)
         return 1
+
+    # 防御状態の表示: 管理APIを定期的に読み、変わった時だけアイコン/ツールチップを替える。
+    # トークンは本体の起動/確認に使ったもの(_ensure_gateway の戻り値)。表示の失敗で
+    # トレイや本体を巻き込まない(ポーラは例外を外へ出さない・デーモン・終了で止まる)。
+    def _show(state):
+        tip, name = _status_view(state, brand)
+        ti.set_status(tip, on_ico if name == ASSET_ICO else off_ico)
+
+    try:
+        threading.Thread(target=_poll_status,
+                         args=(lambda: _fetch_shield_state(admin_url, _tok), _show, stop),
+                         kwargs={"interval": _POLL_SEC},
+                         daemon=True, name="tray-status").start()
+    except Exception:
+        pass
     try:
         stop.wait()                      # 終了が選ばれるまでメインスレッドを生かす
     except KeyboardInterrupt:
         ti.stop()
     finally:
+        stop.set()                       # Ctrl-C で抜けた時も状態ポーラを止める
         _stop_child(gw)                  # 本launcher が起動した本体を停止(既存稼働は触らない)
     return 0
 

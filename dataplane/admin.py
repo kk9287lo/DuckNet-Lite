@@ -20,7 +20,6 @@ import http.cookies
 import json
 import math
 import os
-import re
 import secrets
 import sys
 import threading
@@ -787,13 +786,28 @@ def _make_handler(app: AdminDashboard):
                 elif path == "/api/shield/config":
                     r = sh.set_config(**{k: v for k, v in b.items()})
                 elif path == "/api/shield/optional_sig":
-                    r = sh.set_optional_signature(b.get("name", ""), bool(b.get("on")))
+                    # 'on' は _BOOL_KEYS で JSON の真偽値と確かめ済み。bool() で包まずそのまま渡す
+                    # (セッターも bool 以外を拒否する・#57)。
+                    r = sh.set_optional_signature(b.get("name", ""), b.get("on"))
                 elif path == "/api/shield/paranoia":
-                    r = sh.set_paranoia(b.get("level", 1))
+                    # level は必須(欠落を既定 1=任意署名を全 OFF として実行しない)。復元用の
+                    # optional_sigs は {名前: true/false} だけ("false" を bool() で ON にしない・#57)。
+                    # どちらかが不正なら何も適用せず 400。
+                    opt = b.get("optional_sigs")
+                    if "level" not in b:
+                        self._send(400, _j({"ok": False, "error": "'level' is required (1-4)"}))
+                        return
+                    if opt is not None and not (isinstance(opt, dict) and
+                                                all(isinstance(v, bool) for v in opt.values())):
+                        self._send(400, _j({"ok": False, "error":
+                                            "'optional_sigs' must map names to true or false"}))
+                        return
+                    r = sh.set_paranoia(b["level"])
                     # 監査ログの「元に戻す」は変更前の optional_sigs を同梱する(#69)。プリセットで
                     # 上書きされた個別設定を、検証済みセッター経由で変更前どおりに戻す。
-                    opt = b.get("optional_sigs")
-                    if isinstance(opt, dict):
+                    # set_paranoia が拒否した(ok:False)時は復元もしない(r を状態で上書きすると
+                    # 失敗が成功に化けて監査ログへ載った)。
+                    if isinstance(opt, dict) and r.get("ok", True) is not False:
                         cur = dict(sh.cfg.get("optional_sigs") or {})
                         for name in sorted(set(cur) | set(opt)):
                             if bool(opt.get(name)) != bool(cur.get(name)):
@@ -828,15 +842,10 @@ def _make_handler(app: AdminDashboard):
                     # カスタムシグネチャの試験(状態は一切変更しない・読み取り専用)。まず既存の
                     # validate_pattern(ReDoS/安全性検査)へ通し、危険なパターンは
                     # コンパイル/マッチすら試みない(危険パターンを試験名目で実行させない)。
-                    pattern, sample = b.get("pattern", ""), str(b.get("sample", ""))[:4096]
-                    err = sh.validate_pattern(pattern)
-                    if err:
-                        r = {"ok": True, "matches": False, "error": err}
-                    else:
-                        try:
-                            r = {"ok": True, "matches": bool(re.search(pattern, sample)), "error": None}
-                        except re.error as e:
-                            r = {"ok": True, "matches": False, "error": str(e)}
+                    # 照合は live と同じ(走査面の正規化+大小無視)。生サンプルへの re.search は
+                    # 実際には永久に当たらない規則を「一致」と表示していた(#30)。
+                    r = sh.dry_run_signature(b.get("pattern", ""),
+                                             str(b.get("sample", ""))[:4096])
                 else:
                     self._send(404, _j({"ok": False, "error": "not found"}))
                     return
@@ -1306,7 +1315,7 @@ th.sortable .sortarrow{display:inline-block;width:9px;font-size:9px;color:var(--
     <div class="sect"><span class="ic">🔬</span>詳細分析</div>
     <section class="panel wide">
       <div class="phead"><h2>詳細分析</h2></div>
-      <div class="pbody"><pre class="code" id="analysis"></pre></div>
+      <div class="pbody"><div id="analysis"></div></div>
     </section>
     <section class="panel wide">
       <div class="phead"><h2>変更履歴(監査ログ)</h2><span class="meta" id="auditmeta">—</span></div>
@@ -1421,7 +1430,7 @@ const JA2EN={
  "インターネット(public)を一括遮断します。よろしいですか?":"Block all public (internet) traffic. Are you sure?",
  "(DUCKNET_DECEPTION 未設定 = 偽装なし)":"(DUCKNET_DECEPTION unset = no deception)",
  "サンプル攻撃者":"Sample attacker","から見える偽装(隣接窓で必ず別系統):":"sees this deception (adjacent windows always differ):",
- "残":"remaining ","組込":"built-in","カスタム":"custom","危険除外":"unsafe-excluded",
+ "残":"remaining ","組込":"built-in","カスタム":"custom","停止中":"inactive","注意":"note",
  "(兆候なし)":"(no indicators)","本機":"This host","失敗":"failed",
  "改竄検知":"Tamper detection","直近":"Last",
  /* トースト/確認ダイアログ/汎用保存文言 */
@@ -1471,7 +1480,19 @@ const JA2EN={
  "すべての承認待ち接続を承認します。よろしいですか?":"Approve all pending connections. Are you sure?",
  "すべて承認しました":"Approved all","すべて拒否しました":"Denied all",
  "上限接続数/IP(0=無制限)":"Max conns/IP (0=unlimited)","新規接続/秒/IP(0=無制限)":"New conns/sec/IP (0=unlimited)",
- "全体同時接続上限(0=無制限)":"Total conn limit (0=unlimited)","keep-alive を強制切断":"Force keep-alive close"};
+ "全体同時接続上限(0=無制限)":"Total conn limit (0=unlimited)","keep-alive を強制切断":"Force keep-alive close",
+ /* 詳細分析の節見出し */
+ "上位シグネチャ":"Top signatures","イベント種別":"Event kinds",
+ /* 送信失敗の説明(何が起きたか+次の一手) */
+ "ゲートウェイに接続できません。ゲートウェイが起動しているか確認してください":
+  "Cannot reach the gateway. Check that it is running.",
+ "認証が切れました。ページを再読み込みしてください(別の端末からは、ゲートウェイ起動時に表示されたトークン付きURLで開き直してください)":
+  "Your session has expired. Reload the page (from another machine, reopen the URL with the token printed when the gateway started).",
+ "この開き方では変更を受け付けません。ダッシュボードのアドレスを直接開き直してください":
+  "Changes are refused from how this page was opened. Open the dashboard address directly.",
+ "ゲートウェイがエラーを返しました。ゲートウェイのログを確認してください":
+  "The gateway returned an error. Check the gateway log.",
+ "完了できなかった操作があります":"Some operations did not complete"};
 let LANG="ja";try{LANG=localStorage.getItem("fn-lang")||"ja"}catch(e){}
 function tr(s){if(LANG!=="en"||s==null)return s;const k=String(s).trim();return JA2EN[k]!==undefined?JA2EN[k]:s;}
 function applyStatic(){
@@ -1524,11 +1545,33 @@ $("helpOverlay").onclick=e=>{if(e.target===$("helpOverlay"))$("helpOverlay").sty
 $("lang").textContent=LANG==="en"?"日本語":"EN";
 $("help").title=LANG==="en"?"Usage / capabilities":"使い方 / できること";
 $("help").setAttribute("aria-label",LANG==="en"?"Help":"ヘルプ");applyStatic();
-async function post(p,b){return (await fetch(p,{method:"POST",headers:H,body:JSON.stringify(b)})).json()}
+/* 送信失敗の説明: 生の例外文字列(TypeError: Failed to fetch)・401 の {"error":"token required"}・
+   5xx の内部メッセージをそのまま見せず、何が起きたか+次の一手を平文で返す。 */
+function errText(kind,status){
+ if(kind==="net")return tr("ゲートウェイに接続できません。ゲートウェイが起動しているか確認してください");
+ if(kind==="auth")return tr("認証が切れました。ページを再読み込みしてください(別の端末からは、ゲートウェイ起動時に表示されたトークン付きURLで開き直してください)");
+ if(kind==="origin")return tr("この開き方では変更を受け付けません。ダッシュボードのアドレスを直接開き直してください");
+ return tr("ゲートウェイがエラーを返しました。ゲートウェイのログを確認してください")+(status?" (HTTP "+status+")":"");
+}
+// 例外は投げない(呼び出し側は {ok,error} だけ見ればよい)。以前は通信断や本文が JSON でない応答
+// (前段プロキシの 502 等)で例外が素通りし、一括操作は途中で止まったまま何も言わなかった。
+async function post(p,b){
+ let resp;
+ try{resp=await fetch(p,{method:"POST",headers:H,body:JSON.stringify(b)});}
+ catch(e){return {ok:false,error:errText("net")};}
+ if(resp.status===401){markAuthError();return {ok:false,authFail:true,error:errText("auth")};}
+ if(resp.status===403||resp.status===421)return {ok:false,error:errText("origin")};
+ let r=null;try{r=await resp.json();}catch(e){}
+ if(!r||typeof r!=="object"||Array.isArray(r)||resp.status>=500)return {ok:false,error:errText("http",resp.status)};
+ // 4xx/2xx の r.error はサーバが運用者向けに書いた検証メッセージなのでそのまま見せる
+ if(!resp.ok){r.ok=false;if(typeof r.error!=="string"||!r.error)r.error=errText("http",resp.status);}
+ return r;
+}
 // 認証エラー(401 / {ok:false})はネットワーク断とは別物として扱う: cookie失効・トークン不一致等
 // (例: サーバ再起動でトークンが再生成された)で接続断ではなくデータが"正常"に見えてしまうのを防ぐ。
 function isAuthFail(e){return !!(e&&e.authFail)}
-function markAuthError(){$("conn").className="pill bad";$("connt").textContent=tr("認証エラー・再読込");}
+function markAuthError(){$("conn").className="pill bad";$("connt").textContent=tr("認証エラー・再読込");
+ $("conn").title=errText("auth");}
 async function guardedFetch(path){
  const resp=await fetch(path,{headers:H});
  let data=null;try{data=await resp.json()}catch(e){}
@@ -1554,12 +1597,11 @@ function busy(btn,on){
  else{btn.disabled=false;btn.classList.remove("busy");delete btn.dataset.obusy;}
 }
 /* post + トースト: 成否をトーストで知らせ、btn があれば送信中ビジー表示する。既存の post()
-   はそのまま(内部/連続呼び出し用)に残し、ユーザー操作の起点はこちらへ寄せる。post() 自体は
-   例外を投げても(このダッシュボードの post() は sibling と違い try/catch していない)ここで
-   捕まえてトースト表示に落とす。 */
+   はそのまま(内部/連続呼び出し用)に残し、ユーザー操作の起点はこちらへ寄せる。post() は失敗を
+   平文の {ok:false,error} で返す(念のため例外も捕まえ、生の例外文字列は出さない)。 */
 async function postT(p,b,btn,okMsg,errPrefix){
  busy(btn,true);
- let r;try{r=await post(p,b);}catch(e){r={ok:false,error:String(e)};}
+ let r;try{r=await post(p,b);}catch(e){r={ok:false,error:errText("net")};}
  busy(btn,false);
  if(r&&r.ok)toast(okMsg||tr("保存しました"),"ok");
  else toast((errPrefix?errPrefix+": ":"")+(r&&r.error?r.error:tr("失敗")),"err");
@@ -1591,9 +1633,10 @@ function showSkeleton(){
 }
 async function refresh(){
  let s;try{s=await guardedFetch("/api/state")}catch(e){
-  if(isAuthFail(e)){markAuthError();}else{$("conn").className="pill bad";$("connt").textContent=tr("接続不可");}
+  if(isAuthFail(e)){markAuthError();}else{$("conn").className="pill bad";$("connt").textContent=tr("接続不可");
+   $("conn").title=errText("net");}
   return}
- $("conn").className="pill ok";$("connt").textContent=tr("接続中");
+ $("conn").className="pill ok";$("connt").textContent=tr("接続中");$("conn").title="";
  $("fw").checked=s.firewall.enabled;$("sh").checked=s.shield.cfg.enabled;
  // 直すべき設定(旧版が保存した site whitelist+空 など)を警告バッジで出す。本文は必ず esc() を通す
  const W=s.shield.warnings||[];$("cfgwarn").style.display=W.length?"":"none";
@@ -1728,20 +1771,26 @@ async function unbanSelected(btn){
  const ips=[...banSel];
  if(!ips.length){toast(tr("選択なし"),"info");return;}
  busy(btn,true);
- for(const ip of ips)await post("/api/shield/unban",{ip});
+ const fails=[];for(const ip of ips){const r=await post("/api/shield/unban",{ip});if(!(r&&r.ok))fails.push(r);}
  busy(btn,false);
  banSel.clear();
- toast(tr("選択したIPを解除しました"),"ok");
+ bulkReport(fails,ips.length,tr("選択したIPを解除しました"));
  refresh();
+}
+/* 一括操作の結果: 1件でも失敗したら成功とは言わない(以前は全件失敗でも「解除しました」)。
+   件数と最初の理由(post() が平文にしたもの)を出す。 */
+function bulkReport(fails,n,okMsg){
+ if(!fails.length){toast(okMsg,"ok");return;}
+ toast(tr("完了できなかった操作があります")+" ("+fails.length+"/"+n+"): "+((fails[0]&&fails[0].error)||tr("失敗")),"err");
 }
 async function unbanAll(btn){
  if(!curBans.length)return;
  if(!(await confirmDialog(tr("BAN中の全IPを解除します。よろしいですか?"))))return;
  busy(btn,true);
- for(const b of curBans)await post("/api/shield/unban",{ip:b.ip});
+ const fails=[];for(const b of curBans){const r=await post("/api/shield/unban",{ip:b.ip});if(!(r&&r.ok))fails.push(r);}
  busy(btn,false);
  banSel.clear();
- toast(tr("すべてのBANを解除しました"),"ok");
+ bulkReport(fails,curBans.length,tr("すべてのBANを解除しました"));
  refresh();
 }
 /* 攻撃イベント: 検索フィルタ。curEvents はサーバから取得した最新配列。 */
@@ -1761,17 +1810,17 @@ async function approveAllPending(btn){
  if(!curPending.length)return;
  if(!(await confirmDialog(tr("すべての承認待ち接続を承認します。よろしいですか?"))))return;
  busy(btn,true);
- for(const p of curPending)await post("/api/firewall/resolve",{id:p.id,approve:true});
+ const fails=[];for(const p of curPending){const r=await post("/api/firewall/resolve",{id:p.id,approve:true});if(!(r&&r.ok))fails.push(r);}
  busy(btn,false);
- toast(tr("すべて承認しました"),"ok");
+ bulkReport(fails,curPending.length,tr("すべて承認しました"));
  refresh();
 }
 async function denyAllPending(btn){
  if(!curPending.length)return;
  busy(btn,true);
- for(const p of curPending)await post("/api/firewall/resolve",{id:p.id,approve:false});
+ const fails=[];for(const p of curPending){const r=await post("/api/firewall/resolve",{id:p.id,approve:false});if(!(r&&r.ok))fails.push(r);}
  busy(btn,false);
- toast(tr("すべて拒否しました"),"ok");
+ bulkReport(fails,curPending.length,tr("すべて拒否しました"));
  refresh();
 }
 $("fw").onchange=e=>postT("/api/firewall/toggle",{on:e.target.checked},null,tr("ファイアウォールを更新しました")).then(refresh);
@@ -1812,8 +1861,7 @@ async function refreshPro(){
    <button class="red" data-ip="${esc(a.ip)}" onclick="resolveAppeal(this.dataset.ip,false,this)">${tr("却下")}</button>`:""}</td></tr>`
   ).join("")||'<tr><td colspan="4" class="empty">'+tr("申立なし — BANされた利用者が異議申立を送るとここに表示されます")+'</td></tr>';}catch(e){if(isAuthFail(e))markAuthError();}
  try{const an=await guardedFetch("/api/analysis");
-  $("analysis").textContent=JSON.stringify({actions:an.actions,by_zone:an.by_zone,
-   top_signatures:an.top_signatures,event_kinds:an.event_kinds,active_bans:an.active_bans},null,2);}catch(e){if(isAuthFail(e))markAuthError();}
+  $("analysis").innerHTML=analysisHTML(an);}catch(e){if(isAuthFail(e))markAuthError();}
  try{const ap=await guardedFetch("/api/apt");
   $("apt").textContent=(ap.suspects||[]).map(s=>
    `${(s.ip+"").padStart(15)}  apt ${String(s.apt_score).padStart(3)}  ${s.regular_beacon?"beacon ":""}${s.low_and_slow?"low&slow ":""}${s.banned?"BAN":""}`
@@ -1822,6 +1870,30 @@ async function refreshPro(){
  try{refreshSigs();}catch(e){}
  try{refreshDeception();}catch(e){}
  try{refreshAudit();}catch(e){}
+}
+/* 詳細分析: 以前は /api/analysis の JSON を JSON.stringify で <pre> へ流していた(読めず、次に何を
+   見ればいいか分からない)。見出し付きの節に描く。シグネチャ名・ゾーン・イベント種別は外部入力
+   由来になり得るので、値は必ず esc() を通す(onclick 等の JS 文字列へは一切入れない)。 */
+const ANA_ACT=[["allow","許可"],["throttle","スロットル"],["block","ブロック"]];
+function analysisHTML(an){
+ an=an||{};const A=an.actions||{},req=Number(A.requests)||0;
+ const sec=(t,body)=>`<div><div class="meta" style="margin:2px 0 6px">${esc(tr(t))}</div>${body}</div>`;
+ const row=(l,v,pct)=>`<div class="sbar"><span class="sbl">${esc(tr(l))}</span><span class="sbt">`
+   +(pct==null?"":`<span class="sbf" style="width:${pct}%"></span>`)+`</span><span class="sbn num">${esc(nf(v))}</span></div>`;
+ const acts=row("要求",req,null)+ANA_ACT.filter(([k])=>k in A).map(([k,l])=>{const v=Number(A[k])||0;
+   return row(l,v,req?Math.min(100,Math.round(v/req*100)):0);}).join("");
+ const zones=barHTML(Object.entries(an.by_zone||{}).map(([k,v])=>[k,Number(v)||0]),8);
+ const sigs=(Array.isArray(an.top_signatures)?an.top_signatures:[]).filter(Array.isArray).slice(0,10).map((x,i)=>
+   `<div class="frow"><span class="cnt">${i+1}.</span><span class="desc num">${esc(x[0])}</span>`
+   +`<span class="cnt">×${esc(nf(Number(x[1])||0))}</span></div>`).join("")
+   ||'<div class="empty">'+esc(tr("ヒットなし"))+'</div>';
+ const kinds=Object.entries(an.event_kinds||{}).sort((a,b)=>b[1]-a[1]).map(([k,v])=>
+   `<span class="badge ${sev(k)}">${esc(k)} ${esc(nf(Number(v)||0))}</span>`).join(" ")
+   ||'<div class="empty">'+esc(tr("イベントなし"))+'</div>';
+ const bans=`<div class="kpi i-red"><div class="kn">${esc(nf(Number(an.active_bans)||0))}</div>`
+   +`<div class="kl">${esc(tr("BAN中"))}</div></div>`;
+ return `<div class="grid">${sec("アクション別",acts)}${sec("ゾーン別",zones)}${sec("上位シグネチャ",sigs)}`
+   +`${sec("イベント種別",kinds)}${sec("BAN中のIP",bans)}</div>`;
 }
 /* 変更履歴(監査ログ) */
 let curAudit=[];
@@ -1858,10 +1930,14 @@ let curCustomSigs=[];
 async function refreshSigs(){
  let d;try{d=await guardedFetch("/api/shield/signatures")}catch(e){if(isAuthFail(e))markAuthError();return}
  curCustomSigs=d.custom||[];
+ // 停止中=読込時に載せなかった規則(危険なパターンだけでなく weight 不正・件数上限超過も・#55/#59)
  $("sigmeta").textContent=`${tr("組込")} ${(d.builtin||[]).length} · ${tr("カスタム")} ${d.custom_active||0}`
-   +(d.custom_blocked?` · ${tr("危険除外")} ${d.custom_blocked}`:"");
+   +(d.custom_max?"/"+d.custom_max:"")
+   +(d.custom_blocked?` · ${tr("停止中")} ${d.custom_blocked}`:"");
  $("customsigs").querySelector("tbody").innerHTML=curCustomSigs.map(c=>
-   `<tr><td class="num">${esc(c.name)}</td><td><span class="num">${esc((c.pattern||"").slice(0,48))}</span></td>`
+   `<tr><td class="num">${esc(c.name)}`
+   +(c.active===false?` <span class="badge danger">${tr("停止中")}</span><div class="meta">${esc(c.reason||"")}</div>`:"")
+   +`</td><td><span class="num">${esc((c.pattern||"").slice(0,48))}</span></td>`
    +`<td><button class="ghost" data-signame="${esc(c.name)}">${tr("削除")}</button></td></tr>`).join("")
    ||'<tr><td colspan="3" class="empty">'+tr("カスタムシグネチャなし — 下のフォームから追加できます(組込シグネチャで拾えないパターン用)")+'</td></tr>';
 }
@@ -1869,11 +1945,18 @@ $("customsigs").addEventListener("click",e=>{
  const b=e.target.closest("button[data-signame]");
  if(b)removeSig(b.dataset.signame,b);
 });
+/* sig_add / sig_test の warnings(走査前の正規化で書き換わり、当たらなくなる字面など・#30)。
+   各警告は esc() を通して描く(データを生の HTML へ入れない)。 */
+function sigWarnHtml(r){
+ const W=(r&&Array.isArray(r.warnings))?r.warnings:[];
+ return W.length?' <span class="badge warn">'+tr("注意")+'</span> '+W.map(w=>esc(w)).join(" / "):"";
+}
 async function addSig(btn){
  const name=$("signame").value.trim(),pattern=$("sigpat").value;
  if(!name||!pattern){$("sigerr").textContent=tr("名前とパターンを入力");return;}
  const r=await postT("/api/shield/sig_add",{name,pattern},btn,tr("シグネチャを追加しました"),tr("追加に失敗"));
- $("sigerr").textContent=r.ok?"":("✗ "+(r.error||tr("失敗")));
+ if(r.ok)$("sigerr").innerHTML=sigWarnHtml(r);
+ else $("sigerr").textContent="✗ "+(r.error||tr("失敗"));
  if(r.ok){$("signame").value="";$("sigpat").value="";$("sigtestresult").textContent="";}
  refreshSigs();
 }
@@ -1888,9 +1971,10 @@ async function testSig(btn){
  if(!pattern){$("sigtestresult").innerHTML='<span class="badge muted">'+tr("パターンを入力")+'</span>';return;}
  busy(btn,true);
  let r;try{r=await post("/api/shield/sig_test",{pattern,sample});}finally{busy(btn,false);}
- if(!r||!r.ok){$("sigtestresult").innerHTML='<span class="badge danger">'+tr("エラー")+'</span>';return;}
+ if(!r||!r.ok){$("sigtestresult").innerHTML='<span class="badge danger">'+tr("エラー")+'</span>'
+   +(r&&r.error?" "+esc(r.error):"");return;}
  if(r.error){$("sigtestresult").innerHTML='<span class="badge danger">'+tr("無効なパターン")+': '+esc(r.error)+'</span>';}
- else{$("sigtestresult").innerHTML=r.matches?'<span class="badge warn">'+tr("一致")+'</span>':'<span class="badge muted">'+tr("不一致")+'</span>';}
+ else{$("sigtestresult").innerHTML=(r.matches?'<span class="badge warn">'+tr("一致")+'</span>':'<span class="badge muted">'+tr("不一致")+'</span>')+sigWarnHtml(r);}
 }
 let curPathLimits=[];
 async function addPathLimit(btn){
@@ -2005,7 +2089,12 @@ async function rule(a,btn){
  if(a==="deny"&&!(await confirmDialog(tr("このIP/CIDRを拒否ルールに追加しますか?")+" "+net)))return;
  postT("/api/firewall/rule",{net,action:a},btn,tr("ルールを追加しました"),tr("追加に失敗")).then(refresh);
 }
-async function edge(){const t=await (await fetch("/api/edge",{headers:H})).text();
+async function edge(){
+ // 失敗時(401 等)の JSON 本文を設定ファイルとして保存しない。理由と次の一手をトーストで出す。
+ let resp;try{resp=await fetch("/api/edge",{headers:H});}catch(e){toast(errText("net"),"err");return;}
+ if(resp.status===401){markAuthError();toast(errText("auth"),"err");return;}
+ if(!resp.ok){toast(errText("http",resp.status),"err");return;}
+ const t=await resp.text();
  const u=URL.createObjectURL(new Blob([t]));const a=document.createElement("a");a.href=u;a.download="ducknet_edge.conf";a.click()}
 /* CSV/JSON エクスポート: 既に取得済みの配列をそのままファイル化するだけ(追加取得なし)。 */
 function toCSV(rows,cols){

@@ -353,6 +353,8 @@ def _strip_autostart_flags(raw) -> list:
         base = x.split("=", 1)[0]
         if _is(base, "--uninstall-autostart"):    # 値なし
             i += 1; continue
+        if _is(base, "--json"):                   # 値なし。登録の結果表示の指定で、常駐側には不要
+            i += 1; continue
         if _is(base, "--autostart-name"):         # 別トークンで値を取る
             i += 1 if "=" in x else 2             # =形式は1トークン、別形式は値も飛ばす
             continue
@@ -363,6 +365,233 @@ def _strip_autostart_flags(raw) -> list:
             continue
         out.append(x); i += 1
     return out
+
+
+# ── 運用者向け CLI の結果表示(--install-autostart / --uninstall-autostart)──────────────────
+# 結果の dict を JSON のまま出していたため、運用者には成功したのかも次に何をすればよいのかも
+# 分からなかった。既定は平文の要約(成否の 1 行・要点・失敗時は「次の手順」)、--json は従来と
+# まったく同じ JSON(スクリプト互換)。終了コードは表示と無関係に従来どおり。
+_CLI_CMD = "python -m dataplane"
+
+
+def _cli_ja() -> bool:
+    """CLI の表示言語。サーバ側の文言と同じ規則(DUCKNET_LANG → OS ロケール → 既定 ja)。"""
+    try:
+        from .engine.core.i18n import lang
+        return lang() != "en"
+    except Exception:
+        return True
+
+
+def _cli_one_line(v, limit: int = 300) -> str:
+    """OS の応答など外部由来の値を 1 行の表示用文字列へ。改行・端末制御文字は空白にし、長ければ切る。"""
+    s = "" if v is None else str(v)
+    s = " ".join("".join(c if c.isprintable() else " " for c in s).split())
+    return s if len(s) <= limit else s[:limit - 3] + "..."
+
+
+def _cli_arg(s) -> str:
+    """表示するコマンド例の引数。空白や記号を含む名前は "" で囲む。"""
+    s = str(s)
+    if s and not any(c in s for c in " \t\"'&|<>;^%$`"):
+        return s
+    return '"' + s.replace('"', '\\"') + '"'
+
+
+def _cli_print(lines_fn, ok: bool, *args, **kw) -> None:
+    """要約を表示する。表示の組み立てで想定外の形に当たっても、処理結果(終了コード)は変えない。"""
+    try:
+        lines = lines_fn(*args, **kw)
+    except Exception:
+        ja = _cli_ja()
+        lines = [("完了しました" if ok else "失敗しました") + "(詳細は --json を付けて確認できます)。"
+                 if ja else ("Done" if ok else "Failed") + " (run again with --json for details)."]
+    for ln in lines:
+        print(ln)
+
+
+def _autostart_undo_cmd(name: str, runkey: bool) -> str:
+    s = f"{_CLI_CMD} --uninstall-autostart"
+    if runkey:
+        s += " --install-autostart runkey"            # Run キーの解除はこの指定で選ぶ
+    if name != "DuckNet":
+        s += f" --autostart-name {_cli_arg(name)}"
+    return s
+
+
+def _install_autostart_lines(res: dict, *, name: str, trigger: str, ja: bool) -> list:
+    """--install-autostart の結果を、運用者が読む数行へ(何をどこへ・確認方法・取り消し方)。"""
+    import re as _re
+
+    def t(j, e):
+        return j if ja else e
+    lines = []
+    method = str(res.get("method") or "")
+    nm = str(res.get("name") or name)
+    if res.get("action") == "manual" and method in ("systemd", "launchd"):
+        sysd = method == "systemd"
+        path = str(res.get("unit_path" if sysd else "plist_path") or "")
+        body = str(res.get("unit" if sysd else "plist") or "")
+        lines.append(t("自動起動の設定ファイルを用意しました。まだ登録されていません ― 次の手順で"
+                       "有効にしてください(管理者権限が必要です)。",
+                       "Autostart file prepared, but it is not registered yet. Follow these steps "
+                       "to enable it (requires root)."))
+        lines.append(t(f"  1) 下の内容を {path} として保存:", f"  1) Save the text below as {path}:"))
+        lines.append("-" * 64)
+        lines.extend(body.rstrip("\n").splitlines())
+        lines.append("-" * 64)
+        lines.append(t(f"  2) 有効化: {res.get('enable', '')}", f"  2) Enable it: {res.get('enable', '')}"))
+        if sysd:
+            base = path.rsplit("/", 1)[-1]
+            unit = base[:-len(".service")] if base.endswith(".service") else nm.lower()
+            lines.append(t(f"  確認方法: systemctl status {unit}", f"  To check: systemctl status {unit}"))
+            lines.append(t(f"  取り消し: systemctl disable --now {unit} を実行してから {path} を削除",
+                           f"  To undo : systemctl disable --now {unit}, then delete {path}"))
+            m = _re.search(r"(?m)^User=(.*)$", body)
+            if m:
+                lines.append(t(f"  注意    : このユニットはユーザー {m.group(1)} で動きます。そのユーザーが"
+                               "無ければ作成するか、User= を書き換えてください。より厳しいユニットの例は"
+                               " docs/hardening.md の 2 章にあります。",
+                               f"  Note    : the unit runs as user {m.group(1)}. Create that user or "
+                               "change User=. A hardened unit is shown in docs/hardening.md "
+                               "section 2."))
+        else:
+            base = path.rsplit("/", 1)[-1]
+            label = base[:-len(".plist")] if base.endswith(".plist") else base
+            lines.append(t(f"  確認方法: launchctl list | grep {label}",
+                           f"  To check: launchctl list | grep {label}"))
+            lines.append(t(f"  取り消し: launchctl unload -w {path} を実行してから {path} を削除",
+                           f"  To undo : launchctl unload -w {path}, then delete {path}"))
+            lines.append(t("  詳しくは docs/hardening.md の 4 章にあります。",
+                           "  See docs/hardening.md section 4 for details."))
+        return lines
+    if res.get("ok"):
+        if method == "schtasks":
+            when = (t("PC の起動時", "when the computer starts")
+                    if str(res.get("trigger") or trigger) == "onstart"
+                    else t("サインイン時", "when you sign in"))
+            lines.append(t(f"自動起動を登録しました: Windows タスクスケジューラのタスク「{nm}」"
+                           f"({when}に起動)。",
+                           f'Autostart registered: Windows Task Scheduler task "{nm}" '
+                           f"(starts {when})."))
+            lines.append(t(f"  確認方法: schtasks /query /tn {_cli_arg(nm)}   (タスク スケジューラの画面でも確認できます)",
+                           f"  To check: schtasks /query /tn {_cli_arg(nm)} (or open Task Scheduler)"))
+            lines.append(t(f"  取り消し: {_autostart_undo_cmd(nm, False)}",
+                           f"  To undo : {_autostart_undo_cmd(nm, False)}"))
+        elif method == "runkey":
+            loc = str(res.get("location") or "")
+            lines.append(t("自動起動を登録しました: このユーザーのサインイン時に起動します(Windows の Run キー)。",
+                           "Autostart registered: starts when this user signs in (Windows Run key)."))
+            if loc:
+                lines.append(t(f"  登録先  : {loc}", f"  Location: {loc}"))
+            lines.append(t("  確認方法: タスク マネージャーの「スタートアップ アプリ」に表示されます。",
+                           "  To check: it is listed in Task Manager > Startup apps."))
+            lines.append(t(f"  取り消し: {_autostart_undo_cmd(name, True)}",
+                           f"  To undo : {_autostart_undo_cmd(name, True)}"))
+        else:
+            lines.append(t("自動起動を登録しました。", "Autostart registered."))
+            lines.append(t(f"  取り消し: {_autostart_undo_cmd(nm, False)}",
+                           f"  To undo : {_autostart_undo_cmd(nm, False)}"))
+        return lines
+    where = {"schtasks": t("Windows タスクスケジューラ", "Windows Task Scheduler"),
+             "runkey": t("Windows の Run キー", "Windows Run key")}.get(method, "")
+    lines.append(t("自動起動を登録できませんでした" + (f"({where})" if where else "") + "。",
+                   "Could not register autostart" + (f" ({where})" if where else "") + "."))
+    reason = _cli_one_line(res.get("error") or res.get("detail") or "")
+    if reason:
+        lines.append(t(f"  理由    : {reason}", f"  Reason  : {reason}"))
+    if str(res.get("error") or "").startswith("unsupported platform"):
+        lines.append(t("次の手順: この OS には自動登録の仕組みがありません。OS のサービス管理機能で"
+                       f"「{_CLI_CMD} <起動オプション>」を起動時に実行し、落ちたら再起動するよう"
+                       "設定してください(docs/hardening.md)。",
+                       "Next step: this OS has no automatic registration. Configure the OS service "
+                       f'manager to run "{_CLI_CMD} <options>" at startup and restart it if it '
+                       "stops (see docs/hardening.md)."))
+    elif method == "runkey":
+        lines.append(t("次の手順: ゲートウェイを動かすユーザーで実行してください(Run キーは実行した"
+                       "ユーザーにだけ登録されます)。",
+                       "Next step: run this as the user that will run the gateway (the Run key "
+                       "is registered only for the user who runs it)."))
+    elif trigger == "onstart":
+        lines.append(t("次の手順: PC の起動時(onstart)の登録には管理者権限が必要です。管理者として"
+                       "実行するか、サインイン時の登録(値なしの --install-autostart、または runkey)"
+                       "を使ってください。",
+                       "Next step: registering for computer startup (onstart) needs administrator "
+                       "rights. Run as administrator, or register for sign-in instead "
+                       "(--install-autostart with no value, or runkey)."))
+    else:
+        lines.append(t("次の手順: ゲートウェイを動かすユーザーで実行してください。権限が足りないと"
+                       "出る場合は --install-autostart runkey(このユーザーだけに登録・管理者権限"
+                       "不要)を試すか、docs/hardening.md の手順でサービスとして登録してください。",
+                       "Next step: run this as the user that will run the gateway. If it reports "
+                       "missing permissions, try --install-autostart runkey (this user only, no "
+                       "administrator rights needed) or register a service as described in "
+                       "docs/hardening.md."))
+    return lines
+
+
+def _uninstall_autostart_lines(res: dict, *, name: str, runkey: bool, ja: bool,
+                               plat: str = None) -> list:
+    """--uninstall-autostart の結果を、運用者が読む数行へ。"""
+    def t(j, e):
+        return j if ja else e
+    plat = sys.platform if plat is None else plat
+    nm = str(res.get("name") or name)
+    lines = []
+    if res.get("action") == "manual":
+        unit = name.lower()
+        if plat.startswith("linux"):
+            lines.append(t("この OS では自動で解除しません。次の手順で解除してください(root 権限):",
+                           "Autostart is not removed automatically on this OS. Remove it with "
+                           "these steps (as root):"))
+            lines += [f"  1) systemctl disable --now {unit}",
+                      f"  2) rm /etc/systemd/system/{unit}.service",
+                      "  3) systemctl daemon-reload"]
+        elif plat == "darwin":
+            p = f"/Library/LaunchDaemons/com.ducknet.{unit}.plist"
+            lines.append(t("この OS では自動で解除しません。次の手順で解除してください(管理者権限):",
+                           "Autostart is not removed automatically on this OS. Remove it with "
+                           "these steps (as administrator):"))
+            lines += [f"  1) launchctl unload -w {p}", f"  2) rm {p}"]
+        else:
+            lines.append(t("この OS では自動で解除しません。OS のサービス管理機能で登録を外してください。",
+                           "Autostart is not removed automatically on this OS. Remove it with "
+                           "the OS service manager."))
+        return lines
+    if res.get("ok"):
+        lines.append(t("自動起動を解除しました: " + (f"Run キーの「{nm}」を削除しました。" if runkey
+                                                   else f"タスクスケジューラのタスク「{nm}」を削除しました。"),
+                       "Autostart removed: " + (f'deleted "{nm}" from the Run key.' if runkey
+                                                 else f'deleted Task Scheduler task "{nm}".')))
+        again = f"{_CLI_CMD} --install-autostart" + (" runkey" if runkey else "")
+        lines.append(t(f"  もう一度登録するには: {again}", f"  To register again: {again}"))
+        return lines
+    lines.append(t("自動起動を解除できませんでした: " +
+                   (f"Run キーに「{nm}」が見つからないか、削除できませんでした。" if runkey
+                    else f"タスク「{nm}」が見つからないか、削除する権限がありません。"),
+                   "Could not remove autostart: " +
+                   (f'"{nm}" was not found in the Run key or could not be deleted.' if runkey
+                    else f'task "{nm}" was not found, or you lack permission to delete it.')))
+    reason = _cli_one_line(res.get("error") or res.get("detail") or "")
+    if reason:
+        lines.append(t(f"  理由    : {reason}", f"  Reason  : {reason}"))
+    if runkey:
+        lines.append(t("次の手順: 登録したときの名前が違うなら --autostart-name で指定してください"
+                       "(既定 DuckNet)。タスクスケジューラに登録した場合は --install-autostart runkey を"
+                       "付けずに実行してください。",
+                       "Next step: if it was registered under another name, pass --autostart-name "
+                       "(default DuckNet). If it was registered in Task Scheduler, run without "
+                       "--install-autostart runkey."))
+    else:
+        lines.append(t("次の手順: 登録したときの名前が違うなら --autostart-name で指定してください"
+                       "(既定 DuckNet)。Run キーに登録した場合は --install-autostart runkey を付けて"
+                       "実行してください。管理者として登録したタスクは管理者として解除します。"
+                       f"確認: schtasks /query /tn {_cli_arg(nm)}",
+                       "Next step: if it was registered under another name, pass --autostart-name "
+                       "(default DuckNet). If it was registered in the Run key, add "
+                       "--install-autostart runkey. A task registered as administrator must be "
+                       f"removed as administrator. To check: schtasks /query /tn {_cli_arg(nm)}"))
+    return lines
 
 
 def main(argv=None) -> int:
@@ -409,14 +638,22 @@ def main(argv=None) -> int:
                     help="--install-autostart で登録した自動起動を解除する。")
     ap.add_argument("--autostart-name", default="DuckNet", metavar="NAME",
                     help="自動起動エントリの表示名(既定 DuckNet)。")
+    ap.add_argument("--json", action="store_true",
+                    help="--install-autostart / --uninstall-autostart の結果を、人向けの要約では"
+                         "なく従来どおりの JSON で出力する(スクリプト向け。終了コードは同じ)。")
     a = ap.parse_args(argv)
     # 自動起動の登録/解除(#58): 透明な公認の場所のみ。登録したら即終了(常駐はしない)。
     if a.uninstall_autostart:
         from .engine.core.autostart import uninstall
         import json as _json
         m = "runkey" if a.install_autostart == "runkey" else "auto"
-        print(_json.dumps(uninstall(method=m, name=a.autostart_name), ensure_ascii=False))
-        return 0
+        res = uninstall(method=m, name=a.autostart_name)
+        if a.json:                                    # スクリプト向け: 従来どおりの JSON
+            print(_json.dumps(res, ensure_ascii=False))
+        else:                                         # 人向け: 成否・要点・次の手順
+            _cli_print(_uninstall_autostart_lines, bool(res.get("ok")), res,
+                       name=a.autostart_name, runkey=m == "runkey", ja=_cli_ja())
+        return 0                                      # 従来どおり(解除の成否で終了コードは変えない)
     if a.install_autostart:
         from .engine.core.autostart import install
         import sys as _sys
@@ -426,7 +663,11 @@ def main(argv=None) -> int:
         method = "runkey" if a.install_autostart == "runkey" else "auto"
         trigger = a.install_autostart if a.install_autostart in ("onlogon", "onstart") else "onlogon"
         res = install(serve_args, method=method, name=a.autostart_name, trigger=trigger)
-        print(_json.dumps(res, ensure_ascii=False, indent=2))
+        if a.json:
+            print(_json.dumps(res, ensure_ascii=False, indent=2))
+        else:
+            _cli_print(_install_autostart_lines, bool(res.get("ok")), res,
+                       name=a.autostart_name, trigger=trigger, ja=_cli_ja())
         return 0 if res.get("ok") else 1
     run(backend=a.backend, listen=a.listen, admin_port=a.admin, host=a.host,
         admin_host=a.admin_host, token=a.token,
