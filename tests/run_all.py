@@ -162,6 +162,9 @@ MODULES = [
     "test_sweep_rv_lite_tray",        # トレイ: 他プロセスへトークンを送らない/監査モード表示
     "test_sweep_dec_headfold",        # URL/ヘッダでも全角の ｜＄（）；｀ をメタ文字にしない
     "test_sweep_dec_runbat",          # run.bat の注釈を ASCII に(日本語版 Windows の誤ったエラー行)
+    "test_sweep_rem_jsonesc",         # JSON 本文の \r\n エスケープ後のヘッダ注入/文区切り
+    "test_sweep_rem_tray",            # Explorer 再起動(TaskbarCreated)でトレイのアイコンを付け直す
+    "test_sweep_rem_fwfold",          # fold_fullwidth_punct(既定 OFF)で全角記号も畳む運用
 ]
 
 

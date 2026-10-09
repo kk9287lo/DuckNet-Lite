@@ -372,6 +372,11 @@ _DEFAULTS = {
     # 検知の段階的厳格度(evolution #16): 1=保守(誤検知最小)〜4=最大(高FP許容)。set_paranoia が
     # レベルに応じて高FPの任意シグネチャを一括ON(個別 optional_sigs の上位ダイヤル)。既定1。
     "paranoia": 1,
+    # 全角記号の畳み込み(rem_fwfold): 日本語の地の文で普通に使う全角の ｜ ＄ （ ） ； ｀([[_CJK_FW_PUNCT]])は
+    # 既定では ASCII のメタ文字へ畳まない(決定・dec_headfold)。バックエンド自身が全角を ASCII へ変換する
+    # 構成(入力へ NFKC を掛けるアプリ・Windows の best-fit 変換)では本物の | $ ( ) ; ` として読まれるので、
+    # ON で本文も URL/ヘッダも前の版の NFKC と同じに畳む(日本語の題名等の誤検知も前の版と同じに戻る)。
+    "fold_fullwidth_punct": False,
     # 出口DLP(evolution #6): 応答に混入した秘密情報(鍵/トークン/カード番号)の漏洩検知。
     "dlp_enabled": False,        # 既定OFF(オプトイン)
     "dlp_action": "audit",       # audit=アラートのみ / block=漏洩チャンクを送らず切断
@@ -1230,7 +1235,8 @@ def _strip_sql_comments(s: str) -> str:
 
 
 def _normalize_full(s: str, *, body: bool = False, decode: bool = True,
-                    cap: int = _PRE_CUT, nl: bool = False, nl_views: list | None = None) -> str:
+                    cap: int = _PRE_CUT, nl: bool = False, nl_views: list | None = None,
+                    fold_fw: bool = False, json_esc: bool = False) -> str:
     """シグネチャ走査前の正規化。難読化(多重エンコード/インラインコメント/空白増し/Unicode)を
     減らし、入力長を有界化して ReDoS と CPU 枯渇を抑える。完全な無害化ではない。
     返値は 1 窓(_MAX_SCAN)へ *切り詰めない*(全域を [[_scan_windows]] が窓分割する)。
@@ -1239,11 +1245,15 @@ def _normalize_full(s: str, *, body: bool = False, decode: bool = True,
     地の文/YAML/CSV/multipart の枠の区切りで、文/コマンドの区切りとみなすと誤検知になる(#0/#2)。
     CJK の地の文で普通に使う全角の ｜ ＄ （ ） ； ｀ は、本文でも head でも ASCII のメタ文字へ畳まず空白に
     する([[_CJK_FW_PUNCT]]・#3・dec_headfold)。全角英字・＜＞ 等の畳み込みは本文も head も同じ。
+    fold_fw=True(運用者の設定 fold_fullwidth_punct)はその表の文字も前の版と同じく NFKC で畳む(本文も head も)。
     nl=True(body=True と併用)は本文の crlf・rce・複文照合用の見え方([[_BODY_NL_RULES]]): 生の改行
     (文書の枠)は空白のまま、復号で現れた改行(%0D%0A・&#10;・\\u000a 等で *値に* 入った改行)だけを
     head と同じく ';' にする。nl_views(body=True・nl=False の時)には、復号で現れた改行の後に照合対象の
     語が続く時だけ([[_BODY_NL_LEAD]])、nl=True と同じ結果の見え方を同じ復号結果から作って積む(復号を
     2 回しない・[[NetShield._scan_field]])。
+    json_esc=True(JSON 本文・[[_json_body]])は、その見え方でだけ JSON の短いエスケープ(\\n \\r \\t 等)も
+    復号する=JSON.stringify が書く \\r\\n も %0D%0A・\\u000a と同じ値の改行([[_json_unescape_short]])。
+    本文の走査面(他の検知が見る返値)は変えない。
     decode=False は登録デコーダを掛けない([[_scan_windows]] がフィールド全体へ 1 回掛けた後)。"""
     if not s:
         return ""
@@ -1291,9 +1301,10 @@ def _normalize_full(s: str, *, body: bool = False, decode: bool = True,
                     return m.group(0)
             s = re.sub(r"\\u([0-9a-fA-F]{4})|\\x([0-9a-fA-F]{2})|\\U([0-9a-fA-F]{8})", _unesc, s)
         if not s.isascii():                          # ASCII はそのまま(高速パス)。非ASCIIのみ重処理。
-            for _c in _CJK_FW_PUNCT:                 # CJK の地の文の全角記号はメタ文字にしない(本文も head も)
-                if _c in s:
-                    s = s.replace(_c, " ")
+            if not fold_fw:                          # ON(fold_fullwidth_punct)は下の NFKC で畳む=前の版と同じ
+                for _c in _CJK_FW_PUNCT:             # CJK の地の文の全角記号はメタ文字にしない(本文も head も)
+                    if _c in s:
+                        s = s.replace(_c, " ")
             try:
                 # NFKC は 1 文字を最大 18 文字へ展開する(例 U+FDFA)。8KB を埋められると走査面が
                 # 入力の十数倍に膨れ、(a) そのまま全域を走査すれば CPU 枯渇DoS、(b) 溢れた分を
@@ -1357,14 +1368,33 @@ def _normalize_full(s: str, *, body: bool = False, decode: bool = True,
     # 本文(body=True)では行わない: 本文の改行は正規の区切りで、次の空白畳みで空白になる。
     # 例外は nl=True(本文の crlf・rce・複文照合用): 生の改行は冒頭で空白にしたので、ここに残るのは
     # 復号で値に現れた改行だけ=head と同じく ';' にする。
+    # JSON 本文(json_esc)ではその見え方でだけ、JSON の短いエスケープ(\n \r 等)も値の改行として復号する
+    # (本文の走査面=返値 s は変えない。v は値の改行の見え方の元)。
+    v = s
+    if json_esc and body and (nl or nl_views is not None) and "\\" in s:
+        v = _json_unescape_short(s)
+        if nl:
+            s = v
     if (not body or nl) and ("\r" in s or "\n" in s):
         s = re.sub(r"[\r\n]+", ";", s)
-    elif (nl_views is not None and ("\r" in s or "\n" in s)
-          and _BODY_NL_LEAD.search(s) is not None):
+    elif (nl_views is not None and ("\r" in v or "\n" in v)
+          and _BODY_NL_LEAD.search(v) is not None):
         # 本文で値の改行の後に照合対象の語が続く時だけ、nl=True と同じ見え方を *同じ復号結果から*
         # 作って渡す(復号をやり直さない。行頭がその語でない普通の改行では何も増えない)
-        nl_views.append(_collapse_scan_text(re.sub(r"[\r\n]+", ";", s), cap))
+        nl_views.append(_collapse_scan_text(re.sub(r"[\r\n]+", ";", v), cap))
     return _collapse_scan_text(s, cap)
+
+
+# JSON の短いエスケープ(RFC 8259 §7)。左から重ならずに当てるので \\ は先に 1 組として読む=二重に
+# エスケープされた \\n(値の中の字面のバックスラッシュ + n。コード片の文字列リテラル等)は改行にしない。
+# \t \f は空白、\b(後退)は除く(本文の走査面で制御文字を除くのと同じ)。\uXXXX は復号の段で済んでいる。
+_JSON_SHORT_ESC_RE = re.compile(r'\\([\\"/bfnrt])')
+_JSON_SHORT_ESC = {"\\": "\\", '"': '"', "/": "/", "b": "", "f": " ", "n": "\n", "r": "\r", "t": " "}
+
+
+def _json_unescape_short(s: str) -> str:
+    """JSON の短いエスケープを復号する([[_normalize_full]] json_esc の値の改行の見え方用)。"""
+    return _JSON_SHORT_ESC_RE.sub(lambda m: _JSON_SHORT_ESC[m.group(1)], s)
 
 
 def _collapse_scan_text(s: str, cap: int) -> str:
@@ -1401,7 +1431,8 @@ def _window_starts(n: int, step: int) -> list:
 
 
 def _normalized_parts(chunk: str, step: int, depth: int = 0, *, body: bool = False,
-                      nl: bool = False, nl_parts: list | None = None) -> list:
+                      nl: bool = False, nl_parts: list | None = None, fold_fw: bool = False,
+                      json_esc: bool = False) -> list:
     """生入力 1 断片を *1 回だけ* 正規化し、走査窓の列として返す(#65)。
     返値の上限は断片長 × _NFKC_MAX_EXPAND(+1)。1 文字の展開は NFKC・lower() 込みで最大 4 倍
     ([[_nfkc_char]])なので、展開しても切り捨ては起きず、正規化結果の全域がどれかの窓に載る。
@@ -1413,19 +1444,21 @@ def _normalized_parts(chunk: str, step: int, depth: int = 0, *, body: bool = Fal
     ';' にした見え方(nl=True と同じ)の窓をそこへ足す(同じ正規化の 1 回で作る・[[_normalize_full]])。"""
     cap = len(chunk) * _NFKC_MAX_EXPAND + 1
     views = [] if nl_parts is not None else None
-    n = _normalize_full(chunk, body=body, decode=False, cap=cap, nl=nl, nl_views=views)
+    n = _normalize_full(chunk, body=body, decode=False, cap=cap, nl=nl, nl_views=views, fold_fw=fold_fw,
+                        json_esc=json_esc)
     if len(n) < cap or depth >= 4 or len(chunk) <= 512:
         if views:
             nl_parts.extend(v[j:j + _MAX_SCAN] for v in views for j in _window_starts(len(v), step))
         return [n[j:j + _MAX_SCAN] for j in _window_starts(len(n), step)]
     half = len(chunk) // 2
     return (_normalized_parts(chunk[:half + _SCAN_WIN_OVERLAP], step, depth + 1, body=body, nl=nl,
-                              nl_parts=nl_parts)
-            + _normalized_parts(chunk[half:], step, depth + 1, body=body, nl=nl, nl_parts=nl_parts))
+                              nl_parts=nl_parts, fold_fw=fold_fw, json_esc=json_esc)
+            + _normalized_parts(chunk[half:], step, depth + 1, body=body, nl=nl, nl_parts=nl_parts,
+                                fold_fw=fold_fw, json_esc=json_esc))
 
 
 def _scan_windows(s: str, *, body: bool = False, nl: bool = False,
-                  nl_views: list | None = None) -> tuple:
+                  nl_views: list | None = None, fold_fw: bool = False, json_esc: bool = False) -> tuple:
     """1 フィールドの走査面を返す。生入力を _MAX_SCAN 窓+重なりで刻み、*窓ごとに* 正規化して
     (正規化結果が長ければさらに窓分割して)返す。
     旧実装は「正規化してから [:_MAX_SCAN] で切る」だったため、次の 2 つが『backend へ転送
@@ -1443,7 +1476,9 @@ def _scan_windows(s: str, *, body: bool = False, nl: bool = False,
     body=True は本文用の正規化([[_normalize_full]])で窓を作る。nl=True は本文の crlf・rce・複文照合用の
     見え方(値に復号で現れた改行だけを ';' にする)で窓を作る。nl_views(本文・nl=False)にリストを
     渡すと、値に復号で現れた改行の後に照合対象の語が続く時だけ([[_BODY_NL_LEAD]])、その見え方
-    (nl=True と同じ)の窓が足される(同じ窓予算・重複除去。正規化は 1 回のまま)。"""
+    (nl=True と同じ)の窓が足される(同じ窓予算・重複除去。正規化は 1 回のまま)。
+    fold_fw=True(運用者の設定 fold_fullwidth_punct)は全角の ｜ ＄ （ ） ； ｀ も畳む([[_normalize_full]])。
+    json_esc=True(JSON 本文)はその見え方でだけ JSON の短いエスケープ(\\n \\r 等)も値の改行として読む。"""
     raw = s[:_PRE_CUT]
     if not raw:
         return ("",)
@@ -1453,7 +1488,8 @@ def _scan_windows(s: str, *, body: bool = False, nl: bool = False,
     groups, nl_groups = [], []
     for i in _window_starts(len(raw), step):
         nlp = [] if nl_views is not None else None
-        groups.append(_normalized_parts(raw[i:i + _MAX_SCAN], step, body=body, nl=nl, nl_parts=nlp))
+        groups.append(_normalized_parts(raw[i:i + _MAX_SCAN], step, body=body, nl=nl, nl_parts=nlp,
+                                        fold_fw=fold_fw, json_esc=json_esc))
         if nlp:
             nl_groups.append(nlp)
     if nl_groups:
@@ -1531,6 +1567,17 @@ def _binary_ctype(content_type: str) -> bool:
     if t.startswith(_BINARY_CT_TOP):
         return True
     return t.startswith("application/") and t[12:] in _BINARY_CT_APP
+
+
+def _json_body(text: str, content_type: str = "") -> bool:
+    """本文が JSON か(値の改行の見え方で JSON の短いエスケープ \\n \\r を読む本文・[[_normalize_full]]
+    json_esc)。Content-Type が JSON(application/json・+json 接尾辞・ndjson 等)か、型が無い/違っても
+    先頭(空白・BOM の後)が { か [ の本文(CORS の事前確認を避けて text/plain で送る JSON もある)。
+    本文全体で決める=後ろの窓も同じ読み方。フォーム・multipart・テキストの \\n は字面のまま
+    (コード片の文字列リテラルを値の改行と読まない)。"""
+    if "json" in (content_type or "").split(";", 1)[0].lower():
+        return True
+    return text.lstrip(" \t\r\n﻿")[:1] in ("{", "[")
 
 
 # ブラウザ形 multipart/form-data の枠(RFC 2046/7578)。Content-Type は重複/省略され得る(proxy は
@@ -2555,7 +2602,8 @@ class NetShield:
             rgx = re.compile(pattern, _custom_re_flags(pattern))
         except re.error as e:
             return {"ok": True, "matches": False, "error": str(e)}
-        wins = _scan_windows(str("" if sample is None else sample)[:4096])
+        wins = _scan_windows(str("" if sample is None else sample)[:4096],
+                             fold_fw=bool(self.cfg.get("fold_fullwidth_punct")))   # live と同じ見え方
         out = {"ok": True, "error": None,
                "matches": any(saferegex.search(rgx, w, _MAX_SCAN) for w in wins),
                "normalized": wins[0][:512]}           # 照合した走査面(先頭)
@@ -3245,7 +3293,7 @@ class NetShield:
         self._geo_nets = nets
 
     def _scan_field(self, text: str, *, only: frozenset | None = None, acc=None,
-                    body: bool = False):
+                    body: bool = False, json_esc: bool = False):
         """1 フィールドを *全域* 走査する([[_scan_windows]] の各窓へ署名照合)。
         返値は _scan_signatures と同形 (name, weight) / (None, 0.0)。acc(_SigScan)を渡すと
         複数フィールド/本文の窓をまたいで集計する(組込は初出・カスタムは最重・#31)。
@@ -3255,13 +3303,18 @@ class NetShield:
         照合する([[_BODY_NL_RULES]]。値がリダイレクト先/Cookie/コマンド/SQL に入る時の注入=head と同じ形・
         #14)。その見え方は値の改行の後に照合対象の語が続く時だけ、同じ 1 回の正規化から作る(復号を
         やり直さない・[[_BODY_NL_LEAD]])。生の改行(YAML/テキスト/multipart の枠・部ヘッダの行の
-        区切り)は ';' にしない=正規にヘッダの形をした部ヘッダの並びや、テキストの行頭の語は当たらない。"""
+        区切り)は ';' にしない=正規にヘッダの形をした部ヘッダの並びや、テキストの行頭の語は当たらない。
+        全角の ｜ ＄ （ ） ； ｀ を畳むか(cfg fold_fullwidth_punct・既定 OFF)は本文も head もここで読む。
+        json_esc=True(JSON 本文・[[_json_body]])は、その見え方でだけ JSON の短いエスケープ(\\r\\n 等)も
+        値の改行として読む(他の検知が見る本文の走査面は変えない)。"""
         if acc is None:
             acc = _SigScan(self._custom_re)
         nl_rules = (tuple(r for r in _BODY_NL_RULES if only is None or r[0] in only)
                     if body else ())
         nl_wins = [] if nl_rules else None       # 値の改行を ';' にした見え方の窓(要る時だけ入る)
-        for _w in _scan_windows(text, body=body, nl_views=nl_wins):
+        for _w in _scan_windows(text, body=body, nl_views=nl_wins,
+                                fold_fw=bool(self.cfg.get("fold_fullwidth_punct")),
+                                json_esc=json_esc and body):
             self._scan_into(_w, acc, only=only, body=body)
             if acc.hit is not None and (only is not None or acc.done()):
                 break
@@ -3374,7 +3427,8 @@ class NetShield:
             if _f:
                 _targets.append(_f)
         _targets.extend(h for h in (headers or "").split("\n") if h)
-        _wins0 = _scan_windows(_targets[0])        # 主走査面(全域を窓分割=切り詰めない)
+        _wins0 = _scan_windows(_targets[0],        # 主走査面(全域を窓分割=切り詰めない)
+                               fold_fw=bool(self.cfg.get("fold_fullwidth_punct")))
         blob = _wins0[0]                           # reason/後続参照の後方互換用(先頭窓)
         # 組込は初出ヒットで確定、カスタムは全フィールドで最重を集計(#31・_SigScan)
         _acc = _SigScan(self._custom_re)
@@ -3670,6 +3724,9 @@ class NetShield:
             fields = _multipart_fields(text) or (text,)
         except Exception:
             fields = (data.decode("latin1", "replace"),)
+        # JSON 本文なら、値の改行の見え方で JSON の短いエスケープ(\r\n 等)も読む(本文全体で決める=
+        # 後ろの窓も同じ。multipart の部・フォーム・テキストの \n は字面のまま・[[_json_body]])
+        js = len(fields) == 1 and _json_body(fields[0], content_type)
         win, overlap = _MAX_SCAN, 256
         _acc = _SigScan(self._custom_re)             # 組込は初出・カスタムは全窓の最重(#31)
         for field in fields:
@@ -3678,7 +3735,7 @@ class NetShield:
                 try:
                     # 正規化 *後* を再度窓分割する: NFKC 展開(1 文字→最大 4 文字)で後半が
                     # 1 窓の外へ押し出されるのを防ぐ(生の窓の刻みだけでは足りない)。
-                    self._scan_field(field[i:i + win], acc=_acc, body=True)
+                    self._scan_field(field[i:i + win], acc=_acc, body=True, json_esc=js)
                 except Exception:
                     break
                 if _acc.done():

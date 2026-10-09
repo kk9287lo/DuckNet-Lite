@@ -5,6 +5,8 @@ tray.py — システムトレイ(Windows Shell_NotifyIcon・ctypes・標準ラ�
 pystray 等は使わず Win32 API を ctypes で直接叩く。別スレッドのメッセージループで動かし、
 メニュー選択はコールバックで通知する。非 Windows / 失敗時は no-op(アプリは継続)。
 set_status() でツールチップ/アイコンを後から差し替えられる(防御 ON/OFF の表示に使う)。
+Explorer が再起動して通知領域が作り直されたら(登録メッセージ "TaskbarCreated")、その時点の
+最新のツールチップ/アイコンでアイコンを追加し直す(トレイを起動し直さなくても消えたままにならない)。
 
 正直な範囲: Windows 専用(他 OS は available=False)。ステルス時は呼び出し側が生成可否を選ぶ。
 """
@@ -27,6 +29,8 @@ TPM_RIGHTBUTTON = 0x2
 MF_STRING, MF_SEPARATOR = 0x0, 0x800
 TIP_MAX = 127                   # szTip は WCHAR[128](127 文字+NUL)
 _WND_CLASS = "DuckNetTrayWnd"
+_TASKBAR_CREATED = "TaskbarCreated"   # 通知領域が作り直されたとき Explorer が全トップレベル窓へ送る
+MSGFLT_ALLOW = 1                # ChangeWindowMessageFilterEx: 低い整合性レベルからの受信を許す
 
 
 def available() -> bool:
@@ -87,6 +91,12 @@ class TrayIcon:
         self._applied_icon = None
         self._status_error = None        # 直近の反映失敗(None=成功)。診断・テスト用
         self._apply_thread = None        # 反映を行ったスレッド(=トレイのスレッドのはず)
+        # Explorer の再起動(TaskbarCreated)での追加し直し。id は _run が登録する(0=未登録)
+        self._wm_taskbar = 0
+        self._readd_count = 0            # 追加し直しに成功した回数
+        self._readd_op = None            # 直近の成功が NIM_ADD か NIM_MODIFY か
+        self._readd_error = None         # 直近の追加し直しの失敗(None=成功)
+        self._readd_thread = None        # 追加し直しを行ったスレッド(=トレイのスレッドのはず)
 
     def set_status(self, tooltip: str, icon_path=None) -> None:
         """ツールチップ(と、渡されればアイコン)を差し替える。どのスレッドから呼んでもよい。
@@ -170,27 +180,18 @@ class TrayIcon:
             u32.DestroyWindow.argtypes = [HWND]
             u32.UnregisterClassW.restype = BOOL
             u32.UnregisterClassW.argtypes = [LPCWSTR, HINSTANCE]
+            u32.RegisterWindowMessageW.restype = UINT
+            u32.RegisterWindowMessageW.argtypes = [LPCWSTR]
             shell.Shell_NotifyIconW.restype = BOOL
 
             WNDPROC = ctypes.WINFUNCTYPE(LRESULT, HWND, UINT, WP, LP)
 
             def wndproc(hwnd, msg, wp, lp):
-                if msg == WM_TRAY_STATUS:
-                    self._apply_status()               # set_status の反映(このスレッドで)
-                    return 0
-                if msg == WM_TRAY and lp in (WM_RBUTTONUP, WM_LBUTTONDBLCLK):
-                    if lp == WM_LBUTTONDBLCLK:
-                        self._dispatch(1)              # 既定アクション(=最初の項目)
-                    else:
-                        self._popup(hwnd)
-                    return 0
-                if msg == WM_COMMAND:
-                    self._dispatch(wp & 0xFFFF)
-                    return 0
                 if msg == WM_DESTROY:
                     u32.PostQuitMessage(0)
                     return 0
-                return u32.DefWindowProcW(hwnd, msg, wp, lp)
+                r = self._on_message(hwnd, msg, wp, lp)
+                return u32.DefWindowProcW(hwnd, msg, wp, lp) if r is None else r
 
             self._wndproc = WNDPROC(wndproc)           # GC 防止に保持
 
@@ -207,8 +208,22 @@ class TrayIcon:
             wc.hInstance = hinst
             wc.lpszClassName = _WND_CLASS
             u32.RegisterClassW(ctypes.byref(wc))
+            # Explorer の再起動を知る登録メッセージ(このスレッドで登録。失敗は 0=扱わない)。
+            # 窓を作る前に登録し、作った直後から届いても取りこぼさない。
+            self._wm_taskbar = u32.RegisterWindowMessageW(_TASKBAR_CREATED) or 0
+            # 窓はメッセージ専用(HWND_MESSAGE)にしない: TaskbarCreated はトップレベル窓への一斉送信
             hwnd = u32.CreateWindowExW(0, _WND_CLASS, "DuckNet", 0,
                                        0, 0, 0, 0, 0, 0, hinst, 0)
+            if hwnd and self._wm_taskbar:
+                # 管理者として動いていると、UIPI が通常権限の Explorer からの TaskbarCreated を
+                # 落とす。このメッセージだけはこの窓に届くようにする(無い OS・失敗は無視)。
+                try:
+                    cwmf = u32.ChangeWindowMessageFilterEx
+                    cwmf.restype = BOOL
+                    cwmf.argtypes = [HWND, UINT, DWORD, LPVOID]
+                    cwmf(hwnd, self._wm_taskbar, MSGFLT_ALLOW, None)
+                except Exception:
+                    pass
             # 大アイコン(SM_CXICON=32px 既定)で読み込む。隠れインジケータ表示や高DPIで鮮明・
             # 大きく見える。トレイ内の実寸は OS のトレイセルサイズに従う。
             sz = u32.GetSystemMetrics(11) or 32          # SM_CXICON
@@ -318,6 +333,78 @@ class TrayIcon:
             self._status_error = err
         except Exception as e:
             self._status_error = repr(e)
+
+    def _on_message(self, hwnd, msg, wp, lp):
+        """窓プロシージャの本体(トレイのスレッドで呼ばれる。WM_DESTROY だけは _run の窓
+        プロシージャが扱う)。処理したら 0、既定の処理(DefWindowProcW)へ回すなら None。"""
+        if msg and msg == self._wm_taskbar:            # 0(未登録)を WM_NULL と取り違えない
+            self._readd()                              # Explorer の再起動で通知領域が作り直された
+            return 0
+        if msg == WM_TRAY_STATUS:
+            self._apply_status()                       # set_status の反映(このスレッドで)
+            return 0
+        if msg == WM_TRAY and lp in (WM_RBUTTONUP, WM_LBUTTONDBLCLK):
+            if lp == WM_LBUTTONDBLCLK:
+                self._dispatch(1)                      # 既定アクション(=最初の項目)
+            else:
+                self._popup(hwnd)
+            return 0
+        if msg == WM_COMMAND:
+            self._dispatch(wp & 0xFFFF)
+            return 0
+        return None
+
+    def _readd(self):
+        """通知領域が作り直された(TaskbarCreated)ので、アイコンを NIM_ADD で追加し直す。
+        **トレイのスレッドの窓プロシージャからだけ**呼ぶ。出すのは起動時の値ではなく *最新の*
+        ツールチップ/アイコン(反映待ちの set_status の値も含む)。アイコンが変わっていなければ
+        手元のハンドルをそのまま渡す(シェルは自前の複製を持つ)。差し替えるなら、追加できてから
+        前のハンドルを破棄し、追加できなければ新しい方を破棄して元に戻す(手元の nid.hIcon は
+        常に有効な 1 個=終了時に破棄する)。アイコンが残っている(作り直されていない)と NIM_ADD は
+        失敗するので NIM_MODIFY で揃える。起動時の追加に失敗していた(Explorer がまだ無かった)
+        トレイもここで出る。例外は外へ出さない(窓プロシージャで落とさない)。"""
+        try:
+            nid, api = self._nid, self._api
+            if nid is None or api is None:
+                return
+            import ctypes
+            u32, shell = api
+            self._readd_thread = threading.get_ident()
+            with self._lock:
+                tip, icon = self.tooltip, self.icon_path
+            old_icon, new_icon, err, done = nid.hIcon, None, None, None
+            if icon and (icon != self._applied_icon or not old_icon):
+                sz = self._icon_size
+                new_icon = u32.LoadImageW(0, icon, IMAGE_ICON, sz, sz, LR_LOADFROMFILE)
+                if not new_icon:
+                    err = "LoadImageW failed: %s" % icon   # 手元のアイコンで出し、次の更新で再試行
+            try:
+                nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP
+                nid.szTip = tip
+                if new_icon:
+                    nid.hIcon = new_icon
+                for op in (NIM_ADD, NIM_MODIFY):
+                    if shell.Shell_NotifyIconW(op, ctypes.byref(nid)):
+                        done = op
+                        break
+            finally:
+                if done is None and new_icon:          # 渡せなかった新しいハンドルは捨てる
+                    nid.hIcon = old_icon
+                    u32.DestroyIcon(new_icon)
+            if done is None:
+                self._readd_error = "Shell_NotifyIconW(NIM_ADD) failed"
+                return
+            self._added = True                         # 以後の set_status は NIM_MODIFY で届く
+            self._applied_tip = tip
+            if new_icon:
+                self._applied_icon = icon
+                if old_icon:
+                    u32.DestroyIcon(old_icon)
+            self._status_error = err                   # 表示は最新の値になった(前の失敗は解消)
+            self._readd_op, self._readd_error = done, err
+            self._readd_count += 1                     # 最後に数える(テストはこれを待つ)
+        except Exception as e:
+            self._readd_error = repr(e)
 
     def _popup(self, hwnd):
         import ctypes

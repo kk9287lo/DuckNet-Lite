@@ -66,7 +66,9 @@ def test_rv4_folded_disposition_lines_do_not_rescan_the_block():
     t_plain, h1 = _stream_ms(plain)
     t_fold, h2 = _stream_ms(folded)
     assert h1 is None and h2 is None, (h1, h2)
-    assert t_fold < 4 * max(t_plain, 1.0), (t_plain, t_fold)
+    # 修正前は 21 倍超(折り返しを倍にすると 87 倍)、修正後は 1.6 倍前後。4 倍では検証を並行で
+    # 走らせた高負荷時に 4.5 倍まで揺れて落ちたので、2 乗の振る舞いを確実に捉える 10 倍にする。
+    assert t_fold < 10 * max(t_plain, 1.0), (t_plain, t_fold)
 
 
 def test_rv4_too_many_part_header_lines_fail_closed():

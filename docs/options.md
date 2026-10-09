@@ -37,6 +37,7 @@ DuckNet の挙動は CLI 引数・環境変数・設定キー(cfg)で制御し�
 | --- | --- | --- |
 | `enabled` | `False` | 防御全体の ON/OFF(既定 OFF=完全パススルー)。 |
 | `paranoia` | `1` | 検知の厳格度 1–4。上げるほど誤検知しやすい任意シグネチャを段階的に有効化(2: オープンリダイレクト、3: +内部宛て SSRF、4: +テンプレート注入)。整数以外は拒否(現状維持)。 |
+| `fold_fullwidth_punct` | `False` | 全角の `｜` `＄` `（` `）` `；` `｀` を、URL・ヘッダ・本文のどれでも ASCII の `\|` `$` `(` `)` `;` `` ` `` へ畳んで照合する(前の版の NFKC と同じ)。既定 OFF では日本語の文の記号として空白に読む。**ON にするのは**、保護するバックエンド自身が全角を ASCII へ変換する場合だけ(入力へ NFKC を掛けるアプリ、Windows の best-fit 変換で全角を ANSI へ落とす部品など。全角のまま書いた `｜` がシェル/SQL で本物のメタ文字になる)。ON にすると `データ分析の基礎｜Python` のような題名が前の版と同じく rce 等に当たる(検索 1 回で 60 点=単発拒否の `deny_score` 超)。true/false 以外は拒否(現状維持)。 |
 | `deny_score` / `block_score` | `40` / `100` | 単発拒否(BANなし) / 遮断+自動BAN の脅威スコア閾値。 |
 | `ban_ttl_sec` | `300` | 自動BAN の継続秒(累犯は `ban_escalation`/`ban_escalation_cap` で延長)。 |
 | `body_scan_enabled` / `body_scan_max_bytes` | `True` / `65536` | 要求ボディのシグネチャ走査と上限バイト。multipart でない本文のうち、`Content-Type` がバイナリ型 *かつ* 中身もバイナリ(タブ/CR/LF 以外の制御バイトを含む)のものは署名走査せず、metrics の `body_binary_skipped` に数える([defenses.md](defenses.md) の「要求ボディ検査の範囲」)。 |
