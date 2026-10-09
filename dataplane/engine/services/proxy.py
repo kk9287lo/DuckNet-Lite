@@ -604,6 +604,13 @@ _PAGE_CSS = (
     "h2{color:#f85149}.logo{font-size:13px;color:#58a6ff;margin-bottom:8px}")
 
 
+def _cover_brand(default: str) -> str:
+    """案内ページの表示名(DUCKNET_COVER。空・空白だけなら default)。Server ヘッダや題名へ入るので
+    制御文字は空白にして前後を落とす(CRLF の env ファイルから読むと末尾に CR が残る)。"""
+    v = os.environ.get("DUCKNET_COVER", "")
+    return "".join(ch if ch.isprintable() else " " for ch in v).strip() or default
+
+
 def _block_page(info: dict, submitted: bool = False, msg: str = "") -> bytes:
     """アクセス遮断ページ(商用WAF風)。数分後に解除リクエスト(異議申立)フォームを出す。
     表示名は環境変数 DUCKNET_COVER で差し替え可(ステルス時=製品名を露見させない)。
@@ -611,7 +618,7 @@ def _block_page(info: dict, submitted: bool = False, msg: str = "") -> bytes:
     import html as _html
     from ..core.i18n import t, lang
     lg = lang()
-    brand = _html.escape(os.environ.get("DUCKNET_COVER", "DuckNet-Lite"))
+    brand = _html.escape(_cover_brand("DuckNet-Lite"))
     remain = int(info.get("remain_sec", 0))
     if submitted:
         center = (f"<h2>{t('block.received.h')}</h2>"
@@ -808,7 +815,7 @@ def _guard_page(lg: str, head_key: str, body: str, tone: str = "",
     body/head/tail は呼び出し側でエスケープ済みの HTML 断片。末尾に発生時刻(UTC)を添える
     (訪問者が管理者へ伝えられるように)。"""
     import html as _html
-    brand = _html.escape(os.environ.get("DUCKNET_COVER", "DuckNet-Lite"))
+    brand = _html.escape(_cover_brand("DuckNet-Lite"))
     h = _pgh(head_key, lg)
     ts = time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime())
     page = (
@@ -2195,6 +2202,10 @@ class AsyncEdgeGuard:
                             "body_unscannable", 0) + 1
                         return bytes(extra), "unscannable"
             kw = {"content_type": body_ct} if body_ct else {}   # 型の無い要求は従来どおりの呼び方
+            if len(cts) > 1:
+                # 重複した Content-Type は型を渡さない(上の T1)が、宣言された charset はどれを
+                # backend が採っても読めるように全部を渡す(どれかで読み直して走査する)。
+                kw["charsets"] = ", ".join(cts)
             blocked = sh.inspect_body(ip, pb, **kw).get("action") == "block"   # 無効なら allow
             if not blocked and upload_on:              # #66: 危険なアップロード拡張子も拒否
                 us = None if encoded else sh.upload_scanner(mp_ct, pb, chunked_te)

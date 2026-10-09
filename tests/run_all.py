@@ -166,6 +166,9 @@ MODULES = [
     "test_sweep_rem_tray",            # Explorer 再起動(TaskbarCreated)でトレイのアイコンを付け直す
     "test_sweep_rem_fwfold",          # fold_fullwidth_punct(既定 OFF)で全角記号も畳む運用
     "test_sweep_upd_integrity",       # 同じ場所で更新したとき完全性監視が中核を旧版へ戻さない
+    "test_sweep_rem_charset",         # 本文を宣言された charset でも読む・GraphQL のフラグメントを展開して数える
+    "test_sweep_rem_geoip",           # GeoIP: 入れ子の CIDR・IPv6 の行・IPv4-mapped で国判定が外れない
+    "test_sweep_rem_cover",           # 表示名の制御文字・空の DUCKNET_COVER・Tomcat の偽バナーに PHP を付けない
 ]
 
 

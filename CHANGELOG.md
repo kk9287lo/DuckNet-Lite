@@ -130,6 +130,30 @@
   上げた(旧版で保存した 100 はそのまま残るので見直す)。GET の `?query=`・urlencoded の `query=`・
   multipart の `operations` も検査する。`__typename` はイントロスペクション扱いしない。`graphql_paths` は
   正規化したパスで照合する。
+- **GraphQL(符号化とフラグメント)**: 本文の符号化を JSON の仕様どおりに判定する(BOM、無ければ先頭の NUL の
+  並び=Python の `json.loads` や Jackson と同じ)。以前は本文を常に latin-1 で読み、UTF-16/32 の JSON 本文を
+  「GraphQL でない」か深さ 1 の文書と見て、深さ・複雑度の上限を素通りさせていた(backend はその本文を読む)。
+  `Content-Type` で `charset` が宣言されていればその読み方(EBCDIC・Shift_JIS など。BOM の無い UTF-16/32 は
+  両方のバイト順)でも照合し、どれか 1 つでも上限を超えるか読めなければ遮断する(multipart の `operations` 欄は
+  パートの `Content-Type` の `charset` でも読む)。名前付きフラグメントは展開した
+  先まで数えた実効の深さ・選択数(操作ごと)でも照合する。以前は `...F` を 1 選択と数えるだけで、2 回ずつ次の
+  フラグメントを展開する 16 段の連鎖(実行時は 65536 選択)を 34 選択として通していた。フラグメントの循環は
+  `fragment-cycle` として遮断する。解決は再帰しない(5 万段の連鎖も入力長に比例する時間で数える)
+  ([docs/defenses.md](docs/defenses.md))。
+- **地域判定(`geo_cidrs`)**: `::ffff:a.b.c.d` を IPv4 として `geo_cidrs` と照合する(proxy は以前から正規化して
+  渡すので、`NetShield.inspect` を直接呼ぶ使い方だけが該当。以前は `geo_mode=block` が効かず、`allow` では
+  許可した地域の IPv4 クライアントも遮断した)。
+- **表示名(`DUCKNET_COVER`)**: 管理画面の Server ヘッダ・題名と遮断ページへ入れる前に制御文字を除く(CRLF の
+  env ファイルから読むと末尾に CR が残り、Server ヘッダの行がそのまま壊れていた)。空・空白だけの値は未設定として
+  製品名を出す(以前はアイコンの判定と食い違い、空の名前を出していた)。
+- **偽バナー(`DUCKNET_DECEPTION`)**: Tomcat(`Apache-Coyote`)の偽バナーに PHP の `X-Powered-By` を付けない
+  (系統を Apache と数えていたため、嘘が内部で矛盾していた)。
+- **本文の署名走査(宣言された charset)**: `Content-Type` で UTF-8 以外の `charset` が宣言された本文は、その
+  charset で読んだ字面も走査する(EBCDIC の IBM037/IBM500/IBM1047・UTF-7・UTF-16/32・Shift_JIS 等。Python に
+  無い IBM1047 は IBM037 との差の 6 字を置き換えて読む)。以前は本文を UTF-8/latin-1 でしか読まず、宣言どおりに
+  読む backend(Java の Servlet/Spring 等)には EBCDIC や UTF-7 で書いた本文が素通りだった。`Content-Type` が
+  重複していても、どれの `charset` でも読む。charset の名前は別名表と実在する codec で確かめてから引く
+  (未知の名前をそのまま引くと Python の codec の表に 1 件ずつ溜まり続ける)。
 - **出口 DLP**: 有効時は backend へ `Accept-Encoding: identity` を渡す(それでも圧縮で返った本文は
   `dlp_unscannable` として `dlp_action` どおり)。chunked は枠を外し、読取の切れ目をまたいで走査する。
   カード番号は主要ブランド(Maestro・RuPay は登録された番号範囲)の IIN+14〜19 桁+Luhn(13 桁の JAN/EAN

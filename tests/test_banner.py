@@ -64,6 +64,8 @@ def test_companion_headers_are_consistent_with_server_family():
             d = dict(hs[1:])
             if f == "microsoft":
                 assert d.get("X-Powered-By") == "ASP.NET"; saw_companion = True
+            elif hs[0][1].startswith("Apache-Coyote"):    # Tomcat(Java)に PHP は矛盾
+                assert "X-Powered-By" not in d, d
             elif f in ("apache", "litespeed"):
                 assert d.get("X-Powered-By", "").startswith("PHP/"); saw_companion = True
             elif f == "cloudflare":

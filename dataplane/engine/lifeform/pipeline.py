@@ -925,9 +925,11 @@ def _mp_boundaries(content_type: str, sample: bytes = b"") -> list:
     return out[:4]
 
 
-def _multipart_field(body: bytes, boundaries, field: str):
+def _multipart_field(body: bytes, boundaries, field: str, *, want_type: bool = False):
     """multipart 本文から name=field のパートの中身(bytes)を返す。無ければ None、本文内で完結
-    しない(ヘッダや次の区切りが無い)なら False。GraphQL multipart の operations 欄用(#5)。"""
+    しない(ヘッダや次の区切りが無い)なら False。GraphQL multipart の operations 欄用(#5)。
+    want_type=True なら (中身, そのパートの Content-Type の値(重複はカンマで連結・無ければ "")) を返す
+    (フォームの欄をパートの charset で読む実装=Node の busboy 等に合わせて読み直すため)。"""
     res = None
     for bnd in boundaries:
         pat = b"--" + bytes(bnd)
@@ -954,10 +956,14 @@ def _multipart_field(body: bytes, boundaries, field: str):
                     break
                 pos = e + 1
             name = ""
+            ptypes = []
             for ln in body[j + 1:pos].split(b"\n"):
                 nm, _, val = ln.rstrip(b"\r").partition(b":")
-                if nm.strip().lower() == b"content-disposition":
+                key = nm.strip().lower()
+                if key == b"content-disposition":
                     name = dict(_mp_params(val.decode("latin1", "replace"))).get("name", name)
+                elif key == b"content-type":
+                    ptypes.append(val.strip().decode("latin1", "replace"))
             start = e + 1
             if name == field:
                 k = start - 1                     # 中身が空なら空行の LF の直後が区切り
@@ -970,7 +976,8 @@ def _multipart_field(body: bytes, boundaries, field: str):
                 end = k - 1
                 if end > start and body[end - 1] == 0x0D:
                     end -= 1
-                return body[start:max(start, end)]
+                content = body[start:max(start, end)]
+                return (content, ", ".join(ptypes)) if want_type else content
             i = start
     return res
 
@@ -2975,6 +2982,8 @@ class NetShield:
         if (gm == "allow") or (gm == "block" and self._geo_nets):
             try:
                 addr = ipaddress.ip_address(ip)
+                if addr.version == 6 and addr.ipv4_mapped:   # ::ffff:a.b.c.d は IPv4 の CIDR と照合
+                    addr = addr.ipv4_mapped                  # (proxy は正規化して渡す。API の直呼び用)
                 inside = any(addr in net for net in self._geo_nets)
             except Exception:
                 inside = False
@@ -3698,13 +3707,17 @@ class NetShield:
         return {"action": "block" if banned else "score", "banned": banned,
                 "score": round(score, 1)}
 
-    def inspect_body(self, ip: str, body: bytes, *, content_type: str = "") -> dict:
+    def inspect_body(self, ip: str, body: bytes, *, content_type: str = "",
+                     charsets: str = None) -> dict:
         """要求ボディ先頭(有界)をシグネチャ走査して脅威スコアへ還元する(evolution #61)。
         head と同じ正規化+署名エンジンを使い、POST/JSON/GraphQL 本文に潜む SQLi/XSS/RCE/SSTI
         など head-only 検査の死角を捉える。block_score 超で BAN(enforce 時)。監査モードは記録のみ。
         proxy が本文先頭を読んでから(転送前に)呼ぶ。空/無効/ヒット無しは allow。
         content_type(要求の Content-Type・省略可)がバイナリ型で、走査する先頭の中身もバイナリなら
-        署名走査せず allow(skipped="binary")にして metrics の body_binary_skipped に数える(T1)。"""
+        署名走査せず allow(skipped="binary")にして metrics の body_binary_skipped に数える(T1)。
+        content_type で charset が宣言されていれば、その読み方(UTF-8 と違う字面になるときだけ)も走査する。
+        charsets は charset を読む Content-Type の値(重複ヘッダはカンマで連結したもの)。省略時は
+        content_type(proxy は重複ヘッダのとき content_type を渡さないので、こちらで全部を渡す)。"""
         if not self.is_enabled() or not self.cfg.get("body_scan_enabled") or not body:
             return {"action": "allow"}
         cap = int(self.cfg.get("body_scan_max_bytes", 65536))
@@ -3723,19 +3736,38 @@ class NetShield:
             text = _body_text(data)
             fields = _multipart_fields(text) or (text,)
         except Exception:
-            fields = (data.decode("latin1", "replace"),)
+            text = data.decode("latin1", "replace")
+            fields = (text,)
         # JSON 本文なら、値の改行の見え方で JSON の短いエスケープ(\r\n 等)も読む(本文全体で決める=
         # 後ろの窓も同じ。multipart の部・フォーム・テキストの \n は字面のまま・[[_json_body]])
         js = len(fields) == 1 and _json_body(fields[0], content_type)
+        scans = [(f, js) for f in fields]
+        # 宣言された charset の読み方も走査する: 本文を宣言どおりに読むバックエンド(Java の Servlet/
+        # Spring 等)には、EBCDIC(IBM037/IBM500/IBM1047)・UTF-7・2 バイト目に ASCII の値を含む符号化
+        # (Shift_JIS 等)の本文が、UTF-8/latin-1 で読んだ字面と違う字に見える。UTF-16/32 は NUL を除く
+        # 正規化でも拾えるが、宣言があれば正しく読んだ字面も見る。違う字面になる読み方だけを足す。
+        try:
+            alts = saferegex.declared_readings(data, content_type if charsets is None else charsets)
+        except Exception:
+            alts = []
+        for alt in alts:
+            if alt == text:
+                continue
+            try:
+                parts = _multipart_fields(alt) or (alt,)
+            except Exception:
+                parts = (alt,)
+            ajs = len(parts) == 1 and _json_body(parts[0], content_type)
+            scans += [(p, ajs) for p in parts]
         win, overlap = _MAX_SCAN, 256
         _acc = _SigScan(self._custom_re)             # 組込は初出・カスタムは全窓の最重(#31)
-        for field in fields:
+        for field, fjs in scans:
             i = 0
             while i < len(field):
                 try:
                     # 正規化 *後* を再度窓分割する: NFKC 展開(1 文字→最大 4 文字)で後半が
                     # 1 窓の外へ押し出されるのを防ぐ(生の窓の刻みだけでは足りない)。
-                    self._scan_field(field[i:i + win], acc=_acc, body=True, json_esc=js)
+                    self._scan_field(field[i:i + win], acc=_acc, body=True, json_esc=fjs)
                 except Exception:
                     break
                 if _acc.done():
@@ -3839,22 +3871,25 @@ class NetShield:
         lim = self.graphql_max_bytes(path)
         if not lim:
             return {"action": "allow"}
-        from .graphql import parse_body, form_queries, check
+        from .graphql import parse_readings, form_queries, check
         body = bytes(body or b"")
         qs = (path or "").split("?", 1)[1].split("#", 1)[0] if "?" in (path or "") else ""
         url_q = form_queries(qs) if qs else []
-        body_q, err, too_big = [], "", False
+        # 本文の読み方ごとの (queries, err)。JSON の仕様どおりの判定(UTF-16/32 も)と、宣言された
+        # charset の読み方の両方を照合する(バックエンドによって読み方が違う)。
+        readings, too_big = [], False
         bnds = _mp_boundaries(content_type) if content_type else []
         if bnds:              # graphql-multipart-request-spec: operations 欄が GraphQL(ファイルは対象外)
-            ops = _multipart_field(body[:lim + 1], bnds, "operations")
+            ops = _multipart_field(body[:lim + 1], bnds, "operations", want_type=True)
             if ops is False:
                 too_big = len(body) > lim or not complete    # operations が上限内で完結しない
             elif ops is not None:
-                body_q, err = parse_body(ops, "application/json")
+                # 欄は JSON として読む。パートの Content-Type に charset があればその読み方も照合する
+                readings = parse_readings(ops[0], "application/json", charsets=ops[1])
         elif not complete or len(body) > lim:
             too_big = True
         elif body:
-            body_q, err = parse_body(body, content_type)
+            readings = parse_readings(body, content_type)
         if too_big:
             with self._lock:
                 if self.cfg.get("mode") == "audit":
@@ -3863,17 +3898,17 @@ class NetShield:
                     return {"action": "allow"}
                 self._event(ip, "graphql_too_large", {"limit": lim})
             return {"action": "reject", "status": 413, "reason": "too-large"}
-        if err:
-            res = {"allowed": False, "reason": err}
-        else:
-            lims = dict(max_depth_limit=int(self.cfg.get("graphql_max_depth", 12)),
-                        max_complexity=int(self.cfg.get("graphql_max_complexity", 1000)),
-                        block_introspection=bool(self.cfg.get("graphql_block_introspection",
-                                                              True)),
-                        max_batch=int(self.cfg.get("graphql_max_batch", 10)))
-            res = check(body_q, **lims)
-            if res["allowed"] and url_q:
-                res = check(url_q, **lims)
+        lims = dict(max_depth_limit=int(self.cfg.get("graphql_max_depth", 12)),
+                    max_complexity=int(self.cfg.get("graphql_max_complexity", 1000)),
+                    block_introspection=bool(self.cfg.get("graphql_block_introspection", True)),
+                    max_batch=int(self.cfg.get("graphql_max_batch", 10)))
+        res = {"allowed": True, "reason": "not-graphql"}
+        for body_q, err in readings:
+            res = {"allowed": False, "reason": err} if err else check(body_q, **lims)
+            if not res["allowed"]:
+                break
+        if res["allowed"] and url_q:
+            res = check(url_q, **lims)
         if res["allowed"]:
             return {"action": "allow"}
         with self._lock:

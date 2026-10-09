@@ -10,13 +10,19 @@ GraphQL は1エンドポイント(例 /graphql)に任意の問い合わせを PO
 完全なパーサではなく、字句解析+文脈の追跡で *構造の指標* を取る軽量ガード:
   · 深さ   … 選択セットのネスト。引数/変数既定値の入力オブジェクト({a:{b:1}})は数えない。
   · 複雑度 … 文書に書かれた選択(フィールド。エイリアス付きも 1 個ずつ・...Fragment 展開も 1)の数。
+  · 実効の深さ・複雑度 … 名前付きフラグメント(fragment F on T {…})を展開した先まで数えた値
+    (操作ごとの最大)。上限照合は字面と実効の大きい方で行う。フラグメントが 2 回ずつ次の
+    フラグメントを展開する連鎖は、字面では数十個でも実行時には 2^段数 個の選択になる。
+    フラグメントの循環(F→G→F)は上限超過として扱う(GraphQL の仕様では無効な文書)。
   · イントロスペクション … フィールド名がちょうど __schema / __type のとき。__typename は通常の
     メタフィールド(Apollo/urql が全選択に付ける)なので対象外。
 文字列("…" / \"\"\"…\"\"\")と '#' コメント内は構造に数えない。字句は正規表現の search で拾い、
 文字列/コメントは find で読み飛ばす=入力長に線形(呼び出し側が graphql_max_bytes で長さを抑える)。
+フラグメントの解決も再帰しない(展開の連鎖が深くてもスタックを使わない)。
 """
 from __future__ import annotations
 
+import codecs
 import re
 
 # 選択セット内で意味を持つ字句(名前/数値/... /構造記号/文字列・コメントの開始)。空白・カンマ等は
@@ -31,6 +37,15 @@ _INTROSPECTION = frozenset(("__schema", "__type"))
 _JSONISH = re.compile(r'\s*(?:\[|\{\s*")')
 # urlencoded フォームらしい書き出し(name=…)。生の GraphQL 文書はこの形では始まらない。
 _FORMISH = re.compile(r'[\w.%\[\]-]+=')
+# JSON の値の書き出し(json.loads が受け付ける NaN/Infinity を含む)。これで始まらない本文は JSON として
+# 読めないので、json の深さ検査(1 文字ずつの走査)を省く。
+_JSON_START = re.compile(r'[\[{"\-0-9tfnNI]')
+# 定義の前の読み飛ばす字句(空白・カンマ・BOM・'#' コメント)。後ろに何も続けない match だけで使う
+# (=後戻りしない)。
+_IGNORED = re.compile(r'(?:[\s,\ufeff]|#[^\n\r]*)*')
+_NAME = re.compile(r'[_A-Za-z][_0-9A-Za-z]*')
+_NAME_CHAR = re.compile(r'[_0-9A-Za-z]')
+_CAP = 1 << 30                                    # 実効の数の頭打ち(整数を大きくしない)
 
 
 def _skip_string(q: str, i: int, n: int) -> int:
@@ -59,8 +74,64 @@ def _skip_string(q: str, i: int, n: int) -> int:
             return m.start()                      # 改行=未終端(字句エラー)。ここで閉じる
 
 
+def _fragment_name(q: str, start: int, end: int):
+    """q[start:end](定義の '{' の前)が 'fragment 名前 …' ならその名前、違えば None。"""
+    i = _IGNORED.match(q, start, end).end()
+    if not q.startswith("fragment", i) or i + 8 >= end or _NAME_CHAR.match(q, i + 8):
+        return None
+    m = _NAME.match(q, _IGNORED.match(q, i + 8, end).end(), end)
+    return m.group() if m else None
+
+
+def _expand(own, frags, done):
+    """1 つの定義の実効の (深さ, 選択数)。own={"depth", "fields", "spreads": [(深さ, 名前)…]}。
+    展開先は done(解決済みのフラグメント)から引く。未定義のフラグメントは字面どおり 1 選択。
+    フラグメントの根の選択セットは展開した位置の選択セットに混ざる(深さ k の展開は k-1+展開先の深さ)。"""
+    d, f = own["depth"], own["fields"]
+    for k, name in own["spreads"]:
+        got = done.get(name)
+        if got is not None:
+            if k - 1 + got[0] > d:
+                d = k - 1 + got[0]
+            f += got[1]
+        elif name not in frags:
+            f += 1
+    return min(d, _CAP), min(f, _CAP)
+
+
+def _resolve(frags) -> tuple:
+    """名前付きフラグメントを展開した実効の (深さ, 選択数) を名前ごとに求める(再帰しない深さ優先)。
+    返り値 (解決済み {名前: (深さ, 選択数)}, 循環があったか)。"""
+    done, state, cycle = {}, {}, False
+    for root in frags:
+        if root in state:
+            continue
+        state[root] = 1                           # 1=展開中 / 2=解決済み
+        stack = [(root, 0)]
+        while stack:
+            name, i = stack[-1]
+            sp = frags[name]["spreads"]
+            if i < len(sp):
+                stack[-1] = (name, i + 1)
+                tgt = sp[i][1]
+                if tgt in frags:
+                    st = state.get(tgt)
+                    if st == 1:
+                        cycle = True              # 展開中のものへ戻る=循環
+                    elif st is None:
+                        state[tgt] = 1
+                        stack.append((tgt, 0))
+                continue
+            done[name] = _expand(frags[name], frags, done)
+            state[name] = 2
+            stack.pop()
+    return done, cycle
+
+
 def analyze(q: str) -> dict:
-    """GraphQL 文書の構造指標 {"depth", "fields", "sets", "introspection"} を返す。
+    """GraphQL 文書の構造指標 {"depth", "fields", "sets", "introspection", "depth_eff", "fields_eff",
+    "cycle"} を返す。depth/fields は文書の字面、*_eff は名前付きフラグメントを展開した操作ごとの最大、
+    cycle はフラグメントの循環。
     文脈スタック: S=選択セット / A=引数・変数定義 / O=入力オブジェクト / L=リスト。'{' は文書レベルと
     選択セット内でだけ選択セット、引数/値の中では入力オブジェクト(深さ・選択数に数えない)。"""
     q = str(q)
@@ -70,6 +141,9 @@ def analyze(q: str) -> dict:
     intro = False
     prev = ""                                     # 直前の意味ある字句(コメントは透明)
     spread = on_type = False                      # 直前が '...' / '... on'
+    cur = None                                    # いま読んでいる定義(操作/フラグメント)
+    def_start = 0                                 # その定義の頭(直前の定義の '}' の後)
+    frags, ops = {}, []
     pos = 0
     while pos < n:
         in_sel = bool(stack) and stack[-1] == "S"
@@ -90,17 +164,30 @@ def analyze(q: str) -> dict:
             prev = '"'
         elif c == "{":
             if not stack or stack[-1] == "S":
+                if not stack:                     # 文書レベルの '{'=定義(操作/フラグメント)の始まり
+                    cur = {"depth": 0, "fields": 0, "spreads": []}
+                    name = _fragment_name(q, def_start, m.start())
+                    if name is None:
+                        ops.append(cur)
+                    elif name in frags:           # 同名の重複(仕様では無効)=重い側に倒して合算
+                        cur = frags[name]
+                    else:
+                        frags[name] = cur
                 stack.append("S")
                 depth += 1
                 sets += 1
                 if depth > maxd:
                     maxd = depth
+                if cur is not None and depth > cur["depth"]:
+                    cur["depth"] = depth
             else:
                 stack.append("O")
             prev = "{"
         elif c == "}":
             if stack and stack.pop() == "S":
                 depth -= 1
+            if not stack and cur is not None:     # 定義の終わり
+                cur, def_start = None, pos
             prev = "}"
         elif c == "(":
             stack.append("A")
@@ -131,13 +218,23 @@ def analyze(q: str) -> dict:
                     on_type = True                # インラインフラグメントの型条件が続く
                 else:
                     fields += 1                   # ...Fragment 展開も 1 選択
+                    if cur is not None:
+                        cur["spreads"].append((depth, t))
             else:
                 if prev != ":":
                     fields += 1                   # エイリアス a: f は 1 選択(f 側は数えない)
+                    if cur is not None:
+                        cur["fields"] += 1
                 if t in _INTROSPECTION:
                     intro = True
             prev = "n"
-    return {"depth": maxd, "fields": fields, "sets": sets, "introspection": intro}
+    done, cycle = _resolve(frags) if frags else ({}, False)
+    deff = feff = 0
+    for op in ops:
+        d, f = _expand(op, frags, done)
+        deff, feff = max(deff, d), max(feff, f)
+    return {"depth": maxd, "fields": fields, "sets": sets, "introspection": intro,
+            "depth_eff": deff, "fields_eff": feff, "cycle": cycle}
 
 
 def extract_queries(body) -> list:
@@ -146,19 +243,72 @@ def extract_queries(body) -> list:
     return parse_body(body)[0]
 
 
+def _json_encoding(b: bytes) -> str:
+    """本文の符号化を JSON の仕様どおりに判定する(RFC 4627 の方法=Python の json.loads・Jackson と同じ):
+    BOM があればそれ、無ければ先頭 4 バイトの NUL の並び(JSON の先頭は必ず ASCII の字)。"""
+    if b.startswith((codecs.BOM_UTF32_BE, codecs.BOM_UTF32_LE)):
+        return "utf-32"
+    if b.startswith((codecs.BOM_UTF16_BE, codecs.BOM_UTF16_LE)):
+        return "utf-16"
+    if b.startswith(codecs.BOM_UTF8):
+        return "utf-8-sig"
+    if len(b) >= 4:
+        if not b[0]:
+            return "utf-16-be" if b[1] else "utf-32-be"
+        if not b[1]:
+            return "utf-16-le" if b[2] or b[3] else "utf-32-le"
+    elif len(b) == 2:
+        if not b[0]:
+            return "utf-16-be"
+        if not b[1]:
+            return "utf-16-le"
+    return "utf-8"
+
+
+def _readings(body, charsets: str = "") -> list:
+    """本文の読み方(文字列)の並び。最初が JSON の仕様どおりの判定で読んだもの。charsets(Content-Type の
+    値)で charset が宣言されていれば、その読み方(違う字面になるものだけ)を後ろに足す。バックエンドには
+    判定で読むもの(Python・Jackson)と宣言で読むもの(Spring・Node の body-parser 等)があるので、両方を照合する。"""
+    if not isinstance(body, (bytes, bytearray)):
+        return [str(body).lstrip("\N{ZERO WIDTH NO-BREAK SPACE}")]   # BOM
+    b = bytes(body)
+    enc = _json_encoding(b)
+    if enc in ("utf-8", "utf-8-sig"):
+        # 構造の字句は ASCII だけ。UTF-8 の多バイト文字は ASCII のバイトを含まないので、latin-1 で読んでも
+        # 字句は同じ(不正なバイト列でも読み切れる)。UTF-8 BOM(.NET 等が付ける)は飛ばす。
+        first = (b[3:] if enc == "utf-8-sig" else b).decode("latin1")
+    else:
+        first = b.decode(enc, "replace").lstrip("\N{ZERO WIDTH NO-BREAK SPACE}")
+    out = [first]
+    if charsets:
+        from ..core import saferegex
+        for t in saferegex.declared_readings(b, charsets):
+            if t not in out:
+                out.append(t)
+    return out
+
+
 def parse_body(body, content_type: str = "") -> tuple:
     """要求本文から GraphQL 文書群を取り出す。返り値 (queries, err)。
     application/x-www-form-urlencoded(と 'query=' で始まる本文)は query 欄、JSON は query(配列は
     バッチ)、それ以外の本文は生の文書(application/graphql)として読む。err="malformed" は JSON の
     封筒に見えるのに読めない本文(深すぎる入れ子を含む)=生文書として数えると封筒全体が深さ 1 に
-    見えて上限を素通りするので、呼び出し側がフェイルクローズする。"""
-    if isinstance(body, (bytes, bytearray)):
-        b = bytes(body)
-        if b.startswith(b"\xef\xbb\xbf"):          # UTF-8 BOM(.NET 等が付ける)は飛ばす
-            b = b[3:]
-        text = b.decode("latin1", "replace")
-    else:
-        text = str(body).lstrip("\N{ZERO WIDTH NO-BREAK SPACE}")   # BOM
+    見えて上限を素通りするので、呼び出し側がフェイルクローズする。
+    bytes の本文は JSON の仕様どおりに符号化を判定して読む(UTF-16/32 の JSON も読める)。宣言された
+    charset の読み方まで照合するときは parse_readings を使う。"""
+    return _parse_text(_readings(body)[0], content_type)
+
+
+def parse_readings(body, content_type: str = "", charsets: str = None) -> list:
+    """本文の読み方ごとの (queries, err) の並び(最初は parse_body と同じ)。呼び出し側はすべてを照合し、
+    1 つでも上限を超える/読めない読み方があれば拒否する。charsets は charset を読む Content-Type の値
+    (省略時は content_type。multipart の欄はパートの Content-Type を渡す)。"""
+    texts = _readings(body, content_type if charsets is None else charsets)
+    return [_parse_text(t, content_type) for t in texts]
+
+
+def _parse_text(text: str, content_type: str = "") -> tuple:
+    """文字列にした本文 1 つの (queries, err)(parse_body の本体)。"""
     text = text.strip()
     if not text:
         return [], ""
@@ -166,8 +316,10 @@ def parse_body(body, content_type: str = "") -> tuple:
     if ct == "application/x-www-form-urlencoded":
         return form_queries(text), ""
     # 再帰爆弾([[[[…]]]] 等)は深さで *パース前* に弾く(json の深さ制限の甘さ=自己DoS回避)。
+    # JSON の値で始まらない本文は JSON として読めないので、1 文字ずつの深さ検査を省く。
     from ..core import saferegex
-    d = saferegex.safe_json_loads(text, default=None)
+    d = (saferegex.safe_json_loads(text, default=None) if _JSON_START.match(text)
+         else None)
     if d is not None:                              # 妥当な JSON=GraphQL over JSON として解釈
         if isinstance(d, list):
             return [str(o.get("query", "")) for o in d
@@ -218,17 +370,22 @@ def has_introspection(q: str) -> bool:
 def check(queries, *, max_depth_limit: int = 12, max_complexity: int = 1000,
           block_introspection: bool = True, max_batch: int = 10) -> dict:
     """クエリ群を上限照合。返り値 {"allowed":bool, "reason":..}。GraphQL でない=allowed(not-graphql)。
-    複雑度は選択(フィールド。エイリアス付きも 1 個ずつ)の数。"""
+    複雑度は選択(フィールド。エイリアス付きも 1 個ずつ)の数。深さ・複雑度は文書の字面と、名前付き
+    フラグメントを展開した実効の大きい方で見る。フラグメントの循環は fragment-cycle で拒否する。"""
     if not queries:
         return {"allowed": True, "reason": "not-graphql"}
     if len(queries) > max_batch:
         return {"allowed": False, "reason": f"batch-too-large:{len(queries)}"}
     for q in queries:
         a = analyze(q)
-        if a["depth"] > max_depth_limit:
-            return {"allowed": False, "reason": f"depth:{a['depth']}"}
-        if a["fields"] > max_complexity:
-            return {"allowed": False, "reason": f"complexity:{a['fields']}"}
+        if a["cycle"]:
+            return {"allowed": False, "reason": "fragment-cycle"}
+        depth = max(a["depth"], a["depth_eff"])
+        if depth > max_depth_limit:
+            return {"allowed": False, "reason": f"depth:{depth}"}
+        fields = max(a["fields"], a["fields_eff"])
+        if fields > max_complexity:
+            return {"allowed": False, "reason": f"complexity:{fields}"}
         if block_introspection and a["introspection"]:
             return {"allowed": False, "reason": "introspection"}
     return {"allowed": True, "reason": "ok"}

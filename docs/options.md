@@ -49,7 +49,7 @@ DuckNet の挙動は CLI 引数・環境変数・設定キー(cfg)で制御し�
 | `subnet_defense` | `False` | サブネット(/24・/64)集約防御(opt-in)。 |
 | `jwt_inspect_enabled` | `True` | JWT(`alg:none`/許可外 alg)遮断。 |
 | `cookie_harden_enabled` / `cors_harden_enabled` | `True` / `True` | Set-Cookie 補完 / CORS 無害化。 |
-| `graphql_enabled` / `graphql_max_bytes` | `False` / `262144` | GraphQL 深さ/複雑度/イントロスペクション/バッチ制限(POST 本文と GET `?query=`)。本文は `graphql_max_bytes` まで全体を解析し、超える本文は 413 で拒否。複雑度の上限 `graphql_max_complexity` は既定 1000(選択したフィールドの数。旧版で保存した 100 はそのまま残る)。`body_scan_enabled` とは独立。 |
+| `graphql_enabled` / `graphql_max_bytes` | `False` / `262144` | GraphQL 深さ/複雑度/イントロスペクション/バッチ制限(POST 本文と GET `?query=`)。本文は `graphql_max_bytes` まで全体を解析し、超える本文は 413 で拒否。複雑度の上限 `graphql_max_complexity` は既定 1000(選択したフィールドの数。名前付きフラグメントは展開した先まで数える。旧版で保存した 100 はそのまま残る)。UTF-16/32 の JSON 本文と、宣言された `charset` の読み方も照合する。`body_scan_enabled` とは独立。 |
 | `upload_scan_enabled` | `True` | multipart のパートヘッダ(`filename=` / `filename*=`)の危険拡張子検査。本文の先頭を超えた後続パートも転送しながら検査。生本文アップロードは要求ヘッダ `Content-Disposition` の `filename` / `filename*` で、本文を読む前に検査する。`body_scan_enabled` とは独立。 |
 | `path_override_block` / `method_override_block` | `True` / `False` | ACL バイパス(X-Original-URL 等)/ メソッドオーバーライド遮断。 |
 | `range_check_enabled` | `True` | Range DoS(Apache Killer)対策。 |

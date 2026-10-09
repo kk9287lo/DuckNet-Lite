@@ -15,9 +15,12 @@ saferegex.py — ReDoS 耐性のための正規表現ユーティリティ(標�
                             ループや I/O 向けの限定的な保険であることを明記する。
   5) LiteralScanner       — 複数リテラルの Aho-Corasick(線形時間 O(n))。バックトラックが無く
                             ReDoS 不能。リテラル IoC/シグネチャは正規表現でなくこちらで照合できる。
+  6) declared_readings(...) — 宣言された charset で本文を読み直す(未知の名前で codec の表を太らせない・
+                            線形でない codec は使わない)。
 """
 from __future__ import annotations
 
+import functools
 import re
 import threading
 from collections import deque
@@ -301,6 +304,105 @@ def safe_json_loads(text, *, max_len: int = 2_000_000, max_depth: int = 200, def
         return _json.loads(text)
     except Exception:
         return default
+
+
+# ── 宣言された charset で本文を読み直す ──────────────────────────────────────────
+# 本文を宣言どおりに読むバックエンド(Java の Servlet/Spring・Node の body-parser 等)は、Content-Type の
+# charset=… で本文を文字にする。ASCII と違う字に読む符号化(EBCDIC の IBM037/IBM500・UTF-16/32・UTF-7)や、
+# 2 バイト目に ASCII の値を含む符号化(Shift_JIS・GBK・Big5 等)では、検査が UTF-8/latin-1 で読んだ字面と
+# バックエンドが見る字面が食い違う。呼び出し側が宣言どおりの読み方も照合できるよう、その読み方を返す。
+_CHARSET_RE = re.compile(r'(?i)(?:^|[;\s])charset[ \t]*=[ \t]*(?:"([^"]*)"|([^;\s"]*))')
+# UTF-8/ASCII は呼び出し側が既に読んでいる(同じ字面)ので返さない。
+_DECL_SKIP = frozenset(("utf-8", "utf-8-sig", "ascii"))
+# 本文の符号化ではない Python 固有の codec と、入力長に対して線形でない codec(punycode)は使わない。
+_DECL_DENY = frozenset(("punycode", "idna", "unicode-escape", "raw-unicode-escape", "undefined"))
+# IBM の符号ページ番号(Java の別名 IBM-37 / IBM1047 / cp-500 等)。
+_IBM_CP_RE = re.compile(r"(?:ibm|cp)_?0*(\d{2,5})")
+# Python に無い EBCDIC: IBM-1047(z/OS の Open Systems 版)。IBM-037 と 6 字(¬ Ý ^ [ ] ¨ の位置)だけ違う。
+_CP1047_FROM_037 = str.maketrans("¬Ý^[]¨", "^[¬Ý¨]")
+
+
+@functools.lru_cache(maxsize=256)
+def _codec_name(label: str) -> str:
+    """正規化した charset ラベル → Python の codec 名(使えない/使わないものは "")。
+    codecs.lookup に未知の名前を渡すと encodings の表に 1 件ずつ溜まり続ける(要求ごとに違う名前を
+    送られると上限無しに太る)ので、別名表か encodings の実在モジュールで確かめてから引く。"""
+    import codecs
+    import encodings.aliases
+    import importlib.util
+    m = _IBM_CP_RE.fullmatch(label)
+    cands = [label] + ([f"cp{int(m.group(1)):03d}"] if m else [])
+    for c in cands:
+        if c == "cp1047":
+            return "cp1047"
+        mod = encodings.aliases.aliases.get(c)
+        if mod is None:
+            try:
+                if importlib.util.find_spec("encodings." + c) is None:
+                    continue
+            except Exception:
+                continue
+            mod = c
+        try:
+            name = codecs.lookup(mod).name
+            b"a".decode(name, "replace")          # bytes→bytes の codec(base64・rot13 等)は弾く
+                                                  # (空の bytes は codec を確かめずに '' を返す)
+        except Exception:
+            return ""
+        return "" if name in _DECL_SKIP or name in _DECL_DENY else name
+    return ""
+
+
+def declared_charsets(content_type: str) -> list:
+    """Content-Type の charset 引数を Python の codec 名で返す。UTF-8/ASCII・未知・使わない codec は除く。
+    重複(1 本の中の重複も、重複ヘッダをカンマで連結したものも)は、最初と最後の 2 つ(実装によって
+    最初を採るものと最後を採るものがある)。"""
+    ct = (content_type or "")[:1024]
+    if "charset" not in ct.lower():
+        return []
+    found = []
+    for m in _CHARSET_RE.finditer(ct):
+        raw = (m.group(1) if m.group(1) is not None else m.group(2))[:64].lower()
+        label = re.sub(r"[^0-9a-z]+", "_", raw).strip("_")
+        name = _codec_name(label) if label else ""
+        if name:
+            found.append(name)
+    if not found:
+        return []
+    return [found[0]] if found[0] == found[-1] else [found[0], found[-1]]
+
+
+def declared_readings(data, content_type: str = "") -> list:
+    """本文 data(bytes)を、Content-Type で宣言された charset で読んだ文字列の並び(重複は 1 つ)。
+    宣言が無い・UTF-8/ASCII・未知なら空。BOM の無い UTF-16/UTF-32 はバックエンドによって
+    バイト順の既定が違う(Java はビッグエンディアン・Python は実行機の順)ので両方を返す。
+    先頭の BOM(U+FEFF)は外す。復号できないバイトは置換文字にする。"""
+    import codecs
+    out = []
+    names = declared_charsets(content_type)
+    if not names:
+        return out
+    b = bytes(data or b"")
+    for name in names:
+        if name == "cp1047":
+            encs = ("cp037",)
+        elif name == "utf-16" and not b.startswith((codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE)):
+            encs = ("utf-16-be", "utf-16-le")
+        elif name == "utf-32" and not b.startswith((codecs.BOM_UTF32_LE, codecs.BOM_UTF32_BE)):
+            encs = ("utf-32-be", "utf-32-le")
+        else:
+            encs = (name,)
+        for enc in encs:
+            try:
+                t = b.decode(enc, "replace")
+            except Exception:
+                continue
+            if name == "cp1047":
+                t = t.translate(_CP1047_FROM_037)
+            t = t.lstrip("\N{ZERO WIDTH NO-BREAK SPACE}")
+            if t not in out:
+                out.append(t)
+    return out
 
 
 class LiteralScanner:

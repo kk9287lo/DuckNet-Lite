@@ -92,6 +92,8 @@ def _companions(banner: str, seed: str, t: int) -> list:
     """偽バナーの系統に整合する随伴ヘッダ。整合する『定番の手掛かり』がある系統だけ付け、
     無い系統は付けない(=沈黙もまた整合)。版は窓ごとに揺らして静的な手掛かりを避ける。"""
     fam = _family(banner)
+    if banner.startswith("Apache-Coyote"):       # Tomcat(Java)。系統は apache だが PHP を付けると
+        return []                                # 矛盾する(Tomcat は X-Powered-By を既定で出さない)
     if fam == "microsoft":                       # IIS は ASP.NET スタックが定番
         return [("X-Powered-By", "ASP.NET"), ("X-AspNet-Version", "4.0.30319")]
     if fam in ("apache", "litespeed"):           # LAMP/LiteSpeed は PHP が定番
