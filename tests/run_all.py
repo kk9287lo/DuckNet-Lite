@@ -165,6 +165,7 @@ MODULES = [
     "test_sweep_rem_jsonesc",         # JSON 本文の \r\n エスケープ後のヘッダ注入/文区切り
     "test_sweep_rem_tray",            # Explorer 再起動(TaskbarCreated)でトレイのアイコンを付け直す
     "test_sweep_rem_fwfold",          # fold_fullwidth_punct(既定 OFF)で全角記号も畳む運用
+    "test_sweep_upd_integrity",       # 同じ場所で更新したとき完全性監視が中核を旧版へ戻さない
 ]
 
 
