@@ -41,7 +41,7 @@ DuckNet の挙動は CLI 引数・環境変数・設定キー(cfg)で制御し�
 | `ban_ttl_sec` | `300` | 自動BAN の継続秒(累犯は `ban_escalation`/`ban_escalation_cap` で延長)。 |
 | `body_scan_enabled` / `body_scan_max_bytes` | `True` / `65536` | 要求ボディのシグネチャ走査と上限バイト。multipart でない本文のうち、`Content-Type` がバイナリ型 *かつ* 中身もバイナリ(タブ/CR/LF 以外の制御バイトを含む)のものは署名走査せず、metrics の `body_binary_skipped` に数える([defenses.md](defenses.md) の「要求ボディ検査の範囲」)。 |
 | `body_sig_weight_factor` | `0.7` | 本文由来シグネチャのスコア係数(誤 BAN 低減。1.0=従来、0=記録のみで加点しない)。負の値は拒否(以前の版で保存された負の値は 0 として読む)。 |
-| `body_max_sec` | `60` | ボディ受信の総許容秒(slow POST 対策)。本文の走査中に超えた要求は backend へ送らず切断。 |
+| `body_max_sec` | `60` | ボディ受信の総許容秒(slow POST 対策)。本文の走査中に超えた要求は backend へ送らず切断。途中で間が空いても、この総時間内なら切らずに待つ。 |
 | `flood_threshold` / `window_sec` | `150` / `10` | フラッド閾(窓内要求数)と窓秒。 |
 | `max_conn_per_ip` / `max_total_conn` | `0` / `20000` | IP毎 / 全体の同時接続上限(枯渇/slowloris 増幅対策)。 |
 | `conn_rate_per_ip` | `0` | IP 毎の接続レート上限(毎秒)。接続→即 RST を高速反復する churn フラッドを、head 解析前に安価に shed する。0=無効(NAT の巻き添え回避)。ロックダウンで自動有効。 |

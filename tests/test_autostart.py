@@ -22,11 +22,13 @@ def test_quote_handles_spaces():
 
 
 def test_schtasks_args_are_standard_and_named():
-    args = A.schtasks_create_args("DuckNet", 'python -m dataplane', "onstart")
-    assert args[:5] == ["schtasks", "/create", "/tn", "DuckNet", "/tr"]
-    assert "/sc" in args and "ONSTART" in args and "/rl" in args and "limited" in args
+    # 定義は XML で渡す(/tr は 261 文字までで、ふつうの指定でも超えることがあった)
+    args = A.schtasks_create_args("DuckNet", "task.xml")
+    assert args[:7] == ["schtasks", "/create", "/tn", "DuckNet", "/xml", "task.xml", "/f"]
+    x = A.task_xml(["python", "-m", "dataplane"], trigger="onstart")
+    assert "<BootTrigger>" in x and "<RunLevel>LeastPrivilege</RunLevel>" in x
     # onlogon(既定)
-    assert "ONLOGON" in A.schtasks_create_args("X", "c", "onlogon")
+    assert "<LogonTrigger>" in A.task_xml(["python", "-m", "dataplane"], trigger="onlogon")
 
 
 def test_install_windows_task_uses_injected_runner():

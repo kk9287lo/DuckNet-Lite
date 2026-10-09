@@ -14,6 +14,17 @@ import socket
 import tempfile
 import threading
 
+if __name__ == "__main__":
+    # 単体で走らせたとき(python tests/test_sweep_r2_ipsource.py)も run_all.py と同じく、製品の import
+    # より前に状態dirを使い捨ての一時dirへ向ける(利用者の ~/.cache/dataplane に触れない。Full と同じ形)。
+    import atexit
+    import os
+    import shutil
+    _RUNNER_STATE = tempfile.mkdtemp(prefix="ducknet-test-state-")
+    os.environ["DUCKNET_STATE_DIR"] = _RUNNER_STATE
+    os.environ.setdefault("DUCKNET_OFFLINE", "1")
+    atexit.register(shutil.rmtree, _RUNNER_STATE, True)
+
 import dataplane.engine.lifeform.pipeline as ND
 import dataplane.engine.lifeform.policy as FW
 from dataplane.engine.services.proxy import AsyncEdgeGuard, _real_client_ip

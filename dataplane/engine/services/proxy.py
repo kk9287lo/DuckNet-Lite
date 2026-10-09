@@ -91,6 +91,19 @@ def _request_declares_body(buf: bytes) -> bool:
     return False
 
 
+_CONTINUE_100 = b"HTTP/1.1 100 Continue\r\n\r\n"
+
+
+def _expects_continue(buf: bytes) -> bool:
+    """要求が 100 Continue を待ってから本文を送る形か(HTTP/1.1 以上 + Expect: 100-continue)。
+    HTTP/1.0 の Expect は無視する決まり(RFC 9110 §10.1.1)=1.0 の相手に 1xx は送らない。"""
+    ver = buf.split(b"\r\n", 1)[0].rsplit(b" ", 1)[-1].strip().upper()
+    if not ver.startswith(b"HTTP/") or ver in (b"HTTP/1.0", b"HTTP/0.9"):
+        return False
+    return any(t.strip().lower() == "100-continue"
+               for v in _header_values(buf, b"expect") for t in v.split(","))
+
+
 _CHUNK_HEX = re.compile(rb"\A[0-9A-Fa-f]{1,16}\Z")
 _CHUNK_LINE_MAX = 8192      # サイズ行/trailer 行の上限(超える行は枠の破損とみなす)
 
@@ -631,27 +644,34 @@ def _block_page(info: dict, submitted: bool = False, msg: str = "") -> bytes:
 
 
 # ── 訪問者(ブラウザ)向けの案内ページ ─────────────────────────────────────────
-# 拒否応答(429/502/400/413/415/431 ほか)は、ブラウザの画面遷移(Accept に text/html)には
-# 『何が起きたか・次に何をすればよいか』の短い HTML を返す。API クライアント(Accept:
-# application/json・*/*・Accept 無し)には従来どおりの JSON を返す(機械が読む本文は 1 バイトも
-# 変えない)。ページは拒否経路でだけ組み立てる=ホットパス無関係。文言は _block_page と同じく
-# DUCKNET_LANG(lang())で日英を選ぶ。内部の判定理由・規則名・スコア・パス・製品名
-# (DUCKNET_COVER 設定時)は出さない。
+# 拒否応答(429/502/400/413/415/431 ほか)は、ブラウザの画面遷移(HTML を優先する Accept+
+# 画面遷移らしさ。_wants_html)には『何が起きたか・次に何をすればよいか』の短い HTML を返す。
+# API クライアント(Accept: application/json・*/*・Accept 無し・Java の既定 Accept など)には
+# 従来どおりの JSON を返す(機械が読む本文は 1 バイトも変えない)。ページは拒否経路でだけ
+# 組み立てる=ホットパス無関係。文言は _block_page と同じく DUCKNET_LANG(lang())で日英を選ぶ。
+# 内部の判定理由・規則名・スコア・パス・製品名(DUCKNET_COVER 設定時)は出さない。
 
 def _wants_html(buf) -> bool:
-    """要求が HTML を優先しているか(=ブラウザの画面遷移)。text/html の q が正で、
-    application/json の q より大きいときだけ True。Accept 無し・*/*(curl)・JSON 優先は False。"""
+    """要求がブラウザの画面遷移で HTML を優先しているか。次の両方を満たすときだけ True:
+      · text/html の q が正で、JSON 系(application/json・text/json・…+json)の q より大きい。
+        Accept 無し・*/*(curl)・JSON 優先は False。
+      · 画面遷移らしい: Accept に application/xhtml+xml(主要ブラウザの画面遷移は必ず含む)、
+        Sec-Fetch-Mode: navigate / Sec-Fetch-Dest: document|iframe、または UA がブラウザ
+        (Mozilla/…)。Java HttpURLConnection の既定 Accept(text/html, image/gif, image/jpeg,
+        *; q=.2, */*; q=.2)は text/html が先頭でもブラウザではない=JSON のまま(#33)。"""
     try:
-        acc = _header_value(bytes(buf), b"accept").lower()
+        b = bytes(buf)
+        acc = _header_value(b, b"accept").lower()
     except Exception:
         return False
     if "text/html" not in acc:
         return False
-    qs = {}
+    html_q = json_q = 0.0
     for part in acc.split(","):
         mt, _, params = part.partition(";")
         mt = mt.strip()
-        if mt not in ("text/html", "application/json"):
+        is_json = mt.endswith("/json") or mt.endswith("+json")
+        if mt != "text/html" and not is_json:
             continue
         q = 1.0
         for p in params.split(";"):
@@ -661,8 +681,19 @@ def _wants_html(buf) -> bool:
                     q = float(v.strip())
                 except ValueError:
                     q = 0.0
-        qs[mt] = max(qs.get(mt, 0.0), q)
-    return qs.get("text/html", 0.0) > max(0.0, qs.get("application/json", 0.0))
+        if is_json:
+            json_q = max(json_q, q)
+        else:
+            html_q = max(html_q, q)
+    if not html_q > max(0.0, json_q):
+        return False
+    if "application/xhtml+xml" in acc:
+        return True
+    if _header_value(b, b"sec-fetch-mode").strip().lower() == "navigate":
+        return True
+    if _header_value(b, b"sec-fetch-dest").strip().lower() in ("document", "iframe"):
+        return True
+    return _header_value(b, b"user-agent").strip().lower().startswith("mozilla/")
 
 
 _PG = {
@@ -1074,12 +1105,31 @@ def _redirect_violation_host(status_line: str, lines, req_host: str, allow) -> s
     host = _location_host(loc)
     if not host:
         return ""                                   # 相対リダイレクト=安全
-    rh = (req_host or "").split(":", 1)[0].strip().lower()
-    allowed = {rh} | {str(a).split(":", 1)[0].strip().lower() for a in (allow or [])}
+    # 比較は両辺とも _host_key の正規形で(#32)。旧実装は Host と allow を split(':') で切ったので
+    # IPv6 リテラルが '[2001' になり、自サイトへのリダイレクトまで外部扱いしていた。
+    hk = _host_key(host)
+    allowed = {_host_key(req_host)} | {_host_key(a) for a in (allow or [])}
     allowed.discard("")
-    if host in allowed or any(host == a or host.endswith("." + a) for a in allowed if a):
+    if hk in allowed or any(hk.endswith("." + a) for a in allowed):
         return ""                                   # 自サイト or 許可ホスト(サブドメイン含む)
     return host
+
+
+def _host_key(h) -> str:
+    """ホスト比較用の正規形: 小文字・ポート除去・IPv6 は角括弧を外して正規表記にする(#32)。
+    '[2001:DB8:0::1]:8080' と '2001:db8::1' は同じ、'app.example:443' は 'app.example'。"""
+    h = str(h or "").strip().lower()
+    if h.startswith("["):
+        h = h[1:].split("]", 1)[0]                  # [v6]:port → v6
+    elif h.count(":") == 1:
+        h = h.split(":", 1)[0]                      # host:port(':' が 2 個以上=角括弧なしの v6)
+    if ":" in h:
+        import ipaddress
+        try:
+            h = str(ipaddress.ip_address(h))        # 表記揺れ(0 の省略・大文字)をそろえる
+        except ValueError:
+            pass
+    return h
 
 
 def inject_security_headers(head: bytes, cfg, tls: bool = False, *,
@@ -1451,13 +1501,25 @@ class AsyncEdgeGuard:
             #   method-override は先頭トークン、別名は backend の設定次第)。連結値を検査していた
             #   ため alg:none JWT・遮断メソッド・クレデンシャル単位レートを全て素通りできた。
             #   どれを採っても安全と言えないので 400 で拒否する(正規クライアントは送らない形)。
+            #   ただし mode=audit(記録のみ・遮断しない)では拒否せず『遮断するはずだった』を記録して
+            #   先へ進む(#34。_enforce_or_audit と同じ audit イベント+転送。検査には先頭の値を渡す)。
             _auths = _header_values(buf, b"authorization")
             _keys = _header_values(buf, b"x-api-key")
             _ovrs = list(dict.fromkeys(
                 t.strip().upper()
                 for _n in (b"x-http-method-override", b"x-method-override", b"x-http-method")
                 for v in _header_values(buf, _n) for t in v.split(",") if t.strip()))
-            if len(_auths) > 1 or len(_keys) > 1 or len(_ovrs) > 1:
+            _dup = len(_auths) > 1 or len(_keys) > 1 or len(_ovrs) > 1
+            if _dup and sh.cfg.get("mode") == "audit":
+                self.metrics["dup_header"] = self.metrics.get("dup_header", 0) + 1
+                try:
+                    sh._event(ip, "audit", {"would": "block", "rule": "dup_header",
+                                            "reason": "conflicting header values"})
+                    sh._forward(ip, "dup_header", "suspicious",
+                                ["would block: conflicting header values"])
+                except Exception:
+                    pass
+            elif _dup:
                 self.metrics["dropped"] += 1
                 self.metrics["dup_header"] = self.metrics.get("dup_header", 0) + 1
                 writer.write(_reject_response(
@@ -1630,7 +1692,12 @@ class AsyncEdgeGuard:
                 # #61: 要求ボディ検査。本文先頭を有界に読み、署名走査してから転送する
                 #   (head-only の死角=POST/JSON/GraphQL 本文の SQLi/XSS/RCE/SSTI を塞ぐ)。
                 _bctx = {}
-                extra, blocked = await self._scan_request_body(buf, reader, ip, path, _bctx)
+                extra, blocked = await self._scan_request_body(buf, reader, ip, path, _bctx,
+                                                               writer=writer)
+                if _bctx.get("continued"):
+                    # #10: 100 Continue は DuckNet が返した。backend へは Expect を外して渡す
+                    #   (backend にも 100 を返させるとクライアントに 2 回届く)。
+                    fwd = _strip_request_headers(fwd, (b"expect",))
                 if blocked:
                     self.metrics["dropped"] += 1
                     _rej = {"unscannable": ("415 Unsupported Media Type",
@@ -1969,7 +2036,7 @@ class AsyncEdgeGuard:
             return True
         return on_body
 
-    async def _scan_request_body(self, buf, reader, ip, path="", ctx=None):
+    async def _scan_request_body(self, buf, reader, ip, path="", ctx=None, writer=None):
         """要求ボディの先頭を有界に読んで検査する(#61 署名・#66 アップロード・#67 GraphQL)。
         返り値 (extra, blocked):
           · extra … buf を *超えて* 読んだ本文先頭バイト(クリーン時に backend へ転送する分)。
@@ -1984,7 +2051,10 @@ class AsyncEdgeGuard:
         正直な限界: 署名走査は先頭 body_scan_max_bytes のみ(巨大本文を全バッファしない)。GraphQL
         パスの本文は graphql_max_bytes まで読み切って解析する。chunked 本文は走査面では有界復号して
         から走査する(#D5。backend へは raw 転送)。Content-Encoding 付きの multipart は解凍できた
-        先頭だけをアップロード検査する。"""
+        先頭だけをアップロード検査する。
+        writer(クライアント側)を渡すと、Expect: 100-continue で本文を待っている要求へ、本文を
+        読む前に 100 Continue を返して ctx["continued"]=True を入れる(#10。呼び出し側は backend へ
+        Expect を外して渡す)。"""
         try:
             from ..lifeform.pipeline import net_shield
             sh = net_shield()
@@ -2045,14 +2115,27 @@ class AsyncEdgeGuard:
         if content_len is None and chunked_te:
             trk = _ChunkedEnd()
             trk.feed(body_in_buf)
+        # #10: Expect: 100-continue の送信者(aiohttp・Node・JDK 等)は 100 を受け取るまで本文を送らない。
+        #   本文を読むのは DuckNet なので 100 も DuckNet が返す(nginx と同じ)。返さないと本文が来ない
+        #   まま走査の待ちが切れ、要求は黙って切断されて backend に何も届かなかった。
+        if (writer is not None and not body_in_buf and len(prefix) < target
+                and _expects_continue(buf)):
+            try:
+                writer.write(_CONTINUE_100)
+                if ctx is not None:
+                    ctx["continued"] = True
+            except Exception:
+                pass
         while len(prefix) < target and not (trk is not None and (trk.done or trk.bad)):
             remaining = self.head_timeout if deadline is None else (deadline - loop.time())
             if remaining <= 0:
                 timed_out = True
                 break
             try:
+                # 総デッドラインの運用中は 1 回の読取もその残りまで待つ(#10)。head_timeout で切ると、
+                # 本文の途中に 1 度 10 秒の間が空くだけで『総時間超過』として切断+加点していた。
                 chunk = await asyncio.wait_for(reader.read(min(65536, target - len(prefix))),
-                                               min(self.head_timeout, remaining))
+                                               remaining)
             except asyncio.TimeoutError:
                 timed_out = deadline is not None       # デッドライン運用中の read 停止=slow-body
                 break

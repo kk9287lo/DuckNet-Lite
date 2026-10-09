@@ -100,6 +100,9 @@ def _metrics_exposition(sh) -> str:
                          ("subnet_flag", "subnet_flag_total", "Subnet-aggregation soft flags")):
         scalar(name, int(m.get(key, 0)), "counter", h)
     scalar("shield_enabled", 1 if sh.is_enabled() else 0, "gauge", "Shield enabled (1/0)")
+    # 監査モード(mode=audit=記録のみ・遮断しない)。トレイはこれを見て『防御 ON』と区別して表示する
+    scalar("shield_audit_mode", 1 if sh.cfg.get("mode") == "audit" else 0, "gauge",
+           "Monitor-only mode: records but does not block (1/0)")
     scalar("tracked_ips", int(m.get("tracked_ips", 0)), "gauge", "Tracked source IPs")
     scalar("active_bans", int(m.get("active_bans", 0)), "gauge", "Active bans")
     scalar("paranoia_level", int(sh.cfg.get("paranoia", 1) or 1), "gauge", "Detection paranoia level")
@@ -813,6 +816,10 @@ def _make_handler(app: AdminDashboard):
                             if bool(opt.get(name)) != bool(cur.get(name)):
                                 sh.set_optional_signature(name, bool(opt.get(name)))
                         r = sh.paranoia_status()
+                    # 成功は ok:true を明示する。状態サマリ(paranoia_status)は ok キーを持たず、
+                    # ダッシュボードの postT() は ok の無い応答を失敗と表示していた(変更も元に戻すも)。
+                    if r.get("ok", True) is not False:
+                        r = {**r, "ok": True}
                 elif path == "/api/shield/path_limits":
                     # rules が配列でない(綴り違い {"rule": …} 等)なら置換しない(#24: 空へ
                     # 正規化して全ルールを消し、ok:true を返していた)。
@@ -1631,6 +1638,22 @@ function showSkeleton(){
  $("events").innerHTML=`<div class="frow skel"><span class="time">${bar("40px")}</span><span class="desc">${bar("60%")}</span></div>`.repeat(4);
  $("bans").querySelector("tbody").innerHTML=`<tr class="skel"><td colspan="5">${bar("90%")}</td></tr>`.repeat(3);
 }
+/* 設定の警告(status の warnings)。サーバの message は日本語だけなので、英語表示ではサーバの message_en
+   (あれば)か、既知の code ごとの英文を出す。日本語表示と未知の code はサーバの message(無ければ code)。 */
+const WARN_EN={
+ site_whitelist_empty:()=>"site_mode=whitelist but site_whitelist is empty, so every Host is allowed (a setting saved by an earlier version, kept for compatibility). Add the Hosts to allow to site_whitelist, or set site_mode to off.",
+ cfg_enum_normalized:(w,cfg)=>{
+  const now=(Array.isArray(w.keys)?w.keys:[]).map(k=>String(k)+"="+String(cfg&&cfg[k]!=null?cfg[k]:"?")).join(", ");
+  return "Settings saved by an earlier version were spelled differently (letter case or spaces)"+(now?" and are now read as "+now:"")
+   +". Earlier versions did not recognize that spelling; this version applies them as written. Check that this is what you want and change them if not (after you save the settings again, this warning no longer appears from the next start).";}};
+function warnText(w,cfg){
+ w=w||{};
+ if(LANG==="en"){
+  if(typeof w.message_en==="string"&&w.message_en)return w.message_en;
+  if(Object.prototype.hasOwnProperty.call(WARN_EN,w.code))return WARN_EN[w.code](w,cfg);
+ }
+ return String(w.message||w.code||"");
+}
 async function refresh(){
  let s;try{s=await guardedFetch("/api/state")}catch(e){
   if(isAuthFail(e)){markAuthError();}else{$("conn").className="pill bad";$("connt").textContent=tr("接続不可");
@@ -1639,7 +1662,9 @@ async function refresh(){
  $("conn").className="pill ok";$("connt").textContent=tr("接続中");$("conn").title="";
  $("fw").checked=s.firewall.enabled;$("sh").checked=s.shield.cfg.enabled;
  // 直すべき設定(旧版が保存した site whitelist+空 など)を警告バッジで出す。本文は必ず esc() を通す
- const W=s.shield.warnings||[];$("cfgwarn").style.display=W.length?"":"none";
+ // 本文は表示言語に合わせて差し替えてから描く(warnText)
+ const W=(s.shield.warnings||[]).map(w=>Object.assign({},w,{message:warnText(w,s.shield.cfg)}));
+ $("cfgwarn").style.display=W.length?"":"none";
  $("cfgwarn").innerHTML=W.map(w=>"⚠ "+esc(w.message||w.code||"")).join("<br>");
  const m=s.shield_metrics;
  const em=s.edge_metrics||{};

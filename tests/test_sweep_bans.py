@@ -117,13 +117,18 @@ def test_c25_manual_ban_noncanonical_spellings_block():
 
 def test_c25_manual_ban_rejects_cidr_and_non_ip():
     """CIDR やゾーンID付き・IP でない文字列も ok:True で受け付け、何も遮断しないBANが一覧に
-    並んでいた。単一IP以外は拒否する(範囲はファイアウォールのルールで扱う)。"""
+    並んでいた。単一IP以外は拒否する(範囲はファイアウォールのルールで扱う)。
+    ゾーンID付き(fe80::1%eth0)は、proxy が peer のゾーンを外して渡すようになったので、ゾーンを
+    外した fe80::1 として BAN する(実際に遮断できる・rv_config #17)。"""
     with tempfile.TemporaryDirectory() as d:
         sh = _shield(d)
-        for raw in ("203.0.113.0/24", "fe80::1%eth0", "not-an-ip", "", "a'b<c"):
+        for raw in ("203.0.113.0/24", "not-an-ip", "", "a'b<c"):
             r = sh.ban(raw)
             assert r.get("ok") is False and r.get("error"), (raw, r)
         assert sh.bans() == []
+        r = sh.ban("fe80::1%eth0")
+        assert r.get("ok") is True and r.get("banned") == "fe80::1", r
+        assert sh.inspect("fe80::1", path="/")["action"] == "block"
 
 
 def test_c25_admin_ban_route_rejects_cidr_and_normalizes():

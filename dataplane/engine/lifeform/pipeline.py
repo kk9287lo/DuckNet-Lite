@@ -120,10 +120,10 @@ _SIG_RE = [(name, re.compile(pat)) for name, pat in _SIGNATURES]
 #        '||' '&&' 連結と他の分岐は head と同じ。
 #  crlf: ヘッダ名の後にそのヘッダの値の形が続く(set-cookie:名前= / location:URL / to:…@ 等)。
 #        本文の走査面では改行は ';' にならない([[_normalize_full]] body=True)ので、ここに来る ';' は
-#        字面どおり。値に符号化して入れた改行(%0D%0A 等)は crlf の照合でだけ ';' として読む
-#        (nl=True の見え方・[[NetShield._scan_field]]。生の改行=YAML/テキスト/multipart の枠は空白のまま)。
+#        字面どおり。値に符号化して入れた改行(%0D%0A 等)は crlf・rce・スタック複文の照合でだけ ';' と
+#        して読む(nl=True の見え方・[[_BODY_NL_RULES]]。生の改行=YAML/テキスト/multipart の枠は空白のまま)。
 # 判定は head 用より狭い(部分集合)=prescan のスーパーセット性は崩れない。URL/ヘッダの走査は従来どおり。
-# 本文の crlf の『ヘッダ名+値の形』(先頭の ';' を除いた部分)。[[_BODY_CRLF_GATE]] も同じ形を使う。
+# 本文の crlf の『ヘッダ名+値の形』(先頭の ';' を除いた部分)。
 _BODY_CRLF_SHAPE = (r"(?:set-cookie:\s?[^\s=;]{1,64}=|location:\s?(?:[a-z][a-z0-9+.-]{0,15}:)?/"
                     r"|refresh:\s?\d|content-type:\s?[a-z]{1,32}/[a-z0-9]|content-length:\s?\d"
                     r"|content-disposition:\s?(?:attachment|inline|form-data)\b"
@@ -141,13 +141,6 @@ _BODY_SIG_PATTERNS = {
 _SIG_RE_BODY = [(name, re.compile(_BODY_SIG_PATTERNS[name]) if name in _BODY_SIG_PATTERNS else rgx)
                 for name, rgx in _SIG_RE]
 _BODY_CRLF_RE = dict(_SIG_RE_BODY)["crlf"]
-# 値の改行を ';' にした見え方(2 回目の正規化)を作るかの前置ゲート。本文の走査面(改行=空白)に
-# ';' 無しの『ヘッダ名+値の形』が無ければ、その見え方でも crlf は当たらない(';' と空白の違いは改行の
-# 位置だけで、形の部分は両方に同じ字面で載る)=真陽性のスーパーセット。良性の本文は大半ここで終わる。
-# 走査面は小文字化済みなので (?i) を付けない((?i) 付きは 8KB で約 4 倍遅い)。先にヘッダ名の
-# リテラル(名前の直後は必ず ':'。content- は 4 種・cc: は bcc: も含む)で絞る(8KB で数 µs)。
-_BODY_CRLF_NAMES = ("to:", "cc:", "location:", "set-cookie:", "refresh:", "content-", "mime-version:")
-_BODY_CRLF_GATE = re.compile(_BODY_CRLF_SHAPE)
 # 高コストなシグネチャの前置ゲート(真陽性のスーパーセット): その名前の *どの分岐も*
 # 必ず含むリテラルを列挙する。1 つも無ければ正規表現は原理的にマッチしないので評価を省く。
 # 走査面は正規化済み(小文字化・比較演算子前後の空白除去)なので "1=1" 等の形で確実に現れる。
@@ -443,8 +436,8 @@ def _canon_ip_str(s: str) -> str:
     except ValueError:
         return ""
     if a.version == 6:
-        if a.scope_id:                    # ゾーンID付き(fe80::1%eth0)は peer と一致し得ない
-            return ""
+        if a.scope_id:                    # ゾーンID付き(fe80::1%eth0)は正規形にしない(外すのは
+            return ""                     # 呼び出し側の判断: peer は proxy、設定は _canon_cfg_ip)
         if a.ipv4_mapped:                 # ::ffff:192.0.2.1 は proxy 同様に純IPv4へ
             return str(a.ipv4_mapped)
     return str(a)
@@ -455,6 +448,19 @@ def _canon_ip(ip) -> str:
     単一IPでない(CIDR/ゾーンID付き/不正/非文字列)なら ""。peer IP は正規形で届くため、
     BAN の鍵や白/黒リストを生文字列で比べると '2001:DB8::1' 等の別表記が一致しなかった(#25/#45)。"""
     return _canon_ip_str(ip.strip()) if isinstance(ip, str) else ""
+
+
+def _canon_cfg_ip(ip) -> str:
+    """設定・保存済み BAN・手動操作の単一IPを peer と同じ形へ(_canon_ip+IPv6 のゾーンID除去)。
+    proxy は peer/XFF のゾーンID(fe80::1%eth0 の %eth0)を外して渡す(_norm_ip)ので、設定側を
+    ゾーン付きのまま比べると一致しない: 旧版で書いた白リストの項目が締め出し・黒リスト/BAN は
+    素通りになっていた。ゾーンは任意文字を運べるので値には残さない。IPv4 にゾーンは無い(不正のまま)。"""
+    c = _canon_ip(ip)
+    if not c and isinstance(ip, str) and "%" in ip:
+        head = ip.strip().split("%", 1)[0]
+        if ":" in head:
+            c = _canon_ip(head)
+    return c
 
 
 @functools.lru_cache(maxsize=16)
@@ -469,7 +475,7 @@ def _compile_ip_list(entries: tuple):
             if net is not None:
                 nets.append(net)
         else:
-            c = _canon_ip(e)
+            c = _canon_cfg_ip(e)              # ゾーンID付き(fe80::1%eth0)も peer と同じ形で
             if c:
                 singles.add(c)
     return frozenset(singles), tuple(nets)
@@ -586,6 +592,7 @@ _CD_FILENAME_RE = re.compile(
 _CD_CONT_RE = re.compile(r"filename\*(\d{1,3})(\*?)")    # RFC 2231 継続 filename*0= / *1*=
 _HDR_NAME_RE = re.compile(rb"[!#$%&'*+.^_`|~0-9A-Za-z-]+[ \t]*:")
 _UPLOAD_HDR_MAX = 65536      # 1 パートのヘッダ塊の上限。超過=壊れた/回避狙い→フェイルクローズ
+_UPLOAD_HDR_LINES = 100      # 1 パートのヘッダ行数の上限(実在のパートは折り返し込みでも十数行)。超過=同上
 _UPLOAD_PARTS_MAX = 10000    # 1 本文で検査するパート数の上限。超過=フェイルクローズ
 # 中間セグメントでも実行され得る拡張子。Apache mod_mime の AddHandler/AddType はファイル名の
 # *どの* ドット区切りにも効く(shell.php.jpg が PHP として動く)。最終拡張子は拒否リスト全体で
@@ -703,18 +710,19 @@ def _upload_bad_ext(fn: str, deny) -> str:
 
 def _part_header_hit(block: bytes, deny):
     """パートヘッダ塊(LF 区切りの行)の Content-Disposition から危険なファイル名を探す。
-    折り返し行・ヘッダ名で始まらない行は前の行の続きとして読む(裸 LF を改行と見ない実装の見え方)。"""
+    折り返し行・ヘッダ名で始まらない行は前の行の続きとして読む(裸 LF を改行と見ない実装の見え方)。
+    続き行は断片の並びに貯めて最後に 1 回だけ連結する(+ で伸ばすと続き行の数の 2 乗・#4)。"""
     lines = []
     for ln in block.split(b"\n"):
         ln = ln.rstrip(b"\r")
         if not ln:
             continue
         if lines and (ln[:1] in (b" ", b"\t") or not _HDR_NAME_RE.match(ln)):
-            lines[-1] = lines[-1] + b" " + ln.strip()
+            lines[-1].append(ln.strip())
         else:
-            lines.append(ln)
-    for ln in lines:
-        name, _, val = ln.partition(b":")
+            lines.append([ln])
+    for frags in lines:
+        name, _, val = b" ".join(frags).partition(b":")
         if name.strip().lower() != b"content-disposition":
             continue
         for fn in _cd_filenames(val.decode("latin1", "replace")):
@@ -728,20 +736,26 @@ class _MultipartHeads:
     """multipart 本文から *パートヘッダ塊* を逐次に切り出す(#10/#33)。本文そのものは保持しない
     (区切り検出用の末尾とヘッダ塊だけを有界に持つ=転送しながら全パートを検査できる)。
     区切り行は行頭(直前が LF)の '--' + boundary。行は LF 区切り(CR は剥ぐ)=CRLF と LF だけの
-    送信者の両方に効く。終端区切り(--boundary--)の後ろも見続ける(寛容な解析器が拾う形も逃さない)。"""
-    __slots__ = ("_pat", "_buf", "_hdr", "_st", "parts", "bad")
+    送信者の両方に効く。終端区切り(--boundary--)の後ろも見続ける(寛容な解析器が拾う形も逃さない)。
+    検査量は 1 パートのヘッダ塊の長さに線形(#4): 塊全体は終わりで 1 回だけ返し、行が揃った時点の
+    早期検査はその行を含む論理行だけを返す。旧実装は行が揃うたびに塊全体を返して読み直させ(行数の
+    2 乗)、害の無い行を 1500 回繰り返した小さな要求 1 本でイベントループが数秒止まった。"""
+    __slots__ = ("_pat", "_buf", "_hdr", "_st", "_lines", "_lstart", "_early", "parts", "bad")
 
     def __init__(self, boundary: bytes):
         self._pat = b"--" + bytes(boundary)
         self._buf = bytearray(b"\n")              # 本文先頭も行頭として扱う
         self._hdr = bytearray()
         self._st = 0                              # 0=区切り探し 1=区切り行の残り 2=ヘッダ行
+        self._lines = 0                           # この塊のヘッダ行数(_UPLOAD_HDR_LINES まで)
+        self._lstart = 0                          # この塊の最後の論理行(折り返しの親行)の開始位置
+        self._early = 0                           # この塊で早期検査に返した量(バイト)
         self.parts = 0
         self.bad = ""
 
     def feed(self, data) -> list:
         """data を食わせ、検査すべきヘッダ塊(bytes)の列を返す(完結した塊と、Content-Disposition
-        行が揃った時点の途中までの塊)。"""
+        行が揃った時点のその論理行)。"""
         out = []
         buf, pat = self._buf, self._pat
         buf += data
@@ -757,6 +771,7 @@ class _MultipartHeads:
                     break
                 del buf[:i + len(pat)]
                 self._hdr.clear()
+                self._lines = self._lstart = self._early = 0
                 self._st = 1
             elif self._st == 1:
                 j = buf.find(b"\n")
@@ -779,13 +794,26 @@ class _MultipartHeads:
                 line = bytes(buf[:j]).rstrip(b"\r")
                 if line:
                     del buf[:j + 1]
+                    self._lines += 1
+                    if self._lines > _UPLOAD_HDR_LINES:
+                        self.bad = "multipart のパートヘッダの行数が上限超過"
+                        break
+                    if not self._hdr or not (line[:1] in (b" ", b"\t")
+                                             or not _HDR_NAME_RE.match(line)):
+                        self._lstart = len(self._hdr)     # 新しい論理行(_part_header_hit と同じ読み方)
                     self._hdr += line + b"\n"
                     if len(self._hdr) > _UPLOAD_HDR_MAX:
                         self.bad = "multipart のパートヘッダが過大"
                     elif line.lstrip()[:19].lower() == b"content-disposition":
                         # 行が揃った時点でも見る(ヘッダ塊の終わりを待つと、塊の途中までを含む
-                        # チャンクが先に転送される)。塊の終わりで続き行込みでもう一度見る。
-                        out.append(bytes(self._hdr))
+                        # チャンクが先に転送される)。見るのはこの行を含む論理行だけ。塊の終わりで
+                        # 続き行込みの塊全体をもう一度見る。'content-disposition' で始まる折り返し行が
+                        # 続いて論理行が伸び続ける形は、早期検査の量が塊の 2 倍に達したら終わりの
+                        # 1 回に任せる(伸びるたびに読み直すと 2 乗)。
+                        n = len(self._hdr) - self._lstart
+                        if self._early + n <= 2 * len(self._hdr):
+                            self._early += n
+                            out.append(bytes(self._hdr[self._lstart:]))
                 else:
                     del buf[:j]                   # 空行の LF は残す(中身が空なら次の区切りの行頭)
                     out.append(bytes(self._hdr))
@@ -1202,23 +1230,30 @@ def _strip_sql_comments(s: str) -> str:
 
 
 def _normalize_full(s: str, *, body: bool = False, decode: bool = True,
-                    cap: int = _PRE_CUT, nl: bool = False) -> str:
+                    cap: int = _PRE_CUT, nl: bool = False, nl_views: list | None = None) -> str:
     """シグネチャ走査前の正規化。難読化(多重エンコード/インラインコメント/空白増し/Unicode)を
     減らし、入力長を有界化して ReDoS と CPU 枯渇を抑える。完全な無害化ではない。
     返値は 1 窓(_MAX_SCAN)へ *切り詰めない*(全域を [[_scan_windows]] が窓分割する)。
     入力は _PRE_CUT、返値の長さは cap(既定 _PRE_CUT)で有界=NFKC 展開等でも走査面積は爆発しない。
     body=True は要求本文用: 改行(生でも %0D%0A 由来でも)を ';' にせず空白として畳む。本文の改行は
     地の文/YAML/CSV/multipart の枠の区切りで、文/コマンドの区切りとみなすと誤検知になる(#0/#2)。
-    nl=True(body=True と併用)は本文の crlf 照合専用の見え方: 生の改行(文書の枠)は空白のまま、
-    復号で現れた改行(%0D%0A・&#10;・\\u000a 等で *値に* 入った改行)だけを head と同じく ';' にする。
+    CJK の地の文で普通に使う全角の ｜ ＄ （ ） ； ｀ は、本文でも head でも ASCII のメタ文字へ畳まず空白に
+    する([[_CJK_FW_PUNCT]]・#3・dec_headfold)。全角英字・＜＞ 等の畳み込みは本文も head も同じ。
+    nl=True(body=True と併用)は本文の crlf・rce・複文照合用の見え方([[_BODY_NL_RULES]]): 生の改行
+    (文書の枠)は空白のまま、復号で現れた改行(%0D%0A・&#10;・\\u000a 等で *値に* 入った改行)だけを
+    head と同じく ';' にする。nl_views(body=True・nl=False の時)には、復号で現れた改行の後に照合対象の
+    語が続く時だけ([[_BODY_NL_LEAD]])、nl=True と同じ結果の見え方を同じ復号結果から作って積む(復号を
+    2 回しない・[[NetShield._scan_field]])。
     decode=False は登録デコーダを掛けない([[_scan_windows]] がフィールド全体へ 1 回掛けた後)。"""
     if not s:
         return ""
     s = s[:_PRE_CUT]
     if decode and _SCAN_DECODERS:             # 登録された独自デコーダを走査面で先に適用(可逆)
         s = _apply_scan_decoders(s)
-    if body and nl and ("\r" in s or "\n" in s):
-        s = s.replace("\r", " ").replace("\n", " ")   # 生の改行=枠。復号前に空白へ(後段で区別できる)
+    if body and ("\r" in s or "\n" in s):
+        # 本文の生の改行=枠。復号前に空白へ(後段に残る改行は復号で値に現れたものだけ=区別できる)。
+        # nl=False の走査面は改行も空白も最後に 1 個の空白へ畳むので、先に空白にしても結果は同じ。
+        s = s.replace("\r", " ").replace("\n", " ")
     lim = len(s) * _NFKC_MAX_EXPAND           # NFKC 展開の上限: 周回をまたいで *元の長さ* の 4 倍
     # 復号の外側 fixpoint(有界3周): entity/NFKC 復号が *後段で* 新たに生む %エスケープを
     # URL 復号し損ねる死角を塞ぐ(例 &#37;3cscript → %3cscript が復号されず素通り)。各ステップは
@@ -1256,6 +1291,9 @@ def _normalize_full(s: str, *, body: bool = False, decode: bool = True,
                     return m.group(0)
             s = re.sub(r"\\u([0-9a-fA-F]{4})|\\x([0-9a-fA-F]{2})|\\U([0-9a-fA-F]{8})", _unesc, s)
         if not s.isascii():                          # ASCII はそのまま(高速パス)。非ASCIIのみ重処理。
+            for _c in _CJK_FW_PUNCT:                 # CJK の地の文の全角記号はメタ文字にしない(本文も head も)
+                if _c in s:
+                    s = s.replace(_c, " ")
             try:
                 # NFKC は 1 文字を最大 18 文字へ展開する(例 U+FDFA)。8KB を埋められると走査面が
                 # 入力の十数倍に膨れ、(a) そのまま全域を走査すれば CPU 枯渇DoS、(b) 溢れた分を
@@ -1317,10 +1355,21 @@ def _normalize_full(s: str, *, body: bool = False, decode: bool = True,
     # CR/LF はコマンド/文の区切りとみなせる(サーバ側で実際そう解釈される)。これで ; ベースの
     # 既存検知(RCE ;cat / stacked SQL ;select)が改行注入にも効く。空白畳みより *前* に行う。
     # 本文(body=True)では行わない: 本文の改行は正規の区切りで、次の空白畳みで空白になる。
-    # 例外は nl=True(本文の crlf 照合用): 生の改行は冒頭で空白にしたので、ここに残るのは復号で
-    # 値に現れた改行だけ=head と同じく ';' にする。
+    # 例外は nl=True(本文の crlf・rce・複文照合用): 生の改行は冒頭で空白にしたので、ここに残るのは
+    # 復号で値に現れた改行だけ=head と同じく ';' にする。
     if (not body or nl) and ("\r" in s or "\n" in s):
         s = re.sub(r"[\r\n]+", ";", s)
+    elif (nl_views is not None and ("\r" in s or "\n" in s)
+          and _BODY_NL_LEAD.search(s) is not None):
+        # 本文で値の改行の後に照合対象の語が続く時だけ、nl=True と同じ見え方を *同じ復号結果から*
+        # 作って渡す(復号をやり直さない。行頭がその語でない普通の改行では何も増えない)
+        nl_views.append(_collapse_scan_text(re.sub(r"[\r\n]+", ";", s), cap))
+    return _collapse_scan_text(s, cap)
+
+
+def _collapse_scan_text(s: str, cap: int) -> str:
+    """[[_normalize_full]] の仕上げ: 空白の畳み込み、スキーム/比較演算子/区切りの前後の空白除去、
+    小文字化、cap での切り詰め。"""
     s = re.sub(r"\s+", " ", s)               # 空白畳み込み(回避抑制+走査面積減)
     if ":" in s:
         # スキーム直前の空白を除去(javascript : → javascript:)。ブラウザは URL 内の tab/CR/LF を
@@ -1352,24 +1401,31 @@ def _window_starts(n: int, step: int) -> list:
 
 
 def _normalized_parts(chunk: str, step: int, depth: int = 0, *, body: bool = False,
-                      nl: bool = False) -> list:
+                      nl: bool = False, nl_parts: list | None = None) -> list:
     """生入力 1 断片を *1 回だけ* 正規化し、走査窓の列として返す(#65)。
     返値の上限は断片長 × _NFKC_MAX_EXPAND(+1)。1 文字の展開は NFKC・lower() 込みで最大 4 倍
     ([[_nfkc_char]])なので、展開しても切り捨ては起きず、正規化結果の全域がどれかの窓に載る。
     旧実装は上限 _PRE_CUT で頭打ちになると結果を捨て、生入力を半分ずつ正規化し直していた
     (16K の U+3300 で 15 回)。上限に届いた時(展開上限の想定外)だけ、安全弁として生入力を
     半分に割って正規化し直す(重なり付き・深さと最小長で有界)。
-    登録デコーダはここでは掛けない([[_scan_windows]] がフィールド全体へ 1 回掛け済み)。"""
+    登録デコーダはここでは掛けない([[_scan_windows]] がフィールド全体へ 1 回掛け済み)。
+    nl_parts(本文・nl=False)を渡すと、値に復号で現れた改行の後に照合対象の語が続く時だけ、改行を
+    ';' にした見え方(nl=True と同じ)の窓をそこへ足す(同じ正規化の 1 回で作る・[[_normalize_full]])。"""
     cap = len(chunk) * _NFKC_MAX_EXPAND + 1
-    n = _normalize_full(chunk, body=body, decode=False, cap=cap, nl=nl)
+    views = [] if nl_parts is not None else None
+    n = _normalize_full(chunk, body=body, decode=False, cap=cap, nl=nl, nl_views=views)
     if len(n) < cap or depth >= 4 or len(chunk) <= 512:
+        if views:
+            nl_parts.extend(v[j:j + _MAX_SCAN] for v in views for j in _window_starts(len(v), step))
         return [n[j:j + _MAX_SCAN] for j in _window_starts(len(n), step)]
     half = len(chunk) // 2
-    return (_normalized_parts(chunk[:half + _SCAN_WIN_OVERLAP], step, depth + 1, body=body, nl=nl)
-            + _normalized_parts(chunk[half:], step, depth + 1, body=body, nl=nl))
+    return (_normalized_parts(chunk[:half + _SCAN_WIN_OVERLAP], step, depth + 1, body=body, nl=nl,
+                              nl_parts=nl_parts)
+            + _normalized_parts(chunk[half:], step, depth + 1, body=body, nl=nl, nl_parts=nl_parts))
 
 
-def _scan_windows(s: str, *, body: bool = False, nl: bool = False) -> tuple:
+def _scan_windows(s: str, *, body: bool = False, nl: bool = False,
+                  nl_views: list | None = None) -> tuple:
     """1 フィールドの走査面を返す。生入力を _MAX_SCAN 窓+重なりで刻み、*窓ごとに* 正規化して
     (正規化結果が長ければさらに窓分割して)返す。
     旧実装は「正規化してから [:_MAX_SCAN] で切る」だったため、次の 2 つが『backend へ転送
@@ -1384,16 +1440,29 @@ def _scan_windows(s: str, *, body: bool = False, nl: bool = False) -> tuple:
     登録デコーダはフィールド全体へ 1 回だけ掛け、その出力(上限 _PRE_CUT)を刻む(#62: 旧実装は
     生チャンクごとに掛け、出力が _PRE_CUT に届くと捨てて生入力の半分ずつを復号し直していた=
     全体が要る復号(圧縮/枠付き形式)は断片で失敗し、復号結果が走査面に載らなかった)。
-    body=True は本文用の正規化([[_normalize_full]])で窓を作る。nl=True は本文の crlf 照合用の見え方
-    (値に復号で現れた改行だけを ';' にする)で窓を作る。"""
+    body=True は本文用の正規化([[_normalize_full]])で窓を作る。nl=True は本文の crlf・rce・複文照合用の
+    見え方(値に復号で現れた改行だけを ';' にする)で窓を作る。nl_views(本文・nl=False)にリストを
+    渡すと、値に復号で現れた改行の後に照合対象の語が続く時だけ([[_BODY_NL_LEAD]])、その見え方
+    (nl=True と同じ)の窓が足される(同じ窓予算・重複除去。正規化は 1 回のまま)。"""
     raw = s[:_PRE_CUT]
     if not raw:
         return ("",)
     if _SCAN_DECODERS:
         raw = _apply_scan_decoders(raw)
     step = _MAX_SCAN - _SCAN_WIN_OVERLAP
-    groups = [_normalized_parts(raw[i:i + _MAX_SCAN], step, body=body, nl=nl)
-              for i in _window_starts(len(raw), step)]
+    groups, nl_groups = [], []
+    for i in _window_starts(len(raw), step):
+        nlp = [] if nl_views is not None else None
+        groups.append(_normalized_parts(raw[i:i + _MAX_SCAN], step, body=body, nl=nl, nl_parts=nlp))
+        if nlp:
+            nl_groups.append(nlp)
+    if nl_groups:
+        nl_views.extend(w for w in _budget_windows(nl_groups) if w)
+    return _budget_windows(groups)
+
+
+def _budget_windows(groups: list) -> tuple:
+    """チャンクごとの窓の列から、窓予算内の走査窓の列を作る(重なり由来の同一窓は 1 回だけ)。"""
     # 窓予算は全チャンク通しで数える(#61)。1 文字の展開は最大 4 倍なので、_PRE_CUT 文字を
     # 4 倍に展開しても窓は 11 枚=_MAX_SCAN_WINDOWS に収まり、全域が載る(旧実装はチャンクごとに
     # 12//チャンク数 で打ち切って余りを他へ回さず、16K の 1→4 展開で 4 割強を落としていた)。
@@ -1420,6 +1489,16 @@ def _scan_windows(s: str, *, body: bool = False, nl: bool = False) -> tuple:
 # NFKC/書式文字の畳み込みが効かなかった(%XX や \u エスケープで送った同じ値だけが検知された)。
 # 不正バイトを U+FFFD にせず latin-1 で残すのは、どのバイトも走査面から消さないため。
 _SURROGATE_TO_LATIN1 = {0xDC80 + _b: 0x80 + _b for _b in range(128)}
+# 走査前の正規化([[_normalize_full]])で NFKC の前に空白へ置き換える全角記号(本文も head も・#3)。
+# ｜ ＄ （ ） ； ｀ は日本語/中国語の地の文や題名で普通に使う('データ分析の基礎｜Python'・
+# '価格は＄（税込）'・'宛先；To: …')が、NFKC で | $ ( ) ; ` になると rce の '| python'・'$(…)'・
+# '`…`'、crlf/複文の ';'、ldapi の ')(' に当たり、UTF-8 で読むようにした(#8)本文の保存 1 回ごとに
+# 42 点(単発拒否の閾値超え)が入っていた。シェル/SQL がこれらの全角形を区切りとして読むことは
+# 無い。値の送り方(生 UTF-8・\u エスケープ・%XX)に依らず同じに扱うため、復号の各周回で置き換える。
+# head(URL/ヘッダ)も同じ(決定・dec_headfold): ブラウザが %XX で送る '?q=データ分析の基礎｜Python'
+# の検索 1 回が 60 点=単発拒否になっていた(前の版から)。全角英字や XSS の ＜＞ 等の畳み込み(#8)は
+# 本文も head もそのまま。
+_CJK_FW_PUNCT = ("＄", "（", "）", "；", "｀", "｜")
 
 
 def _body_text(data: bytes) -> str:
@@ -1497,19 +1576,20 @@ def _multipart_fields(text: str):
     boundary = m.group(1)
     delim = "\n--" + boundary
     pieces = text[m.end():].split(delim)
-    parts = [pieces[0]]
+    parts = [[pieces[0]]]                   # 部ごとの断片の並び(連結は部ごとに 1 回=本文長に線形・#38)
     for p in pieces[1:]:
         q = (p[2:] if p.startswith("--") else p).lstrip(" \t")   # 終端 --境界-- と行末の空白
         if q.startswith("\r\n"):
-            parts.append(q[2:])
+            parts.append([q[2:]])
         elif q.startswith("\n"):
-            parts.append(q[1:])
+            parts.append([q[1:]])
         elif not q:
-            parts.append("")
+            parts.append([""])
         else:
-            parts[-1] += delim + p          # 境界を接頭に持つ別の行=枠ではない(中身へ戻す)
+            parts[-1] += (delim, p)         # 境界を接頭に持つ別の行=枠ではない(中身へ戻す)
     heads, bodies = [boundary], []
-    for pt in parts:
+    for frags in parts:
+        pt = "".join(frags)
         if pt.endswith("\r"):
             pt = pt[:-1]                    # 次の枠の直前の CRLF の CR
         h, c = _mp_split_part(pt)
@@ -1633,6 +1713,27 @@ def _stacked_query_suspect(blob: str, *, body: bool = False) -> bool:
     return (_STACKED_BODY_RE if body else _STACKED_RE).search(blob) is not None
 
 
+# 本文で、値に符号化して入れた改行(%0A・&#10;・\\u000a 等)を ';' にした見え方(nl=True)でも照合する
+# 規則(#14)。値の改行はサーバ側で文/コマンドの区切りになる(head と同じ注入)が、本文の他の署名には
+# 見せない(';' にすると '...' + 改行 が traversal の '..;' に当たる等、別の誤検知が出る)。どれも ';' の
+# 後に文脈(引数・SQL 文の構文・ヘッダ値の形)を要求する本文用の照合なので、テキストエリアの
+# 'Cat food …' / 'Update: …' / 'To: …' 行は当たらない。並びは [[NetShield._scan_builtin]] と同じ
+# (署名の rce → crlf、構造検知のスタック複文)。(名前, 正規表現, 既定の重み)。
+_BODY_NL_RULES = (("rce", dict(_SIG_RE_BODY)["rce"], 30),
+                  ("crlf", _BODY_CRLF_RE, 30),
+                  ("sqli-stacked", _STACKED_BODY_RE, 40))
+# その見え方を作るかの前置ゲート([[_normalize_full]] の改行の段=復号で値に現れた改行だけが残る所で
+# 見る)。見え方で新たに当たりうるのは ';'(=値の改行)の直後にコマンド名/SQL の動詞/ヘッダ名+':' が
+# 来る形だけ(他の分岐は本文の走査面で照合済み)で、改行と語の間・ヘッダ名と ':' の間で仕上げが消すのは
+# 空白だけ=真陽性のスーパーセット。改行の後は改行以外の空白だけを見る(改行の長い連続で 2 乗に
+# ならない)。小文字化の前なので大小を無視する。
+_BODY_NL_LEAD = re.compile(
+    r"[\r\n][^\S\r\n]*(?:(?:cat|wget|curl|bash|sh|nc|powershell|select|exec)\b"
+    r"|(?:insert|update|delete|drop|create|alter|truncate|union|grant)\s"
+    r"|(?:set-cookie|location|refresh|content-(?:type|length|disposition|transfer-encoding)"
+    r"|bcc|cc|to|mime-version)[^\S\r\n]*:)", re.I)
+
+
 # DOMイベントハンドラ系 XSS の *構造* 検知 — 個別ハンドラ名の列挙(prescan需要)を避け、
 # 『タグ内に on<名前>= が現れる』形で捕捉する(<svg onload= / <div onclick= / <svg/onload=)。
 # literal '<タグ' を要求するため、?onload=1 のような素の引数は対象外=低誤検知。タグと
@@ -1681,6 +1782,19 @@ _ENUM_KEYS = {
 }
 # 照合用: 小文字の綴り → 正規の綴り
 _ENUM_CANON = {k: {a.lower(): a for a in vs} for k, vs in _ENUM_KEYS.items()}
+# 列挙値を検証しなかった旧版が *認識しない綴り*('Whitelist' ' audit' 等)で実際に取っていた動作
+# (#18)。読む側は正規の綴りとの完全一致で比べていたので、ip_mode='Whitelist' は off として動いて
+# いた。保存値を正規化して読むと動作が変わるキー(正規化後 != これ)だけを warnings で名指しする。
+# cookie_samesite は旧版も strip して Set-Cookie に書き、ブラウザは大小を区別しないので対象外。
+_ENUM_LEGACY_EFFECT = {
+    "dlp_action": "audit",            # == "block" のときだけ遮断していた
+    "mode": "enforce",                # == "audit" のときだけ記録のみ
+    "open_redirect_mode": "audit",    # != "enforce" は記録のみ
+    "geo_mode": "off", "site_mode": "off", "ip_mode": "off",
+}
+_ENUM_NORM_CODE = "cfg_enum_normalized"
+# 許可リスト型のモードと、そのリストのキー(空なら全遮断になることを警告文に添える)
+_ALLOW_LIST_OF = {("ip_mode", "whitelist"): "ip_whitelist", ("geo_mode", "allow"): "geo_cidrs"}
 # HTTP ヘッダへそのまま書く自由入力の文字列キー。origin_header は要求ヘッダの *名前*
 # (エッジトークン・#77)、open_redirect_safe_path は応答の Location の *値*。改行(CR/LF)・NUL・
 # 他の制御文字(C0/DEL/C1 と U+2028/2029)はヘッダの区切りを壊すので受理しない。ヘッダ名は
@@ -1703,14 +1817,28 @@ def _finite_number(v) -> bool:
 
 def _sig_weight(w):
     """カスタムシグネチャ weight を検証して float で返す(不正は None)。NaN はスコアを永久に
-    NaN にし(閾値比較が常に偽=その IP は BAN されない)、負値は他の検知の加点を打ち消す。"""
+    NaN にし(閾値比較が常に偽=その IP は BAN されない)、負値は他の検知の加点を打ち消す。
+    上限超えの有限値は _SIG_WEIGHT_MAX へ丸める: 旧版は任意の weight(『見たら BAN』の 5000 等)を
+    受理して保存しており、無効化すると更新で検知が止まる。1000 でも 1 回の一致で block_score を大きく
+    超えるので動作は同じ。"""
     if isinstance(w, bool):
         return None
     try:
         w = float(w)
     except (TypeError, ValueError, OverflowError):
         return None
-    return w if math.isfinite(w) and 0 <= w <= _SIG_WEIGHT_MAX else None
+    if not math.isfinite(w) or w < 0:
+        return None
+    return min(w, _SIG_WEIGHT_MAX)
+
+
+def _sig_weight_capped(w) -> bool:
+    """weight が上限を超える有限値で、_sig_weight が丸めたか(一覧・追加結果での注記用)。"""
+    try:
+        return (not isinstance(w, bool) and math.isfinite(float(w))
+                and float(w) > _SIG_WEIGHT_MAX)
+    except (TypeError, ValueError, OverflowError):
+        return False
 
 
 # ── カスタムシグネチャの補助(名前・件数上限・正規化との食い違い) ──
@@ -1834,6 +1962,26 @@ def _norm_blocked_methods(methods):
     return norm, rejected
 
 
+def _dropped_elements(k: str, raw, kept):
+    """_load(strict=False)が保存値の *一部の要素だけ* 捨てたときの記録用(フル版 #16 と同じ)。
+    リスト/辞書キーの捨てた要素数を返す(捨てていなければ None)。重複の畳み込みは数えない
+    (意味は変わらない)。キーごと捨てた場合は呼び出し側の keys に入る。"""
+    if k == "blocked_methods":                 # _norm_blocked_methods の rejected は重複も含む
+        items = raw.replace(",", " ").split() if isinstance(raw, str) else raw
+        if not isinstance(items, (list, tuple)):
+            return None
+        bad = 0
+        for m in items:
+            m = str(m).strip().upper()
+            if m and not (m.isalpha() and len(m) <= 16):
+                bad += 1
+        return bad or None
+    if isinstance(raw, (list, tuple, dict)) and isinstance(kept, (list, dict)):
+        lost = len(raw) - len(kept)
+        return lost if lost > 0 else None
+    return None
+
+
 # site_mode="whitelist" の許可リスト(#85 r4)。_site_block は空の許可リストを評価しない=*全 Host
 # 許可*(fail-open。ip/geo の許可リストは空=全遮断)。設定の入口では結果がこの組になる変更を拒否し、
 # 旧版が保存した state だけは締め出さないよう従来どおり読み込んで status の warnings で知らせる。
@@ -1885,12 +2033,19 @@ def _card_issuer_ok(d: bytes) -> bool:
     13 桁の JAN/EAN コード(45/49 始まり)や 16 桁の注文番号の約 1 割が Luhn を満たして
     credit_card と判定され、DLP block で商品一覧の応答が切れていた。
     Visa 4 / Mastercard 51-55・2221-2720 / Amex 34・37 / Discover 6011・644-649・65 /
-    JCB 3528-3589 / Diners 300-305・36・38 / UnionPay 62。d は 14 桁以上の数字列。"""
+    JCB 3528-3589 / Diners 300-305・36・38 / UnionPay 62 /
+    Maestro 5018・5020・5038・5893・6304・6759・6761-6763・676770・676774 /
+    RuPay 508500-508999・606985-607984・608001-608500(652150-653149 は 65 に含まれる)。
+    Maestro と RuPay は前版が検出していたのに絞り込みで抜けていた(review #39)。登録された範囲だけを
+    足す(50xx/60xx/63xx 全体は足さない=注文番号の誤検知を戻さない)。d は 14 桁以上の数字列。"""
     if d[:1] == b"4":
         return True
-    p2, p3, p4 = int(d[:2]), int(d[:3]), int(d[:4])
+    p2, p3, p4, p6 = int(d[:2]), int(d[:3]), int(d[:4]), int(d[:6])
     return (51 <= p2 <= 55 or 2221 <= p4 <= 2720 or p2 in (34, 37, 36, 38, 62, 65)
-            or p4 == 6011 or 644 <= p3 <= 649 or 3528 <= p4 <= 3589 or 300 <= p3 <= 305)
+            or p4 == 6011 or 644 <= p3 <= 649 or 3528 <= p4 <= 3589 or 300 <= p3 <= 305
+            or p4 in (5018, 5020, 5038, 5893, 6304, 6759, 6761, 6762, 6763)
+            or p6 in (676770, 676774) or 508500 <= p6 <= 508999
+            or 606985 <= p6 <= 607984 or 608001 <= p6 <= 608500)
 
 
 def scan_secret_leak(data, start: int = 0, limit: int = None) -> list:
@@ -2009,7 +2164,8 @@ class NetShield:
         # 保存済みの要注意設定(旧版が保存し得た site_mode=whitelist + 空リスト等)は挙動を変えずに
         # 読み込み、起動時に 1 回だけ system イベントで知らせる(以後は status の warnings・#85 r4)。
         for w in self.config_warnings():
-            self._event("system", w["code"], {"note": w["message"]})
+            self._event("system", w["code"], {"note": w["message"],
+                                              "keys": list(w.get("keys") or ())})
 
     # ── 永続化 ───────────────────────────────────────────────────
     def _read_state(self, path: str, default, what: str, status_out: list | None = None):
@@ -2051,7 +2207,12 @@ class NetShield:
                 self.report_tamper("state_tamper", what, reason, extra)
             except Exception:
                 pass
-            return default, False
+            # 署名実績のあるファイルの *削除* は、警報したうえで migrate=True を返し、呼び出し側の
+            # 再保存で fail-safe 値(state.json は既定値+防御有効)を署名保存させる(#19)。保存しないと
+            # 起動のたびに同じ削除を警報し続けた(意図した初期化でも毎回 malicious が SIEM へ飛ぶ)。
+            # 保存で .hw の版が進むので、再び消されれば再び警報する(=削除 1 回につき 1 回)。
+            # 中身の改竄・すり替え・巻き戻し(ファイルが残る)は証拠を上書きせず従来どおり毎回警報。
+            return default, (seen == "missing" and status == "tampered")
         if status == "missing":
             return default, False
         return (val if val is not None else default), (status == "unsigned")
@@ -2084,24 +2245,36 @@ class NetShield:
         # ので未配線だった頃の既定 40 が必ず残っており、配線後にそれを効かせると既存の導入で
         # 加点(=共有キーでの BAN 第三者転嫁)が突然有効になる。新版で明示した値は版付きで残る。
         legacy = not isinstance(d.get("rev"), int) or d["rev"] < _CFG_REV
-        dropped = []
+        dropped, partial, renamed = [], {}, {}
         for k, v in (d.get("cfg") or {}).items():
             if legacy and k == "cred_rate_score":
                 continue
             # 署名が正しくても値が壊れている場合がある(旧版の set_config は構造/NaN を素通しで
             # 保存していた)。API と同じ検証を通し、壊れた保存値で起動直後から全断させない。
-            ok, v = self._coerce_cfg(k, v, strict=False, base=cfg) if k in cfg else (False, None)
+            ok, nv = self._coerce_cfg(k, v, strict=False, base=cfg) if k in cfg else (False, None)
             if ok:
-                cfg[k] = v
+                cfg[k] = nv
+                # 要素の一部だけ捨てたリスト/辞書も記録する(黙って消え、次の保存でファイルからも消えた)
+                lost = _dropped_elements(k, v, nv)
+                if lost:
+                    partial[k] = lost
+                # 旧版では効いていなかった綴りが正規化で効き始めるキー(#18・warnings で名指し)
+                if isinstance(v, str) and nv != v and _ENUM_LEGACY_EFFECT.get(k, nv) != nv:
+                    renamed[k] = nv
             elif k in cfg:
                 dropped.append(k)                 # 不正な保存値=既定値のまま(黙って捨てない)
-        if dropped:                               # どのキーを捨てたかだけ記録(値は載せない)
-            self._event("system", "cfg_load_rejected",
-                        {"keys": sorted(dropped),
-                         "note": "保存済みの不正な設定値は読まず既定値を使う"})
+        if dropped or partial:                    # どのキー/要素を捨てたかだけ記録(値は載せない)
+            ev = {"keys": sorted(dropped),
+                  "note": "保存済みの不正な設定値は読まず既定値を使う"}
+            if partial:
+                ev["elements"] = partial          # キーごとの読まなかった要素数
+                ev["note"] = ((ev["note"] + "。") if dropped else "") + (
+                    "一部の要素を読まなかった(elements。次の保存で設定ファイルからも消えるので、"
+                    "必要なら使える形で登録し直す)")
+            self._event("system", "cfg_load_rejected", ev)
+        if into is None:                          # 起動時の読込だけを warnings の根拠にする
+            self._enum_renamed = renamed
         # BANは安全側で揮発(再起動でリセット)・設定のみ永続
-        if migrate and into is None:              # 旧来の無署名→署名済みへ移行
-            self._save()
         if into is None and status in ("tampered", "rolled_back"):
             from ..core.signed_state import has_signed_history
             if self._state_signed_before or has_signed_history(self.path, self._state_key):
@@ -2109,6 +2282,10 @@ class NetShield:
                 self._event("system", "cfg_fail_closed",
                             {"file": os.path.basename(self.path), "status": status,
                              "note": "state.json を検証できないため既定値+防御有効で起動"})
+        # 旧来の無署名→署名済みへ移行。署名実績のある state.json の削除(#19)も、上の fail-closed を
+        # 当てた後の cfg を保存する(次の起動で同じ削除を再警報せず、OFF にも戻らない)。
+        if migrate and into is None:
+            self._save()
         return status
 
     def _save(self) -> bool:
@@ -2240,7 +2417,7 @@ class NetShield:
             if not s.get("enabled", True):
                 why = "無効(enabled=false)"
             elif w is None:
-                why = f"weight が不正(0〜{_SIG_WEIGHT_MAX:g} の有限の数値)"
+                why = "weight が不正(0 以上の有限の数値)"
             else:
                 why = self.validate_pattern(s.get("pattern", ""))   # 危険(ReDoS等)/長すぎは載せない
                 if not why and len(out) >= _CUSTOM_SIG_MAX:
@@ -2255,6 +2432,8 @@ class NetShield:
             v = dict(s)
             if w is None:
                 v["weight"] = None             # NaN/inf をそのまま返すと管理画面の JSON が壊れる
+            elif _sig_weight_capped(s.get("weight", 40)):
+                v["weight"] = w                # 旧版が保存した上限超え: 一覧は実際に効く値を出す
             v["active"] = not why
             if why:
                 v["reason"] = why
@@ -2315,7 +2494,8 @@ class NetShield:
             return {"ok": False, "error": f"name '{name}' は組込シグネチャと同名(別の名前にする)"}
         w = _sig_weight(weight)
         if w is None:
-            return {"ok": False, "error": f"weight は 0〜{_SIG_WEIGHT_MAX:g} の有限の数値"}
+            return {"ok": False, "error": "weight は 0 以上の有限の数値"
+                                          f"({_SIG_WEIGHT_MAX:g} を超える値は {_SIG_WEIGHT_MAX:g})"}
         err = self.validate_pattern(pattern) if isinstance(pattern, str) else "pattern は文字列"
         if err:
             return {"ok": False, "error": err}
@@ -2335,6 +2515,9 @@ class NetShield:
             self._compile_custom()
             out = {"ok": True, "added": name, "total_custom": len(self._custom)}
         warns = _custom_pattern_warnings(pattern)
+        if _sig_weight_capped(weight):        # 丸めた(拒否はしない)ことを返す
+            warns.append(f"weight は上限 {_SIG_WEIGHT_MAX:g} として保存した"
+                         f"(1 回の一致で block_score を大きく超える)")
         if warns:
             out["warnings"] = warns
         return out
@@ -2480,7 +2663,12 @@ class NetShield:
             if k == "paranoia":
                 v = max(1, min(4, v))                         # set_paranoia と同じ範囲
             elif k in _RATE_COUNT_KEYS and v > _RATE_COUNT_MAX:
-                return False, None
+                # API では拒否して知らせる。旧版は上限なしで受理し、巨大値(1億など)は『実質無効』の
+                # 書き方として使われていた。保存済みの旧値を捨てると既定値(50 / 600)で 4xx 加点や
+                # API キー遮断が突然効き始めるので、上限へ丸めて読む(上限でも実質発火しない)。
+                if strict:
+                    return False, None
+                v = _RATE_COUNT_MAX
             elif k == "cadence_min_samples" and v > _CADENCE_SAMPLES:
                 # 間隔は _CADENCE_SAMPLES 個しか溜まらない=超える値は周期性検知を黙って永久に
                 # 無効化していた(#40)。API では拒否して知らせ、保存済みの旧値は上限へ丸める。
@@ -3063,30 +3251,27 @@ class NetShield:
         複数フィールド/本文の窓をまたいで集計する(組込は初出・カスタムは最重・#31)。
         body=True は要求本文用の正規化で窓を作り(改行を ';' にしない・[[_normalize_full]])、
         ';' 前提の検知に文脈を要求する本文用の照合で走査する(#2・[[_SIG_RE_BODY]])。
-        本文の crlf だけは、値に符号化して入れた改行(%0D%0A 等)を ';' にした見え方でも照合する
-        (値がリダイレクト先/Cookie に反映される時の注入=head の crlf と同じ形)。その見え方は
-        [[_BODY_CRLF_GATE]] が通った時だけ作り直す(良性の本文の正規化は 1 回のまま)。生の改行
-        (YAML/テキスト/multipart の枠・部ヘッダの行の区切り)は ';' にしない=正規にヘッダの形をした
-        部ヘッダの並びが crlf に当たることはない。"""
+        本文の crlf・rce・スタック複文は、値に符号化して入れた改行(%0D%0A 等)を ';' にした見え方でも
+        照合する([[_BODY_NL_RULES]]。値がリダイレクト先/Cookie/コマンド/SQL に入る時の注入=head と同じ形・
+        #14)。その見え方は値の改行の後に照合対象の語が続く時だけ、同じ 1 回の正規化から作る(復号を
+        やり直さない・[[_BODY_NL_LEAD]])。生の改行(YAML/テキスト/multipart の枠・部ヘッダの行の
+        区切り)は ';' にしない=正規にヘッダの形をした部ヘッダの並びや、テキストの行頭の語は当たらない。"""
         if acc is None:
             acc = _SigScan(self._custom_re)
-        # 値の改行は復号でしか現れない('%'・'&'・'\\' のどれかが要る。全角 ％ 等は NFKC でそれらに
-        # なるので非 ASCII は常に通す。登録デコーダの出力も別扱い)
-        nl_ok = body and (only is None or "crlf" in only) and (
-            bool(_SCAN_DECODERS) or "%" in text or "&" in text or "\\" in text
-            or not text.isascii())
-        nl = False
-        for _w in _scan_windows(text, body=body):
+        nl_rules = (tuple(r for r in _BODY_NL_RULES if only is None or r[0] in only)
+                    if body else ())
+        nl_wins = [] if nl_rules else None       # 値の改行を ';' にした見え方の窓(要る時だけ入る)
+        for _w in _scan_windows(text, body=body, nl_views=nl_wins):
             self._scan_into(_w, acc, only=only, body=body)
             if acc.hit is not None and (only is not None or acc.done()):
                 break
-            if (nl_ok and not nl and acc.hit is None
-                    and any(_n in _w for _n in _BODY_CRLF_NAMES) and _BODY_CRLF_GATE.search(_w)):
-                nl = True
-        if nl and acc.hit is None:
-            for _w in _scan_windows(text, body=True, nl=True):
-                if saferegex.search(_BODY_CRLF_RE, _w, _MAX_SCAN):
-                    acc.hit, acc.weight = "crlf", _SIG_WEIGHT.get("crlf", 30)
+        if nl_wins and acc.hit is None:
+            for _w in nl_wins:
+                for _name, _rgx, _wt in nl_rules:
+                    if saferegex.search(_rgx, _w, _MAX_SCAN):
+                        acc.hit, acc.weight = _name, _SIG_WEIGHT.get(_name, _wt)
+                        break
+                if acc.hit is not None:
                     break
         return acc.result()
 
@@ -3979,7 +4164,7 @@ class NetShield:
 
     def ban(self, ip: str, ttl_sec: float = None, permanent: bool = False) -> dict:
         """手動BAN。permanent=True で無期限BAN、ttl_sec で時限BAN(既定は cfg のTTL)。"""
-        key = _canon_ip(ip)
+        key = _canon_cfg_ip(ip)               # fe80::1%eth0 は peer と同じ fe80::1 を BAN
         if not key:
             # 生文字列を鍵にすると空白付き/大文字/非圧縮 IPv6 は正規形の peer と一致せず、一覧に
             # 載るのに何も遮断しない BAN になっていた(#25/#45)。単一IP以外(CIDR 等)は拒否する。
@@ -4065,7 +4250,7 @@ class NetShield:
     def unban(self, ip: str) -> dict:
         # 表記ゆれでも同じIPを解除する(#45)。旧版が生の綴りで保存した IP でない鍵(CIDR 等)も
         # 一覧の綴りそのままで解除できるよう、正規形と生文字列の両方を引く。
-        key = _canon_ip(ip)
+        key = _canon_cfg_ip(ip)               # ban と同じくゾーンID付きも peer の形で引く
         raw = ip if isinstance(ip, str) else ""
         hit = False
         with self._lock:
@@ -4289,7 +4474,7 @@ class NetShield:
             # 旧版は手動BANの生の綴り(大文字/非圧縮 IPv6・空白付き)を鍵に保存していた(#45)。
             # 正規形へ寄せて実際の peer と一致させる。IP でない旧鍵(CIDR 等)はそのまま読む
             # (一覧に出して解除できるように)。
-            ip = _canon_ip(ip) or ip
+            ip = _canon_cfg_ip(ip) or ip          # ゾーンID付きの旧鍵も peer の形へ(fe80::1%eth0)
             try:
                 until = float("inf") if b.get("permanent") else float(b.get("until") or 0)
                 cnt = int(b.get("count") or 0)
@@ -4547,16 +4732,50 @@ class NetShield:
         return {"summary": summary, "events": evs[:50]}
 
     def config_warnings(self) -> list:
-        """壊れてはいないが運用者が直すべき設定の一覧([{code, keys, message}]・無ければ空)。
+        """壊れてはいないが運用者が直すべき設定の一覧([{code, keys, message, message_en}]・無ければ空)。
+        message は日本語、message_en は同じ内容の英文(英語表示のダッシュボードが優先して出す)。
         · site_whitelist_empty(#85 r4): site_mode=whitelist なのに site_whitelist が空=全 Host を
-          許可している。設定の入口では拒否するが、旧版が保存した state は締め出し回避のため維持。"""
+          許可している。設定の入口では拒否するが、旧版が保存した state は締め出し回避のため維持。
+        · cfg_enum_normalized(#18): 旧版が保存した列挙値の綴り('Whitelist' 等)を正規化して読み、
+          旧版では効いていなかった設定がこの版で効き始めた。運用者が別の値にしたキーは外す
+          (設定を保存し直せば正規の綴りで残るので、次の起動からは出ない)。"""
         out = []
         if self.cfg.get("site_mode") == "whitelist" and not self.cfg.get("site_whitelist"):
             out.append({"code": _SITE_WL_EMPTY_CODE, "keys": list(_SITE_KEYS),
                         "message": "site_mode=whitelist ですが site_whitelist が空のため、全 Host を"
                                    "許可しています(以前の版で保存された設定を互換のため維持)。"
                                    "許可する Host を site_whitelist に追加するか、site_mode を off に"
-                                   "してください。"})
+                                   "してください。",
+                        "message_en": "site_mode=whitelist but site_whitelist is empty, so every Host "
+                                      "is allowed (a setting saved by an earlier version, kept for "
+                                      "compatibility). Add the Hosts to allow to site_whitelist, or "
+                                      "set site_mode to off."})
+        ren = {k: v for k, v in (getattr(self, "_enum_renamed", None) or {}).items()
+               if self.cfg.get(k) == v}
+        if ren:
+            keys = sorted(ren)
+            now = ", ".join(f"{k}={ren[k]}" for k in keys)
+            was = ", ".join(f"{k}={_ENUM_LEGACY_EFFECT[k]}" for k in keys)
+            empty = [lk for (k, v), lk in _ALLOW_LIST_OF.items()
+                     if ren.get(k) == v and not self.cfg.get(lk)]
+            out.append({"code": _ENUM_NORM_CODE, "keys": keys,
+                        "message": f"以前の版で保存された設定の綴り(大文字小文字・前後の空白)を正規化し、"
+                                   f"{now} として読み込みました。以前の版はこの綴りを認識せず {was} と"
+                                   f"同じ動作でしたが、この版では設定どおりに効きます。"
+                                   + (f"{', '.join(empty)} が空のため、該当する送信元をすべて遮断します。"
+                                      if empty else "")
+                                   + "意図した設定か確認し、違えば変更してください(設定を保存し直すと"
+                                     "次の起動からこの警告は出ません)。",
+                        "message_en": f"Settings saved by an earlier version were spelled differently "
+                                      f"(letter case or surrounding spaces); they were normalized and "
+                                      f"are now read as {now}. Earlier versions did not recognize that "
+                                      f"spelling and behaved as {was}; this version applies the "
+                                      f"settings as written. "
+                                      + (f"{', '.join(empty)} {'is' if len(empty) == 1 else 'are'} "
+                                         f"empty, so every client is blocked. " if empty else "")
+                                      + "Check that this is what you want and change it if not "
+                                        "(after you save the settings again, this warning no longer "
+                                        "appears from the next start)."})
         return out
 
     def status(self) -> dict:

@@ -11,7 +11,7 @@ DuckNet L7 の防御と、それを制御する設定キーの一覧です(`NetS
 
 | 防御 | 主な設定キー | 既定 | 概要 |
 |---|---|---|---|
-| 侵入シグネチャ | （常時・`paranoia` で厳格度） | ON | SQLi/XSS/RCE/traversal/XXE/SSRF/JNDI/SSI/OGNL/proto/CRLF/NoSQLi/LFI/scanner。多層正規化(多重デコード/Unicode/Log4j入れ子)付き |
+| 侵入シグネチャ | （常時・`paranoia` で厳格度） | ON | SQLi/XSS/RCE/traversal/XXE/SSRF/JNDI/SSI/OGNL/proto/CRLF/NoSQLi/LFI/scanner。多層正規化(多重デコード/Unicode/Log4j入れ子)付き。全角英字や全角の `＜` `＞` などは ASCII へ畳んで照合し、日本語の文で普通に使う全角の `｜` `＄` `（` `）` `；` `｀` は URL・ヘッダ・本文のどれでも記号へ畳まず空白として読む |
 | 要求ボディ検査 | `body_scan_enabled`, `body_scan_max_bytes` | ON | POST/JSON/GraphQL 本文を有界・重複ウィンドウで走査(下の注記) |
 | 圧縮ボディ解凍 | `body_decode_enabled` | ON | gzip/deflate を有界解凍してから走査(圧縮回避封じ) |
 | アップロード検査 | `upload_scan_enabled`, `upload_deny_ext` | ON | multipart のパートと生本文アップロード(要求ヘッダの `Content-Disposition`)の危険拡張子(webshell)を拒否。二重拡張子/NUL 切り/`filename*` 対応(下の注記) |
@@ -31,12 +31,18 @@ DuckNet L7 の防御と、それを制御する設定キーの一覧です(`NetS
 > `drop`・`create`・`alter` + `table` など / `truncate table` / `exec xp_…` / `union select` /
 > `grant … on … to`)が続くとき、コマンド連結(`rce` の `;` 分岐)は `;` の後のコマンドが引数(`-` で始まる
 > フラグ・パス・`$` 変数・リダイレクト・URL・IPv4・`host.tld/`)を伴うとき、`crlf` は既知の応答ヘッダ名と
-> その値の形(`set-cookie:名前=` / `location:URL` / `to:宛先@…` など)の直前に、字面の `;` か、値に符号化
-> して入れた改行(`%0D%0A`・`&#10;` など、復号で現れた改行。urlencoded・JSON・multipart のフォーム値の
-> どれでも)があるときだけです。URL/ヘッダの走査は従来どおりです。本文の生の改行(YAML/テキストの行・
-> multipart の枠とパートヘッダの区切り)は文書の構造とみなし、`crlf` の照合でも空白のまま読みます(正直な
-> 限界: フォーム値に符号化せず生の CRLF で入れた改行の後のヘッダの形は `crlf` に当たりません)。
-> カスタムシグネチャを含む他の検知が見る本文の走査面では、改行はどれも空白です。multipart(先頭行が
+> その値の形(`set-cookie:名前=` / `location:URL` / `to:宛先@…` など)の直前に `;` があるときだけです。
+> この 3 つ(`sqli-stacked`・`rce` の `;` 分岐・`crlf`)の照合では、値に符号化して入れた改行(`%0D%0A`・
+> `&#10;`・`\u000a` など、復号で現れた改行。urlencoded・JSON・multipart のフォーム値のどれでも)も字面の
+> `;` と同じに読みます(値がリダイレクト先・Cookie・コマンド・SQL 文に入るときの注入で、URL/ヘッダ側と
+> 同じ形)。URL/ヘッダの走査は従来どおりです。本文の生の改行(YAML/テキストの行・multipart の枠と
+> パートヘッダの区切り)は文書の構造とみなし、この 3 つの照合でも空白のまま読みます(正直な限界: フォーム値に
+> 符号化せず生の改行で入れた後のヘッダ・コマンド・SQL 文の形は当たりません)。
+> カスタムシグネチャを含む他の検知が見る本文の走査面では、改行はどれも空白です。
+> 本文でも URL/ヘッダと同じく、日本語・中国語の地の文や題名で普通に使う全角の `｜` `＄` `（` `）` `；` `｀` を
+> ASCII の記号へ畳まず、空白として読みます(`データ分析の基礎｜Python` のような題名が rce に当たらないように。
+> 生の UTF-8・`\uXXXX`・`%XX` のどの送り方でも同じ)。全角英字や全角の `＜` `＞` は ASCII へ畳んで照合します。
+> multipart(先頭行が
 > `--境界` の本文)は枠を外し、各パートの中身とパートヘッダ(`name` / `filename` など)を別々に走査します。
 > 署名走査しないのは
 > 次の 2 つだけです: (1) multipart の *ファイル* パート(`filename` 付き)で中身に制御バイトを含むもの、
@@ -59,7 +65,8 @@ DuckNet L7 の防御と、それを制御する設定キーの一覧です(`NetS
 > 拡張子(php 系・phtml・phar・cgi・py・asp/aspx・jsp 系・shtml)を中間に含む名前(`shell.php.jpg`)です。
 > `www.example.com.har` の `com` のような中間セグメントは見ません。本文が `body_scan_max_bytes` を超える
 > 場合も、残りを転送しながら全パートのヘッダを検査し、危険なパートを見つけた時点で転送を止めて
-> backend 接続を切ります(パート数 10000・パートヘッダ 64KiB を超える multipart は検査できないので遮断)。
+> backend 接続を切ります(パート数 10000・1 パートのヘッダ 64KiB または 100 行を超える multipart は検査
+> できないので遮断。検査の時間はヘッダと本文の長さに比例します)。
 > 正直な限界: `Content-Encoding`(gzip 等)で圧縮された multipart は、解凍できた先頭だけを検査します。
 > `body_scan_enabled` を OFF にしてもアップロード検査は止まりません(止めるのは `upload_scan_enabled`)。
 
@@ -94,9 +101,9 @@ DuckNet L7 の防御と、それを制御する設定キーの一覧です(`NetS
 | IP レート/フラッド | `flood_threshold`, `window_sec`, `deny_score`, `block_score` | ON | スコア: `deny_score` 以上で単発拒否・`block_score` 以上で自動BAN(累犯エスカレーション) |
 | パス別レート | `path_limits`（`set_path_limits`） | opt-in | 認証/高コスト経路を厳格化 |
 | per-IP 同時接続 | `max_conn_per_ip` | opt-in | 接続枯渇/slowloris 増幅対策 |
-| クレデンシャル単位レート | `cred_rate_enabled`, `cred_rate_limit`, `cred_rate_window_sec` | opt-in | トークン/API キー単位(IP ローテーション濫用対策)。窓内 `cred_rate_limit` 件までは通し、超えた要求だけを遮断(既定は加点・BAN なし) |
-| 応答エラーレート | `resp_score_enabled`, `resp_error_threshold` | ON | 4xx 連射(列挙/ブルートフォース)を脅威スコアへ。`resp_error_threshold` は 1 以上(0 以下は拒否)。シールド OFF の間は集計のみで加点しない |
-| スロー POST | `body_timeout_enabled`, `body_max_sec` | ON | 要求ボディの総受信時間上限(R-U-Dead-Yet)。本文の走査中に超えた要求は backend へ送らず切断 |
+| クレデンシャル単位レート | `cred_rate_enabled`, `cred_rate_limit`, `cred_rate_window_sec` | opt-in | トークン/API キー単位(IP ローテーション濫用対策)。窓内 `cred_rate_limit` 件までは通し、超えた要求だけを遮断(既定は加点・BAN なし)。`cred_rate_limit` は 1048576 以下(超える値は拒否。以前の版で保存した上限超えの値は 1048576 として読む) |
+| 応答エラーレート | `resp_score_enabled`, `resp_error_threshold` | ON | 4xx 連射(列挙/ブルートフォース)を脅威スコアへ。`resp_error_threshold` は 1〜1048576(範囲外は拒否。以前の版で保存した上限超えの値は 1048576 として読む=実質発火しない)。シールド OFF の間は集計のみで加点しない |
+| スロー POST | `body_timeout_enabled`, `body_max_sec` | ON | 要求ボディの総受信時間上限(R-U-Dead-Yet)。本文の走査中に超えた要求は backend へ送らず切断(途中で間が空いても総時間内なら待つ)。本文を読む前に `Expect: 100-continue` で待っている要求には DuckNet が `100 Continue` を返し、backend へは `Expect` を外して渡す |
 | サブネット集約 | `subnet_defense`, `subnet_threshold` | opt-in | 分散攻撃を /24・/64 で束ねる |
 | データ量クォータ | `quota_max_gb`, `quota_max_conn_sec` | opt-in | egress 持ち出し量/接続時間で遮断 |
 
@@ -108,7 +115,7 @@ DuckNet L7 の防御と、それを制御する設定キーの一覧です(`NetS
 | セキュリティヘッダ注入 | `sec_headers_enabled`, `sec_headers_extra`, `sec_headers_strip` | opt-in | X-Content-Type-Options/Frame-Options/Referrer-Policy ほか |
 | Set-Cookie ハードニング | `cookie_harden_enabled`, `cookie_samesite`, `cookie_httponly` | ON | SameSite/Secure(TLS時)/HttpOnly(opt-in)を補完 |
 | CORS 無害化 | `cors_harden_enabled` | ON | `ACAO:*`/`null` + 資格情報の危険併存を無害化 |
-| オープンリダイレクト | `open_redirect_enabled`, `open_redirect_allow`, `open_redirect_mode` | opt-in | 外部許可外への 3xx を安全パスへ書換/記録 |
+| オープンリダイレクト | `open_redirect_enabled`, `open_redirect_allow`, `open_redirect_mode` | opt-in | 外部許可外への 3xx を安全パスへ書換/記録。ホストはポートを除いて比べ、IPv6 リテラルは角括弧の有無・表記の揺れを問わない(`[2001:db8::1]:8080` と `2001:db8::1` は同じ) |
 | キャッシュ汚染ヘッダ除去 | `strip_cache_poison_headers`, `cache_poison_headers` | ON | 非信頼クライアントの `X-Forwarded-Host` 等を除去 |
 
 ## 認証情報 / 信頼 / その他
@@ -146,13 +153,17 @@ DuckNet L7 の防御と、それを制御する設定キーの一覧です(`NetS
 > 既定値(OFF)で、改竄の記録もしません。既存の state dir で `DUCKNET_STATE_KEY` を替えると旧鍵の署名を
 > 検証できないので、同じく既定値+ON と改竄の記録つきで起動します(設定を入れ直してください)。正直な
 > 限界: `state.json` と `.hw` の両方を消されると、設定を一度も保存していない状態と区別できず既定値(OFF)
-> で記録なしに起動します。
+> で記録なしに起動します。署名実績のある状態ファイルの *削除* は、その起動で記録したうえで既定値(`state.json`
+> は既定値+シールド ON)を署名して保存し直すので、同じ削除を起動のたびに記録し続けることはありません(再び
+> 消されれば再び記録します。中身の改竄・すり替え・巻き戻しはファイルを残したまま起動のたびに記録します)。
 
 ## 訪問者に返す応答(ブラウザ / API)
 
 拒否したときの応答本文は、要求の `Accept` で切り替えます。ブラウザの画面遷移(`Accept` に `text/html` があり、
-`application/json` より優先)には、何が起きたか・次に何をすればよいかを書いた短い HTML ページを返します。
-API クライアント(`Accept: application/json`・`*/*`・`Accept` 無し)には従来どおりの JSON を返します(本文は同じ)。
+`application/json` などの JSON 型より優先し、さらに画面遷移らしい要求=`Accept` に `application/xhtml+xml` がある・
+`Sec-Fetch-Mode: navigate` / `Sec-Fetch-Dest: document`・ブラウザの `User-Agent`(`Mozilla/…`)のどれか)には、
+何が起きたか・次に何をすればよいかを書いた短い HTML ページを返します。API クライアント(`Accept: application/json`・
+`*/*`・`Accept` 無し・Java `HttpURLConnection` の既定 `Accept` など)には従来どおりの JSON を返します(本文は同じ)。
 状態コード・`Retry-After`・デセプションのヘッダはどちらでも同じで、HTML には `Cache-Control: no-store` が付きます。
 ページの言語は遮断ページと同じく `DUCKNET_LANG`(未設定なら OS ロケール)で選び、表示名は `DUCKNET_COVER` で
 差し替えられます。判定理由・規則名・スコアは出しません。ページの末尾に発生時刻(UTC)を出すので、訪問者からの
@@ -208,7 +219,7 @@ API クライアント(`Accept: application/json`・`*/*`・`Accept` 無し)に�
 | `block_page` | `True` | 遮断時に HTML の説明ページを返す(False=応答せずに接続を切る) |
 | `appeal_enabled` | `True` | 遮断ページに『解除リクエスト(異議申立)』を表示 |
 | `appeal_after_sec` | `120` | BANから この秒数 経過後にのみ解除リクエストを表示(数分後) |
-| `mode` | `"enforce"` | `enforce`(遮断)/ `audit`(遮断せず記録のみ。出口 DLP の `block` も記録のみになる) |
+| `mode` | `"enforce"` | `enforce`(遮断)/ `audit`(遮断せず記録のみ。出口 DLP の `block` と、単一値ヘッダの重複(enforce では 400)も記録のみになる) |
 | `blocked_extensions` | `(空)` | 遮断する拡張子(例 .env .sql .bak .git .ini) |
 | `blocked_urls` | `(空)` | 遮断するURL部分文字列(例 /admin /wp-admin) |
 | `require_tls` | `False` | 正規TLS以外(平文)を遮断(X-Forwarded-Proto=https 必須) |

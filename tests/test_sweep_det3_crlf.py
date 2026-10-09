@@ -104,9 +104,10 @@ def test_raw_header_shaped_lines_are_document_structure():
         assert sh._decayed_score(sh._state("192.0.2.53")) == 0
 
 
-def test_value_line_break_is_seen_only_by_crlf_rule():
-    """値の改行を ';' として見るのは crlf の照合だけ。他の署名が見る本文の走査面は従来どおり改行を
-    空白に畳む(';' にすると '...' + 改行 が traversal の '..;' に当たる等、別の誤検知が出る)。"""
+def test_value_line_break_view_is_used_only_by_crlf_rce_and_stacked_rules():
+    """値の改行を ';' として見るのは crlf・rce(';' 連結)・sqli-stacked の照合だけ(P._BODY_NL_RULES)。
+    他の署名(カスタムシグネチャを含む)が見る本文の走査面は従来どおり改行を空白に畳む(';' にすると
+    '...' + 改行 が traversal の '..;' に当たる等、別の誤検知が出る)。"""
     for f in _CRLF_FIXTURES:
         assert ";" not in _normalize_full(f.decode("ascii"), body=True), f
     with tempfile.TemporaryDirectory() as d:
@@ -118,8 +119,8 @@ def test_value_line_break_is_seen_only_by_crlf_rule():
 
 
 def test_benign_form_body_is_normalized_once():
-    """改行入りの普通のフォーム本文は 1 回だけ正規化する(crlf 用の見え方は、ヘッダ名と値の形が
-    揃った時だけ作る=要求ごとの経路を重くしない)。"""
+    """改行入りの普通のフォーム本文は 1 回だけ正規化する(crlf・rce・複文用の見え方が要る時も、同じ
+    1 回の正規化の中で作る=復号をやり直さない・要求ごとの経路を重くしない)。"""
     calls = []
     orig = P._normalize_full
 

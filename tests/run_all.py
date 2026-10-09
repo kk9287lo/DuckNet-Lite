@@ -151,6 +151,17 @@ MODULES = [
     "test_sweep_ux_dashboard_gui",    # ダッシュボードの詳細分析/エラー表示
     "test_sweep_ux_cli",              # CLI の要約表示と --json
     "test_sweep_lite_tray_status",    # トレイのアイコン/ツールチップで防御 ON/OFF を表示
+    # 2026-10 全差分の独立レビューで見つかった回帰の修正
+    "test_sweep_rv_autostart",        # 自動起動: XML 登録で /TR 261 文字制限を回避
+    "test_sweep_rv_bodynorm",         # 本文: 全角記号を記号へ畳まない/符号化改行の文区切り
+    "test_sweep_rv_multipart",        # multipart: 部ヘッダ走査を線形に/行数上限/カード IIN
+    "test_sweep_rv_config",           # 旧版の設定・状態を更新後も同じ意味で読む
+    "test_sweep_rv_proxy",            # 100-continue/IPv6 リダイレクト/API 判定/監査
+    "test_sweep_rv_runtime",          # ログ回転で待たない
+    "test_sweep_rv_operator",         # run.bat の py -3/表示の言語
+    "test_sweep_rv_lite_tray",        # トレイ: 他プロセスへトークンを送らない/監査モード表示
+    "test_sweep_dec_headfold",        # URL/ヘッダでも全角の ｜＄（）；｀ をメタ文字にしない
+    "test_sweep_dec_runbat",          # run.bat の注釈を ASCII に(日本語版 Windows の誤ったエラー行)
 ]
 
 

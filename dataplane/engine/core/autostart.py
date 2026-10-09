@@ -45,17 +45,37 @@ def package_root() -> str:
     return here
 
 
+def needs_chdir(root: str = "") -> bool:
+    """`python -m dataplane` を起動位置に頼らず import できない配置か。
+    site-packages / dist-packages(pip install・venv・--user)は既定の sys.path に入るので
+    どこから起動しても import できる。それ以外(ソースツリー・解凍しただけ・editable)は
+    安全側で『要る』とみなす。区切りは \\ と / の両方を見る(テストは OS を問わず走る)。"""
+    base = str(root or package_root()).replace("\\", "/").rstrip("/").rsplit("/", 1)[-1]
+    return base.lower() not in ("site-packages", "dist-packages")
+
+
+def _py_str(s: str) -> str:
+    """-c に埋め込む Python の文字列リテラル。repr は \\ を二重にしてコマンド行を長くするので、
+    安全なら raw 文字列で書く(' を含む・末尾が \\ の場所だけ repr)。"""
+    if "'" in s or "\n" in s or "\r" in s or s.endswith("\\"):
+        return repr(s)
+    return "r'%s'" % s
+
+
 def windows_command(command, workdir: str = "") -> list:
-    """Windows 用に `python -m dataplane …` を作業ディレクトリ非依存の形へ置き換える。
-    タスクスケジューラ(/tr)と Run キーは『開始位置』を持たず %windir%\\System32 で起動するため、
-    pip install 不要のソースツリー配置では `-m dataplane` が import できず即死していた
-    (登録自体は ok:true)。起動直後に配置先へ chdir してから同じモジュールを実行する
-    (app.env も CWD で見つかる)。"""
+    """Run キー用に `python -m dataplane …` を起動位置に依らない形へ置き換える。
+    Run キーは『開始位置』を持たず %windir%\\System32 で起動するため、pip install 不要の
+    ソースツリー配置では `-m dataplane` が import できず即死していた(登録自体は ok:true)。
+    起動直後に配置先へ chdir してから同じモジュールを実行する(app.env も CWD で見つかる)。
+    site-packages 配置は前置き不要なので付けない(付けるとコマンド行が 110 文字以上延びる)。
+    タスクスケジューラは WorkingDirectory を持てるので task_xml を使い、この前置きは使わない。"""
     cmd = [str(a) for a in command]
     if len(cmd) >= 3 and cmd[1] == "-m" and cmd[2] == "dataplane":
-        boot = ("import os,runpy;os.chdir(%r);runpy.run_module('dataplane',run_name='__main__')"
-                % (workdir or package_root()))
-        cmd = [cmd[0], "-c", boot] + cmd[3:]
+        root = workdir or package_root()
+        if needs_chdir(root):
+            boot = ("import os,runpy;os.chdir(%s);runpy.run_module('dataplane',run_name='__main__')"
+                    % _py_str(root))
+            cmd = [cmd[0], "-c", boot] + cmd[3:]
     return cmd
 
 
@@ -82,12 +102,52 @@ def _quote_systemd(cmd) -> str:
 
 
 # ── Windows: タスクスケジューラ ──────────────────────────────────────────
-def schtasks_create_args(name: str, command_str: str, trigger: str = "onlogon") -> list:
-    """`schtasks /create` の argv(純粋)。trigger: onlogon(ログオン時)/ onstart(ブート時)。
-    /rl limited=最小権限で実行(昇格しない)。/f=既存を上書き。"""
-    sc = "ONSTART" if str(trigger).lower() == "onstart" else "ONLOGON"
-    return ["schtasks", "/create", "/tn", name, "/tr", command_str,
-            "/sc", sc, "/rl", "limited", "/f"]
+def _xml_text(s) -> str:
+    # CR はそのままだと XML の読み込みで LF に正規化されるので文字参照で残す
+    return (str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            .replace("\r", "&#13;"))
+
+
+def task_xml(command, *, trigger: str = "onlogon", workdir: str = "") -> str:
+    """タスクスケジューラのタスク定義(XML・純粋)。trigger: onlogon(ログオン時)/ onstart(ブート時)。
+    `schtasks /create /tr` は値が 261 文字までで、配置先へ chdir する前置きを足すと python.org 既定の
+    ユーザー単位 Python や --config 付きのふつうの指定でも超えて登録できなかった。定義なら長さの
+    上限が無く、開始位置を WorkingDirectory で渡せるので前置きも要らない。
+    意味は /tr 時代と同じ: 誰かのサインイン時(LogonTrigger)/起動時(BootTrigger)に、登録した
+    ユーザーとしてログオン中に実行(InteractiveToken)・最小権限(LeastPrivilege=/rl limited)。
+    常駐するゲートウェイなので、既定の『72 時間で停止』『バッテリーでは起動しない/止める』は外す。"""
+    cmd = [str(a) for a in command]
+    trig = "BootTrigger" if str(trigger).lower() == "onstart" else "LogonTrigger"
+    args = _quote(cmd[1:])
+    return (
+        '<?xml version="1.0" encoding="UTF-16"?>\n'
+        '<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">\n'
+        "  <RegistrationInfo>\n"
+        "    <Description>DuckNet gateway (registered by --install-autostart)</Description>\n"
+        "  </RegistrationInfo>\n"
+        f"  <Triggers>\n    <{trig}>\n      <Enabled>true</Enabled>\n    </{trig}>\n  </Triggers>\n"
+        '  <Principals>\n    <Principal id="Author">\n'
+        "      <LogonType>InteractiveToken</LogonType>\n"
+        "      <RunLevel>LeastPrivilege</RunLevel>\n"
+        "    </Principal>\n  </Principals>\n"
+        "  <Settings>\n"
+        "    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>\n"
+        "    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>\n"
+        "    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>\n"
+        "    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>\n"
+        "    <Enabled>true</Enabled>\n"
+        "  </Settings>\n"
+        '  <Actions Context="Author">\n    <Exec>\n'
+        f"      <Command>{_xml_text(cmd[0])}</Command>\n"
+        + (f"      <Arguments>{_xml_text(args)}</Arguments>\n" if args else "")
+        + f"      <WorkingDirectory>{_xml_text(workdir or package_root())}</WorkingDirectory>\n"
+        "    </Exec>\n  </Actions>\n"
+        "</Task>\n")
+
+
+def schtasks_create_args(name: str, xml_path: str) -> list:
+    """`schtasks /create` の argv(純粋)。定義は task_xml を書いたファイル。/f=既存を上書き。"""
+    return ["schtasks", "/create", "/tn", name, "/xml", xml_path, "/f"]
 
 
 def schtasks_delete_args(name: str) -> list:
@@ -95,17 +155,29 @@ def schtasks_delete_args(name: str) -> list:
 
 
 def install_windows_task(name, command, *, trigger="onlogon", run=None) -> dict:
-    """タスクスケジューラへ登録(明示名=Task Scheduler で可視)。run は subprocess.run を注入可能。"""
+    """タスクスケジューラへ登録(明示名=Task Scheduler で可視)。run は subprocess.run を注入可能。
+    定義は BOM 付き UTF-16 の一時ファイルで渡し(schtasks が確実に読める形)、登録後に消す。"""
     import subprocess
+    import tempfile
     run = run or subprocess.run
-    args = schtasks_create_args(name, _quote(windows_command(command)), trigger)
+    path = ""
     try:
-        r = run(args, capture_output=True, stdin=subprocess.DEVNULL, timeout=30, text=True)
+        fd, path = tempfile.mkstemp(prefix="ducknet-task-", suffix=".xml")
+        with os.fdopen(fd, "w", encoding="utf-16") as f:
+            f.write(task_xml(command, trigger=trigger))
+        r = run(schtasks_create_args(name, path), capture_output=True,
+                stdin=subprocess.DEVNULL, timeout=30, text=True)
         return {"ok": getattr(r, "returncode", 1) == 0, "method": "schtasks",
                 "name": name, "trigger": trigger,
                 "detail": (getattr(r, "stdout", "") or getattr(r, "stderr", "")).strip()}
     except Exception as e:
         return {"ok": False, "method": "schtasks", "name": name, "error": str(e)}
+    finally:
+        if path:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
 
 
 def uninstall_windows_task(name, *, run=None) -> dict:

@@ -31,8 +31,13 @@ _MAX_READ_BYTES = 64 * 1024 * 1024   # 状態JSONの読込上限(#111: 書込権
 # open が PermissionError になる。POSIX には無い一時的な失敗なので、Windows でだけ短い有界
 # バックオフで再試行する(合計 約 0.43 秒で諦める)。POSIX の PermissionError は本物の権限
 # 不足なので待たない。
+# ただし要求経路では眠らない: ログのローテーションは再試行せず(握られていれば見送って
+# _ROTATE_RETRY_SEC 後に 1 回だけ試し直す)、append_jsonl(wait=False) は開けなければ待たずに諦める。
+# 読み手が tail している間、要求ごとに約 0.43 秒眠って要求処理が止まっていた。
 _WIN = os.name == "nt"
 _SHARE_RETRIES = 10
+_ROTATE_RETRY_SEC = 5.0              # 回せなかったログは、この間ローテーションを試さない
+_ROTATE_BLOCKED: dict = {}           # abspath -> 最後に回せなかった時刻(monotonic)
 
 
 def _retry_sharing(fn, *args):
@@ -136,8 +141,18 @@ def _load_json_file(p: str):
 _O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)   # POSIX: 最終要素が symlink なら失敗
 
 
-def _rotate(path: str, backups: int) -> None:
-    """path → path.1 → … → path.{backups} と押し出し、最古は破棄。失敗は無害に握る。"""
+def _rotate(path: str, backups: int) -> bool:
+    """path → path.1 → … → path.{backups} と押し出し、最古は破棄。眠らない(要求経路から呼ばれる)。
+    先に現行を一時名へ退避する: 読み手が握っていればここで失敗し、世代には一切触らない(旧実装は
+    最古の削除と押し出しを済ませてから現行の改名に失敗し、失敗のたびに世代を 1 つずつ削っていた)。
+    path.1 を空けられなければ現行へ戻す。戻り値: 回せたか(False=今回は見送り・行は失わない)。"""
+    staged = f"{path}.rot-{os.urandom(4).hex()}"
+    try:
+        os.replace(path, staged)
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
     oldest = f"{path}.{backups}"
     try:
         if os.path.exists(oldest):
@@ -148,20 +163,31 @@ def _rotate(path: str, backups: int) -> None:
         try:
             src = f"{path}.{i - 1}"
             if os.path.exists(src):
-                _retry_sharing(os.replace, src, f"{path}.{i}")
+                os.replace(src, f"{path}.{i}")
         except Exception:
             pass
+    first = f"{path}.1"
+    if not os.path.exists(first):             # 押し出せなかった path.1 を上書きしない
+        try:
+            os.replace(staged, first)             # 現行 → path.1
+            return True
+        except OSError:
+            pass
     try:
-        if os.path.exists(path):
-            _retry_sharing(os.replace, path, f"{path}.1")     # 現行 → path.1
-    except Exception:
+        os.replace(staged, path)
+    except OSError:
         pass
+    return False
 
 
 def append_jsonl(path: str, obj: Any, *, max_bytes: int = 5_000_000,
-                 backups: int = 1, encoding: str = "utf-8") -> bool:
+                 backups: int = 1, encoding: str = "utf-8", wait: bool = True) -> bool:
     """1行 JSON を追記する。追記後にサイズ上限を超えそうなら先にローテーションする。
-    追記ログ(監査ログ)の無制限肥大を防ぐ共有ヘルパ。失敗しても例外は投げない。"""
+    追記ログ(監査ログ)の無制限肥大を防ぐ共有ヘルパ。失敗しても例外は投げない。
+    ローテーションは眠らない: 読み手が握っていれば見送り(上限を超えて追記を続ける)、
+    _ROTATE_RETRY_SEC 後の追記で 1 回だけ試し直す。
+    wait=False は要求経路(イベントループ・接続処理)用: Windows の共有違反で開けなくても待たずに
+    諦める(False)。既定の wait=True は管理操作の監査など、短く待ってでも行を残したい書き手用。"""
     try:
         line = json.dumps(obj, ensure_ascii=False) + "\n"
     except Exception:
@@ -178,8 +204,17 @@ def append_jsonl(path: str, obj: Any, *, max_bytes: int = 5_000_000,
             except OSError:
                 cur = 0
             if cur and cur + len(line.encode(encoding, "replace")) > max_bytes:
-                _rotate(path, max(1, backups))
-            with _retry_sharing(_open_append_nofollow, path, encoding) as f:
+                key = os.path.abspath(path)
+                now = time.monotonic()
+                last = _ROTATE_BLOCKED.get(key)
+                if last is None or now - last >= _ROTATE_RETRY_SEC:
+                    if _rotate(path, max(1, backups)):
+                        _ROTATE_BLOCKED.pop(key, None)
+                    else:
+                        _ROTATE_BLOCKED[key] = now
+            opened = (_retry_sharing(_open_append_nofollow, path, encoding) if wait
+                      else _open_append_nofollow(path, encoding))
+            with opened as f:
                 f.write(line)
         return True
     except Exception:

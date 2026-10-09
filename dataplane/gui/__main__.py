@@ -8,7 +8,8 @@ __main__.py — DuckNet-Lite: システムトレイ常駐(トレイのみ・依�
   · 無料版でできること   … このエディションで使える機能一覧(上位版との差は README/❓ヘルプ参照)
   · 終了               … 本launcher が起動した本体を停止し、トレイを外してプロセス終了
 防御の状態は 5 秒ごとに管理APIから読み、アイコン(ON=通常 / それ以外=淡色)とツールチップで示す
-(「防御 ON」「防御 OFF」「ゲートウェイに接続できません」「状態を確認できません(トークン不一致)」)。
+(「防御 ON」「防御 ON(監査モード: 記録のみ)」「防御 OFF」「ゲートウェイに接続できません」
+「状態を確認できません(トークン不一致)」)。トークンは相手が本製品の管理APIだと確かめてから送る。
 ON/OFF の切替そのものはダッシュボードで行う(トレイには持たせない)。
 起動時、本体(ゲートウェイ)が未起動なら子プロセスとして一緒に立ち上げる(既に稼働中なら起動しない)。
 backend/listen は env DUCKNET_BACKEND / DUCKNET_LISTEN で上書き可(既定 127.0.0.1:8080 / 8443)。
@@ -97,11 +98,14 @@ def _status_icons():
 
 # ── 防御状態の表示(トレイのアイコン/ツールチップ) ──────────────────────
 STATE_ON, STATE_OFF, STATE_DOWN, STATE_AUTH = "on", "off", "unreachable", "auth"
+STATE_AUDIT = "audit"              # 有効だが mode=audit(検知は記録のみ・何も遮断しない)
 _POLL_SEC = 5.0                    # 状態の再取得間隔(秒)。初回は起動直後に即時
 _FETCH_TIMEOUT = 2.0
 _METRICS_MAX = 64 * 1024           # 読む上限(ducknet_shield_enabled は先頭近くにある)
+_ADMIN_401_MARK = b"token required"   # 本製品の管理APIが返す 401 本文の指紋(_admin_is_ours と共通)
 _STATUS_TEXT = {
     STATE_ON: "防御 ON / Protection ON",
+    STATE_AUDIT: "防御 ON(監査モード: 記録のみ・遮断しません)/ Protection ON (audit: record only)",
     STATE_OFF: "防御 OFF(ダッシュボードで ON にできます)/ Protection OFF",
     STATE_DOWN: "ゲートウェイに接続できません / Gateway unreachable",
     STATE_AUTH: "状態を確認できません(管理トークン不一致)/ Status unknown (token mismatch)",
@@ -109,8 +113,9 @@ _STATUS_TEXT = {
 
 
 def _status_view(state: str, brand=None):
-    """防御状態 → (ツールチップ, アイコン名)。ON だけ通常アイコン、それ以外(OFF・接続不可・
-    トークン不一致)は淡色=「守られていない/守られているか分からない」を同じ見た目にまとめる。
+    """防御状態 → (ツールチップ, アイコン名)。ON だけ通常アイコン、それ以外(OFF・監査モード・
+    接続不可・トークン不一致)は淡色=「守られていない/守られているか分からない」を同じ見た目に
+    まとめる。監査モードは検知しても遮断しない=試験で切り替えたまま戻し忘れたら気づけるように淡色。
     想定外の値は接続不可と同じ扱い(ON と誤表示しない)。ブランド名は DUCKNET_COVER に従い、
     長すぎる名前はブランド側を詰めて状態の文言を残す(szTip は 127 文字)。"""
     if state not in _STATUS_TEXT:
@@ -130,22 +135,49 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 
 def _parse_shield_enabled(body: bytes) -> str:
     """/api/metrics(plain-text の露出形式)から `ducknet_shield_enabled 1|0` を読む。
-    見つからない・値が 0/1 でない応答は「接続できない」扱い(本製品の応答ではない)。"""
+    見つからない・値が 0/1 でない応答は「接続できない」扱い(本製品の応答ではない)。
+    有効でも `ducknet_shield_audit_mode 1`(mode=audit)なら STATE_AUDIT。この行を出さない
+    旧い本体は従来どおり ON。無効(0)なら監査かどうかに関わらず OFF(検査そのものが止まっている)。"""
+    enabled = audit = None
     for line in body.decode("utf-8", "replace").splitlines():
         parts = line.split()
-        if len(parts) == 2 and parts[0] == "ducknet_shield_enabled":
-            return {"1": STATE_ON, "0": STATE_OFF}.get(parts[1], STATE_DOWN)
-    return STATE_DOWN
+        if len(parts) != 2:
+            continue
+        if parts[0] == "ducknet_shield_enabled" and enabled is None:
+            enabled = parts[1]
+        elif parts[0] == "ducknet_shield_audit_mode" and audit is None:
+            audit = parts[1]
+    if enabled == "1":
+        return STATE_AUDIT if audit == "1" else STATE_ON
+    return STATE_OFF if enabled == "0" else STATE_DOWN
+
+
+def _is_admin_401(e) -> bool:
+    """HTTPError が本製品の管理APIの 401(本文 {"ok": false, "error": "token required"})か。
+    自前の認証で 401 を返すプログラムは多いので、状態コードだけでは本製品と決められない。"""
+    if getattr(e, "code", None) != 401:
+        return False
+    try:
+        return _ADMIN_401_MARK in e.read(256)
+    except Exception:
+        return False
 
 
 def _fetch_shield_state(base_url: str, token: str, timeout: float = _FETCH_TIMEOUT) -> str:
     """管理APIからシールドの有効状態を 1 回読む。戻り値は STATE_*(例外は出さない)。
     使うのは GET /api/metrics: 認証付きで shield_enabled を返す中で最も軽い(/api/state は
     イベント・上位送信元・BAN 一覧まで組み立てる)。プロキシは通さない(_admin_is_ours と同じ
-    理由に加え、ここは X-Token を載せる=トークンがプロキシとそのログへ平文で渡る)。"""
+    理由に加え、ここは X-Token を載せる=トークンがプロキシとそのログへ平文で渡る)。
+    トークンを載せる前に、相手が本製品の管理APIかを *トークン無しで* 毎回確かめる(_ensure_gateway
+    と同じ _admin_is_ours)。以前は起動時のトークンを、いまポートで待ち受けている相手へ確かめずに
+    送っていた=本体が止まった後に同じポートを取った別のプロセスへ、設定済みのトークンが渡った。
+    「トークン不一致」は本製品の 401 の時だけ。自前の認証で 401 を返す別のプログラムがポートを
+    使っている時は「接続できない」(トークンを直せば済むかのように見せない)。"""
     try:
         from ..engine.core.netaddr import url as _url
         host, port = _admin_addr(base_url)
+        if token and not _admin_is_ours(host, port, timeout):
+            return STATE_DOWN                     # 本製品と確かめられない相手へトークンを送らない
         req = urllib.request.Request(_url(host, port, "/api/metrics"))
         if token:
             req.add_header("X-Token", token)
@@ -154,10 +186,12 @@ def _fetch_shield_state(base_url: str, token: str, timeout: float = _FETCH_TIMEO
             body = r.read(_METRICS_MAX)
     except urllib.error.HTTPError as e:
         try:
-            e.close()
-        except Exception:
-            pass
-        return STATE_AUTH if e.code == 401 else STATE_DOWN
+            return STATE_AUTH if _is_admin_401(e) else STATE_DOWN
+        finally:
+            try:
+                e.close()
+            except Exception:
+                pass
     except Exception:
         return STATE_DOWN                         # 接続拒否・タイムアウト・URL 不正など
     if not token:
@@ -252,22 +286,24 @@ def _admin_is_ours(host: str, port: int, timeout: float = 1.0) -> bool:
     url = _url(host, port, "/api/state")           # IPv6 リテラルは [] で囲う
     # 既定の opener は環境変数のプロキシ設定(http_proxy 等)を拾う。ローカルの指紋確認が
     # プロキシ経由になると別物の応答を見て「本製品ではない」と誤判定し、ゲートウェイを
-    # 起動できなくなる。ここは必ず直接続する。
-    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    # 起動できなくなる。ここは必ず直接続する。リダイレクトにも従わない: 従うと、別物が本物の
+    # 管理APIへ転送しただけで転送先の 401 を指紋と取り違え、その別物へトークンを送ってしまう
+    # (本製品の管理APIはここをリダイレクトしない=3xx は別物)。
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect())
     try:
         with opener.open(url, timeout=timeout) as _r:
             _r.read(1)
         return False                              # 200=無認証で応答する別物(本製品は 401)
     except urllib.error.HTTPError as e:
-        if e.code != 401:
-            return False
         try:
-            body = e.read(256)
-        except Exception:
-            return False
+            return _is_admin_401(e)
+        finally:
+            try:
+                e.close()
+            except Exception:
+                pass
     except Exception:
         return False
-    return b"token required" in body
 
 
 def _ensure_gateway(base_url: str, token: str):
@@ -417,7 +453,8 @@ def main(argv=None) -> int:
         return 1
 
     # 防御状態の表示: 管理APIを定期的に読み、変わった時だけアイコン/ツールチップを替える。
-    # トークンは本体の起動/確認に使ったもの(_ensure_gateway の戻り値)。表示の失敗で
+    # トークンは本体の起動/確認に使ったもの(_ensure_gateway の戻り値)。送る前に毎回、相手が
+    # 本製品の管理APIかを確かめる(_fetch_shield_state)。表示の失敗で
     # トレイや本体を巻き込まない(ポーラは例外を外へ出さない・デーモン・終了で止まる)。
     def _show(state):
         tip, name = _status_view(state, brand)

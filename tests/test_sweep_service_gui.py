@@ -82,7 +82,8 @@ def test_c21_run_ps1_has_utf8_bom():
     """BOM 無し UTF-8 の .ps1 を Windows PowerShell 5.1 は ANSI コードページ(日本語版は cp932)
     で読む。コメント末尾のバイト列が改行を飲み込み、波括弧が閉じずに起動前に ParserError に
     なっていた。非 ASCII を含むなら BOM 付き UTF-8 で保存する。"""
-    raw = open(os.path.join(ROOT, "run.ps1"), "rb").read()
+    with open(os.path.join(ROOT, "run.ps1"), "rb") as f:
+        raw = f.read()
     if any(b >= 0x80 for b in raw):
         assert raw.startswith(b"\xef\xbb\xbf"), "非 ASCII を含む run.ps1 に UTF-8 BOM が無い"
 
@@ -120,7 +121,7 @@ def test_c22_abbreviated_autostart_flags_are_stripped():
     with tempfile.TemporaryDirectory() as d, \
             _env(DUCKNET_ENV_FILE=os.path.join(d, "none.env")), \
             _patched(A, install=lambda args, **kw: (seen.append(list(args)), {"ok": True})[1]), \
-            contextlib.redirect_stdout(open(os.devnull, "w")):
+            open(os.devnull, "w") as devnull, contextlib.redirect_stdout(devnull):
         for argv in cases:
             seen.clear()
             assert S.main(list(argv)) == 0, argv
@@ -167,6 +168,9 @@ def test_c23_windows_autostart_command_runs_outside_checkout():
         r = subprocess.run(val, cwd=d, env=env, capture_output=True, timeout=60)
     assert r.returncode == 0 and b"usage" in r.stdout.lower(), (
         r.returncode, r.stderr[-300:])
+    # タスクスケジューラ側は開始位置(WorkingDirectory)を持てるので、前置きなしの同じコマンドを
+    # 配置先から起動する定義で登録する(/tr は 261 文字までで前置きを足すと超えていた)
+    import xml.etree.ElementTree as ET
     seen = {}
 
     class _R:
@@ -175,10 +179,16 @@ def test_c23_windows_autostart_command_runs_outside_checkout():
         stderr = ""
 
     def _run(args, **kw):
-        seen["tr"] = args[args.index("/tr") + 1]
+        with open(args[args.index("/xml") + 1], "rb") as f:
+            seen["xml"] = f.read()
         return _R()
     A.install_windows_task("DuckNetSweep", A.build_command(["--help"]), run=_run)
-    assert seen["tr"] == val
+    ns = {"t": "http://schemas.microsoft.com/windows/2004/02/mit/task"}
+    ex = ET.fromstring(seen["xml"]).find("t:Actions/t:Exec", ns)
+    exe, argl, wd = (ex.find("t:" + k, ns).text for k in ("Command", "Arguments", "WorkingDirectory"))
+    line = subprocess.list2cmdline([exe]) + " " + argl
+    r = subprocess.run(line, cwd=wd, env=env, capture_output=True, timeout=60)
+    assert r.returncode == 0 and b"usage" in r.stdout.lower(), (r.returncode, r.stderr[-300:])
 
 
 # ── #33 / #62 引数の引用が壊れていた(空文字・埋め込み " ・末尾 \ ・XML 未エスケープ) ──
@@ -403,13 +413,18 @@ def test_c66_run_bat_strips_quotes_like_load_env_file():
 def test_c66_run_sh_strips_quotes_like_load_env_file():
     """run.sh も同じく引用符付きの値を export していた。"""
     bash = shutil.which("bash")
-    if not bash or (WIN and "system32" in bash.lower()):   # WSL の bash では Windows の Python を呼べない
-        raise SkipTest("bash が無い環境")
+    # WSL の bash(system32 / WindowsApps の起動スタブ)では Windows の Python を呼べない。
+    # WindowsApps のスタブは呼び出し後も中継プロセスが残り、一時dirを掴んで後始末を失敗させていた。
+    if not bash or (WIN and any(s in bash.lower() for s in ("system32", "windowsapps"))):
+        raise SkipTest("bash が無い環境(WSL の bash は対象外)")
     py = sys.executable.replace("\\", "/") if WIN else sys.executable
-    with tempfile.TemporaryDirectory() as d:
+    d = tempfile.mkdtemp(prefix="sweep-run-sh-")
+    try:
         _launcher_dir(d, "run.sh")
         r = subprocess.run([bash, os.path.join(d, "run.sh").replace("\\", "/")], cwd=d,
                            env=_launcher_env(py), capture_output=True, timeout=60)
+    finally:
+        shutil.rmtree(d, True)          # 残ったプロセスが掴んでいても後始末でテストを落とさない
     got = _launcher_result(r)
     assert got == _ENV_WANT, got
 
@@ -472,7 +487,7 @@ def test_c94_tray_reads_admin_url_and_cover_after_app_env():
         with _env(DUCKNET_ENV_FILE=env_file, DUCKNET_ADMIN_URL=None, DUCKNET_COVER=None), \
                 _patched(G.tray, available=lambda: True, TrayIcon=_Tray), \
                 _patched(G, _ensure_gateway=_ensure), \
-                contextlib.redirect_stderr(open(os.devnull, "w")):
+                open(os.devnull, "w") as devnull, contextlib.redirect_stderr(devnull):
             G.main([])
     assert seen.get("url") == "http://127.0.0.1:18099", seen
     assert seen.get("brand") == "Disk Indexer", seen

@@ -273,12 +273,21 @@ def test_fetch_unreachable_port_is_unreachable():
 
 
 class _Canned(http.server.BaseHTTPRequestHandler):
-    """決まった応答を返す偽の管理 API(壊れた応答・リダイレクト・別物の待受を模す)。"""
-    status, body, location, seen = 200, b"", None, None
+    """決まった応答を返す偽の管理 API(壊れた応答・リダイレクト・別物の待受を模す)。
+    guard=True は本製品と同じく、トークン無しの要求へ 401 "token required" を返す(トレイは
+    トークンを送る前にこれで相手を確かめる=guard 無しの偽物にはトークン付きの要求が届かない)。"""
+    status, body, location, seen, guard = 200, b"", None, None, False
 
     def do_GET(self):
         if self.seen is not None:
             self.seen.append((self.path, self.headers.get("X-Token")))
+        if self.guard and not self.headers.get("X-Token"):
+            deny = b'{"ok": false, "error": "token required"}'
+            self.send_response(401)
+            self.send_header("Content-Length", str(len(deny)))
+            self.end_headers()
+            self.wfile.write(deny)
+            return
         self.send_response(self.status)
         if self.location:
             self.send_header("Location", self.location)
@@ -292,9 +301,9 @@ class _Canned(http.server.BaseHTTPRequestHandler):
 
 
 @contextlib.contextmanager
-def _canned(status=200, body=b"", location=None, seen=None):
+def _canned(status=200, body=b"", location=None, seen=None, guard=False):
     H = type("H", (_Canned,), {"status": status, "body": body, "location": location,
-                               "seen": seen})
+                               "seen": seen, "guard": guard})
     srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
     t = threading.Thread(target=srv.serve_forever, daemon=True)
     t.start()
@@ -311,19 +320,23 @@ def test_fetch_malformed_or_foreign_answers_are_unreachable():
     for body in (b"hello", b"", b"ducknet_shield_enabled 2\n", b"ducknet_shield_enabled\n",
                  b"ducknet_shield_enabled_total 1\n", b"\xff\xfe\x00garbage",
                  json.dumps({"enabled": True}).encode()):
-        with _canned(200, body) as url:
+        with _canned(200, body, guard=True) as url:
             assert G._fetch_shield_state(url, "tok", timeout=2.0) == "unreachable", body
     for code in (404, 421, 500, 503):
-        with _canned(code, b"{}") as url:
+        with _canned(code, b"{}", guard=True) as url:
             assert G._fetch_shield_state(url, "tok", timeout=2.0) == "unreachable", code
     # 本製品は無認証の要求に 200 を返さない。トークン無しで 200 が来たら別物の待受(ON と誤表示しない)
     with _canned(200, b"ducknet_shield_enabled 1\n") as url:
         assert G._fetch_shield_state(url, "", timeout=2.0) == "unreachable"
-    # 正しい形なら読める(偽サーバでも形式どおりなら ON/OFF を返す=パーサ自体の確認)
-    with _canned(200, b"# HELP x\nducknet_requests_total 3\nducknet_shield_enabled 1\n") as url:
+    # 正しい形なら読める(本製品と同じ 401 で相手確認に通る偽サーバなら、形式どおりの応答から
+    # ON/OFF を返す=パーサ自体の確認)。無認証にも 200 を返す偽物にはトークンを送らない(#26)。
+    on_body = b"# HELP x\nducknet_requests_total 3\nducknet_shield_enabled 1\n"
+    with _canned(200, on_body, guard=True) as url:
         assert G._fetch_shield_state(url, "tok", timeout=2.0) == "on"
-    with _canned(200, b"ducknet_shield_enabled 0\r\n") as url:
+    with _canned(200, b"ducknet_shield_enabled 0\r\n", guard=True) as url:
         assert G._fetch_shield_state(url, "tok", timeout=2.0) == "off"
+    with _canned(200, on_body) as url:
+        assert G._fetch_shield_state(url, "tok", timeout=2.0) == "unreachable"
 
 
 def test_fetch_does_not_follow_redirects_with_the_token():
@@ -331,7 +344,8 @@ def test_fetch_does_not_follow_redirects_with_the_token():
     G = _G()
     seen = []
     with _canned(200, b"ducknet_shield_enabled 1\n", seen=seen) as target:
-        with _canned(302, b"", location=target + "/steal") as url:
+        # guard=True: 相手確認には通し、トークン付きの要求の方をリダイレクトさせる
+        with _canned(302, b"", location=target + "/steal", guard=True) as url:
             assert G._fetch_shield_state(url, "secret-tok", timeout=2.0) == "unreachable"
     assert seen == [], seen
 
