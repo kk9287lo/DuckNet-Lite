@@ -36,8 +36,8 @@ def test_failed_rollback_leaves_auditable_bytes_and_later_append_fails_closed():
         original = path.read_bytes()
         opened = atomic_io._open_append_nofollow
 
-        def partial(target, encoding):
-            return _PersistPrefixThenFail(opened(target, encoding))
+        def partial(target, encoding, **budget):
+            return _PersistPrefixThenFail(opened(target, encoding, **budget))
 
         with patch.object(atomic_io, "_open_append_nofollow", side_effect=partial), \
                 patch.object(atomic_io.os, "ftruncate",

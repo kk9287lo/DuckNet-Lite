@@ -315,7 +315,7 @@ def test_unreachable_and_fake_listener_never_receives_token():
 # ── main() がポーラを配線する ──────────────────────────────────────────
 def test_main_polls_and_shows_state_until_quit():
     G = _G()
-    rec = {"status": [], "fetch": []}
+    rec = {"status": [], "fetch": [], "children": [], "signed": [], "transport": []}
     started = threading.Event()
 
     class _Tray:
@@ -334,7 +334,17 @@ def test_main_polls_and_shows_state_until_quit():
 
     def _fetch(url, tok, timeout=2.0, *, owned_child=None):
         rec["fetch"].append((url, tok))
+        rec["children"].append(owned_child)
         return "off"
+
+    def _signed(url, tok, timeout=2.0):
+        rec["signed"].append((url, tok, timeout))
+        return "off"
+
+    def _unexpected_transport(*args, **kwargs):
+        rec["transport"].append((args, kwargs))
+        raise AssertionError("fake tray lifecycle must not contact a live admin listener")
+
     out = {}
     class _Child:
         exited = False
@@ -349,25 +359,36 @@ def test_main_polls_and_shows_state_until_quit():
             self.exited = True
             return 0
 
+    child = _Child()
     with tempfile.TemporaryDirectory() as d:
         with open(os.path.join(d, "none.env"), "w", encoding="utf-8"):
             pass
         with _env(DUCKNET_ENV_FILE=os.path.join(d, "none.env"), DUCKNET_COVER="Disk Indexer",
                   DUCKNET_ADMIN_URL="http://127.0.0.1:18097", DUCKNET_ICON_DIR=None), \
                 _patched(G.tray, available=lambda: True, TrayIcon=_Tray), \
-                _patched(G, _ensure_gateway=lambda url, tok: ("tok-1", _Child()),
-                         _fetch_shield_state=_fetch, _POLL_SEC=0.01):
+                _patched(G, _ensure_gateway=lambda url, tok: ("tok-1", child),
+                         _fetch_shield_state=_fetch, _signed_admin_state=_signed,
+                         _read_admin_reply=_unexpected_transport, _POLL_SEC=0.01):
             th = threading.Thread(target=lambda: out.setdefault("rc", G.main([])), daemon=True)
             th.start()
             try:
                 assert started.wait(5), "poller never showed a state"
-                assert _wait(lambda: len(rec["fetch"]) >= 5, 5.0), rec["fetch"]
+                # Both state sources are fake: real connection timeouts must
+                # not become the scheduling clock for this lifecycle test.
+                assert _wait(lambda: len(rec["fetch"]) >= 5 and len(rec["signed"]) >= 5,
+                             5.0), rec
             finally:
                 if "cb" in rec:
                     rec["cb"]("quit")                # トレイの「終了」
                 th.join(10)
     assert not th.is_alive() and out.get("rc") == 0, out
-    assert rec["fetch"][0] == ("http://127.0.0.1:18097", "tok-1"), rec["fetch"]
+    assert all(call == ("http://127.0.0.1:18097", "tok-1") for call in rec["fetch"]), rec["fetch"]
+    assert all(owned is child for owned in rec["children"]), rec["children"]
+    assert len(rec["signed"]) <= len(rec["fetch"])
+    assert all((url, tok) == ("http://127.0.0.1:18097", "tok-1") and 0 < timeout <= G._FETCH_TIMEOUT
+               for url, tok, timeout in rec["signed"]), rec["signed"]
+    assert rec["transport"] == [], rec["transport"]
+    assert rec.get("stopped") and child.exited
     tip, icon = rec["status"][0]
     assert tip.startswith("Disk Indexer — ") and "防御 OFF" in tip, tip
     assert os.path.basename(icon) == "DuckNet-off.ico", icon

@@ -360,7 +360,14 @@ def test_csv_treats_formula_prefix_and_csv_controls_as_literal_text():
     # evaluates them. Check exact export bytes and both common CSV separators.
     raw = result["csv"].encode("utf-8")
     assert b'"\t=1+1"' in raw and b'"\t+1+1"' in raw
-    rows = list(csv.reader(io.StringIO(result["csv"], newline="")))
+    # Python 3.10's reader rejects NUL although the export preserves it as
+    # literal text. Substitute a non-delimiter only for parsing, then restore
+    # it so the exact raw bytes above and every decoded value below are checked.
+    placeholder = "\ufdd0"
+    assert placeholder not in result["csv"]
+    parseable = result["csv"].replace("\x00", placeholder)
+    rows = [[cell.replace(placeholder, "\x00") for cell in row]
+            for row in csv.reader(io.StringIO(parseable, newline=""))]
     assert rows[0] == ["value"] and all(len(row) == 1 for row in rows)
     values = [row[0] for row in rows[1:]]
     n = len(result["dangerous"])

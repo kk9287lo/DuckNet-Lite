@@ -22,11 +22,20 @@ def test_unrelated_backup_never_enters_runtime_image():
     if not shutil.which("docker"):
         raise SkipTest("Docker CLI unavailable")
     try:
-        available = _docker("info", "--format", "{{.ServerVersion}}", timeout=8)
+        available = _docker("info", "--format", "{{.OSType}}", timeout=8)
     except (OSError, subprocess.TimeoutExpired):
         raise SkipTest("Docker daemon unavailable")
     if available.returncode:
         raise SkipTest("Docker daemon unavailable")
+    daemon_os = available.stdout.strip().lower()
+    assert daemon_os, "Docker daemon did not report its image OS"
+    if daemon_os != "linux":
+        raise SkipTest("Linux image context requires a Linux Docker daemon; OSType=" + daemon_os)
+    # The Linux legacy builder also exercises .dockerignore and COPY, but
+    # --progress belongs to BuildKit and is absent from legacy CLI help.
+    build_help = _docker("build", "--help", timeout=8)
+    assert build_help.returncode == 0, build_help.stderr[-1200:]
+    progress = ("--progress=quiet",) if "--progress" in build_help.stdout else ()
 
     tag = "ducknet-r18-context:" + uuid.uuid4().hex[:12]
     with tempfile.TemporaryDirectory(prefix="ducknet-r18-context-") as tmp:
@@ -50,7 +59,7 @@ def test_unrelated_backup_never_enters_runtime_image():
                                       encoding="ascii")
                 probe_tag = tag + "-probe-" + str(index)
                 try:
-                    probe = _docker("build", "--pull=false", "--progress=quiet",
+                    probe = _docker("build", "--pull=false", *progress,
                                     "-f", str(probe_file), "-t", probe_tag,
                                     str(context), timeout=30)
                     assert probe.returncode != 0, (
@@ -67,7 +76,7 @@ def test_unrelated_backup_never_enters_runtime_image():
             copy_file = context / "Dockerfile.copy-probe"
             copy_file.write_text("FROM scratch\n" + "\n".join(copy_lines) + "\n",
                                  encoding="ascii")
-            built = _docker("build", "--pull=false", "--progress=quiet", "-f",
+            built = _docker("build", "--pull=false", *progress, "-f",
                             str(copy_file), "-t", tag, str(context), timeout=60)
             assert built.returncode == 0, built.stderr[-1200:]
             created = _docker("create", "--pull=never", tag, "/unused", timeout=15)

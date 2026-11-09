@@ -616,14 +616,31 @@ def _jwt_alg(token: str):
         return None
 
 
+def _bearer_token(auth: str) -> str:
+    """Read the SP/HTAB separator also used by HTTP authentication parsers.
+
+    Keep Unicode whitespace out of this grammar. The proxy separately rejects
+    multiple credentials so a backend cannot choose a different token.
+    """
+    if not isinstance(auth, str):
+        return ""
+    value = auth.strip(" \t")
+    if value[:6].lower() != "bearer" or value[6:7] not in (" ", "\t"):
+        return ""
+    token = value[7:].strip(" \t")
+    if "," in token or any(ord(character) < 33 or ord(character) == 127 for character in token):
+        return ""
+    return token
+
+
 def _jwt_violation(auth: str, allowed_algs) -> str:
     """Authorization 値から JWT 違反を判定(#68)。返り値: 違反理由 or ""(問題なし/JWTでない)。
       · alg:none … 無署名トークン=認証バイパスの試み(最重大)。
       · allowed_algs 指定時にそれ以外の alg … alg 混同攻撃の疑い。"""
-    a = (auth or "").strip()
-    if a[:7].lower() != "bearer ":
+    token = _bearer_token(auth)
+    if not token:
         return ""
-    alg = _jwt_alg(a[7:].strip())
+    alg = _jwt_alg(token)
     if alg is None:
         return ""                                 # JWT でない=対象外
     al = alg.strip().lower()
@@ -708,14 +725,25 @@ def _mp_params(value: str, escapes: bool = True) -> list:
     return out
 
 
+def _filename_codec(label: str) -> str:
+    """Resolve only bounded known text codecs; unknown labels must not fill Python's cache."""
+    import encodings
+    if not isinstance(label, str) or not label or len(label) > 64 or not label.isascii():
+        raise ValueError("unscannable filename charset")
+    name = saferegex._codec_name(encodings.normalize_encoding(label).lower())
+    if not name or name == "cp1047":
+        raise ValueError("unscannable filename charset")
+    return name
+
+
 def _rfc5987(v: str, charset: bool = True) -> str:
-    """RFC 5987/8187 の ext-value(charset'lang'%XX…)を復号する(#11)。拡張子判定には ASCII が
-    残れば足りるので常に UTF-8(不正は置換)で読む。charset=False は継続の 2 個目以降(%XX のみ)。"""
+    """Decode the declared filename charset rather than inventing a UTF-8 reading."""
     from urllib.parse import unquote_to_bytes
     v = v.strip().strip('"')
+    label = "utf-8"
     if charset and v.count("'") >= 2:
-        v = v.split("'", 2)[2]
-    return unquote_to_bytes(v).decode("utf-8", "replace")
+        label, _language, v = v.split("'", 2)
+    return unquote_to_bytes(v).decode(_filename_codec(label), "strict")
 
 
 def _cd_filenames(value: str) -> list:
@@ -732,13 +760,27 @@ def _cd_filenames(value: str) -> list:
             elif esc:
                 m = _CD_CONT_RE.fullmatch(k)
                 if m:
-                    cont[int(m.group(1))] = (v, bool(m.group(2)))
+                    index = int(m.group(1))
+                    if index >= 64 or index in cont:
+                        raise ValueError("ambiguous filename continuation")
+                    cont[index] = (v, bool(m.group(2)))
     if cont:                                      # 継続は番号順に連結(*N* は %XX 復号・先頭だけ charset 付き)
-        parts = []
+        if set(cont) != set(range(len(cont))):
+            raise ValueError("incomplete filename continuation")
+        parts, label = [], "utf-8"
+        encoded = any(flag for _value, flag in cont.values())
+        from urllib.parse import unquote_to_bytes
         for idx in sorted(cont):
             v, enc = cont[idx]
-            parts.append(_rfc5987(v, idx == 0) if enc else v)
-        names.append("".join(parts))
+            if idx == 0 and enc and v.count("'") >= 2:
+                label, _language, v = v.split("'", 2)
+            if encoded:
+                parts.append(unquote_to_bytes(v) if enc else v.encode("latin1", "strict"))
+            else:
+                parts.append(v)
+        # A code unit or UTF-8 sequence can cross segment boundaries.
+        names.append(b"".join(parts).decode(_filename_codec(label), "strict")
+                     if encoded else "".join(parts))
     for m in _CD_FILENAME_RE.finditer(value):
         v = m.group(2) if m.group(2) is not None else (m.group(3) or "")
         names.append(_rfc5987(v) if m.group(1) else v)
@@ -748,29 +790,68 @@ def _cd_filenames(value: str) -> list:
 def _upload_bad_ext(fn: str, deny) -> str:
     """ファイル名が拒否拡張子なら該当拡張子、でなければ ""。最終拡張子は deny 全体、中間セグメントは
     _UPLOAD_MULTI_EXT に入るものだけ(二重拡張子 shell.php.jpg・#9)。パス(/ と \\)は basename に、
-    Windows が捨てる末尾の '.'/空白は落とし、NUL で切った形(C 文字列として保存する実装)と
-    切らない形の両方を見る。"""
+    Windows の stream 指定前の名前と raw 値の両方を検査する。末尾の '.'/空白は落とし、
+    NUL で切った形(C 文字列として保存する実装)と切らない形の両方を見る。"""
     base = fn.replace("\\", "/").rsplit("/", 1)[-1]
-    if "user.ini" in deny and base.rstrip(" .").lower() == ".user.ini":
-        return "user.ini"
-    for cand in (base.split("\x00", 1)[0], base):
-        segs = cand.rstrip(" .").lower().split(".")
-        if len(segs) < 2:
-            continue
-        last = segs[-1].strip()
-        if last in deny:
-            return last
-        for s in segs[1:-1]:
-            s = s.strip()
-            if s in deny and s in _UPLOAD_MULTI_EXT:
-                return s
+    for view in (base, base.split(":", 1)[0]):
+        for cand in (view.split("\x00", 1)[0], view):
+            if "user.ini" in deny and cand.rstrip(" .").lower() == ".user.ini":
+                return "user.ini"
+            segs = cand.rstrip(" .").lower().split(".")
+            if len(segs) < 2:
+                continue
+            last = segs[-1].strip()
+            if last in deny:
+                return last
+            for s in segs[1:-1]:
+                s = s.strip()
+                if s in deny and s in _UPLOAD_MULTI_EXT:
+                    return s
     return ""
+
+
+def _upload_filename_hit(disposition: str, deny, *, complete=True):
+    """Check raw and legacy MIME filename readings without changing the wire."""
+    if saferegex.mime_parameters_uninspectable(disposition, max_len=_UPLOAD_HDR_MAX):
+        return ("unscannable filename metadata", "") if complete else None
+    try:
+        filenames = _cd_filenames(disposition)
+    except (LookupError, UnicodeError, ValueError, TypeError):
+        return "unscannable filename encoding", ""
+    for filename in dict.fromkeys(filenames):
+        extension = _upload_bad_ext(filename, deny)
+        if extension:
+            return filename[:120], extension
+        if "=?" not in filename or "?=" not in filename:
+            continue
+        # Some MIME-based receivers accept RFC2047 words in filename even
+        # though ordinary form uploads do not need that representation.
+        # A raw suffix check must not inspect a different saved filename.
+        from email.header import decode_header
+        from email.errors import HeaderParseError
+        try:
+            pieces = decode_header(filename)
+            if not any(isinstance(part, bytes) and charset for part, charset in pieces):
+                return "unscannable filename encoding", ""
+            decoded = "".join(part.decode(_filename_codec(charset or "ascii"), "strict")
+                              if isinstance(part, bytes) else part
+                              for part, charset in pieces)
+            if (len(decoded) > _UPLOAD_HDR_MAX or any(ord(ch) < 32 or ord(ch) == 127 for ch in decoded)
+                    or ("=?" in decoded and "?=" in decoded)):
+                return "unscannable filename encoding", ""
+        except (LookupError, UnicodeError, ValueError, TypeError, HeaderParseError):
+            return "unscannable filename encoding", ""
+        extension = _upload_bad_ext(decoded, deny)
+        if extension:
+            return decoded[:120], extension
+    return None
 
 
 def _part_header_hit(block: bytes, deny):
     """パートヘッダ塊(LF 区切りの行)の Content-Disposition から危険なファイル名を探す。
     折り返し行・ヘッダ名で始まらない行は前の行の続きとして読む(裸 LF を改行と見ない実装の見え方)。
     続き行は断片の並びに貯めて最後に 1 回だけ連結する(+ で伸ばすと続き行の数の 2 乗・#4)。"""
+    complete = getattr(block, "complete", True)
     lines = []
     for ln in block.split(b"\n"):
         ln = ln.rstrip(b"\r")
@@ -788,11 +869,53 @@ def _part_header_hit(block: bytes, deny):
             return "nested multipart cannot be scanned", ""
         if name.strip().lower() != b"content-disposition":
             continue
-        for fn in _cd_filenames(val.decode("latin1", "replace")):
-            ext = _upload_bad_ext(fn, deny)
-            if ext:
-                return fn[:120], ext
+        hit = _upload_filename_hit(val.decode("latin1", "replace"), deny, complete=complete)
+        if hit:
+            return hit
     return None
+
+
+def _multipart_transfer_uninspectable(head: str) -> bool:
+    """Only identity part encodings share the bytes inspected and received."""
+    values = [value.strip().lower() for key, value in _multipart_header_fields(head)
+              if key == "content-transfer-encoding"]
+    return bool(values) and (len(values) != 1 or values[0] not in ("7bit", "8bit", "binary"))
+
+
+def _multipart_part_name(head: str):
+    """Return one field identity, or False when receivers can select another."""
+    dispositions = [value for key, value in _multipart_header_fields(head)
+                    if key == "content-disposition"]
+    if len(dispositions) > 1:
+        return False
+    if not dispositions:
+        return ""
+    if saferegex.mime_parameters_uninspectable(dispositions[0], max_len=_UPLOAD_HDR_MAX):
+        return False
+    names = []
+    for escapes in (True, False):
+        params = _mp_params(dispositions[0], escapes)
+        if any(key == "name*" or re.fullmatch(r"name\*\d+\*?", key)
+               for key, _value in params):
+            return False
+        values = [value for key, value in params if key == "name"]
+        if len(values) > 1:
+            return False
+        if any(re.search(r"=\?[^?\s]+\?[bqBQ]\?[^?]*\?=", value) for value in values):
+            return False                           # MIME decoders can expose a different field
+        names.append(values[0] if values else "")
+    if names[0] != names[1]:
+        return False
+    if names[0] == "operations" and _multipart_transfer_uninspectable(head):
+        return False                              # MIME receivers may decode a different operation
+    return names[0]
+
+
+class _MultipartHeaderBlock(bytes):
+    def __new__(cls, value, *, complete):
+        result = super().__new__(cls, value)
+        result.complete = complete
+        return result
 
 
 class _MultipartHeads:
@@ -803,9 +926,10 @@ class _MultipartHeads:
     検査量は 1 パートのヘッダ塊の長さに線形(#4): 塊全体は終わりで 1 回だけ返し、行が揃った時点の
     早期検査はその行を含む論理行だけを返す。旧実装は行が揃うたびに塊全体を返して読み直させ(行数の
     2 乗)、害の無い行を 1500 回繰り返した小さな要求 1 本でイベントループが数秒止まった。"""
-    __slots__ = ("_pat", "_buf", "_hdr", "_st", "_lines", "_lstart", "_early", "parts", "bad")
+    __slots__ = ("_pat", "_buf", "_hdr", "_st", "_lines", "_lstart", "_early", "parts", "bad",
+                 "_operations_limit", "_operations_count", "_terminal", "field_bad")
 
-    def __init__(self, boundary: bytes):
+    def __init__(self, boundary: bytes, operations_limit=None):
         self._pat = b"--" + bytes(boundary)
         self._buf = bytearray(b"\n")              # 本文先頭も行頭として扱う
         self._hdr = bytearray()
@@ -815,6 +939,10 @@ class _MultipartHeads:
         self._early = 0                           # この塊で早期検査に返した量(バイト)
         self.parts = 0
         self.bad = ""
+        self._operations_limit = operations_limit
+        self._operations_count = 0
+        self._terminal = False
+        self.field_bad = False
 
     def feed(self, data) -> list:
         """data を食わせ、検査すべきヘッダ塊(bytes)の列を返す(完結した塊と、Content-Disposition
@@ -842,6 +970,16 @@ class _MultipartHeads:
                     if len(buf) > _UPLOAD_HDR_MAX:
                         self.bad = "multipart の区切り行が過大"
                     break
+                tail = bytes(buf[:j]).rstrip(b"\r").strip(b" \t")
+                if tail == b"--":
+                    self._terminal = True
+                    del buf[:j]                # retain the line boundary for an epilogue
+                    self._st = 0
+                    continue
+                if tail:
+                    del buf[:j]                # a boundary prefix inside ordinary file data
+                    self._st = 0
+                    continue
                 del buf[:j + 1]
                 self.parts += 1
                 if self.parts > _UPLOAD_PARTS_MAX:
@@ -876,12 +1014,40 @@ class _MultipartHeads:
                         n = len(self._hdr) - self._lstart
                         if self._early + n <= 2 * len(self._hdr):
                             self._early += n
-                            out.append(bytes(self._hdr[self._lstart:]))
+                            out.append(_MultipartHeaderBlock(self._hdr[self._lstart:], complete=False))
                 else:
                     del buf[:j]                   # 空行の LF は残す(中身が空なら次の区切りの行頭)
-                    out.append(bytes(self._hdr))
+                    if self._operations_limit is not None:
+                        name = _multipart_part_name(self._hdr.decode("latin1"))
+                        if name is False:
+                            self.bad = "ambiguous multipart field identity"
+                            self.field_bad = True
+                            break
+                        if name == "operations":
+                            self._operations_count += 1
+                            if self._operations_count > self._operations_limit:
+                                self.bad = "uninspected or repeated operations field"
+                                self.field_bad = True
+                                break
+                    out.append(_MultipartHeaderBlock(self._hdr, complete=True))
                     self._st = 0
         return out
+
+    def finish(self):
+        if self.bad:
+            return
+        if self._st == 2:
+            self.bad = "incomplete multipart part header"
+            self.field_bad = self._operations_limit is not None
+            return
+        if self._operations_limit is None:
+            return
+        if self._st == 1 and bytes(self._buf).strip(b" \t\r\n") == b"--":
+            self._terminal = True                 # a closing boundary need not end in CRLF
+            self._st = 0
+        if self._st or not self._terminal:
+            self.bad = "incomplete multipart field metadata"
+            self.field_bad = True
 
 
 class _ChunkDecode:
@@ -937,13 +1103,17 @@ class _UploadScan:
     feed(生の本文バイト) は危険なパートを見つけたら (filename, ext) を返す(以後も同じ値)。
     壊れた/過大な multipart は (理由, "")=検査できないのでフェイルクローズ。chunked=True は
     転送符号化の枠を解いてから見る(枠でパートヘッダを分断する回避を封じる)。"""
-    __slots__ = ("_heads", "_deny", "_dechunk", "hit")
+    __slots__ = ("_heads", "_deny", "_dechunk", "hit", "metadata_bad")
 
-    def __init__(self, boundaries, deny, chunked: bool = False):
-        self._heads = [_MultipartHeads(b) for b in boundaries]
+    def __init__(self, boundaries, deny, chunked: bool = False, operations_limit=None):
+        if operations_limit is not None and (type(operations_limit) is not int
+                                              or operations_limit not in (0, 1)):
+            raise ValueError("operations_limit must be zero or one")
+        self._heads = [_MultipartHeads(b, operations_limit) for b in boundaries]
         self._deny = deny
         self._dechunk = _ChunkDecode() if chunked else None
         self.hit = None
+        self.metadata_bad = False
 
     def feed(self, data):
         if self.hit is not None or not data:
@@ -952,12 +1122,24 @@ class _UploadScan:
             data = self._dechunk.feed(bytes(data))
         for h in self._heads:
             for block in h.feed(data):
-                r = _part_header_hit(block, self._deny)
+                r = _part_header_hit(block, self._deny) if self._deny else None
                 if r:
                     self.hit = r
                     return r
             if h.bad:
+                self.metadata_bad = h.field_bad
                 self.hit = (h.bad, "")
+                return self.hit
+        return None
+
+    def finish(self):
+        if self.hit is not None:
+            return self.hit
+        for head in self._heads:
+            head.finish()
+            if head.bad:
+                self.metadata_bad = head.field_bad
+                self.hit = (head.bad, "")
                 return self.hit
         return None
 
@@ -991,14 +1173,23 @@ def _multipart_field(body: bytes, boundaries, field: str, *, want_type: bool = F
     res = None
     for bnd in boundaries:
         pat = b"--" + bytes(bnd)
+
+        def next_marker(start):
+            index = body.find(pat, start)
+            while index >= 0:
+                if index == 0 or body[index - 1] == 0x0A:
+                    end = body.find(b"\n", index + len(pat))
+                    tail = body[index + len(pat):end if end >= 0 else len(body)]
+                    if tail.rstrip(b"\r").strip(b" \t") in (b"", b"--"):
+                        return index
+                index = body.find(pat, index + 1)
+            return -1
+
         i = 0
         while True:
-            i = body.find(pat, i)
+            i = next_marker(i)
             if i < 0:
                 break
-            if i > 0 and body[i - 1] != 0x0A:
-                i += 1
-                continue
             if body[i + len(pat):i + len(pat) + 2] == b"--":
                 break                             # 終端区切り=以降にパートは無い
             j = body.find(b"\n", i)
@@ -1013,23 +1204,22 @@ def _multipart_field(body: bytes, boundaries, field: str, *, want_type: bool = F
                 if not body[pos:e].rstrip(b"\r"):
                     break
                 pos = e + 1
-            name = ""
             ptypes = []
             part_head = body[j + 1:pos].decode("latin1", "replace")
             for key, value in _multipart_header_fields(part_head):
-                if key == "content-disposition":
-                    name = dict(_mp_params(value)).get("name", name)
-                elif key == "content-type":
+                if key == "content-type":
                     ptypes.append(value)
+            # A receiver may take the first disposition/name parameter while
+            # dict(_mp_params(...)) silently kept the last. Do not let an
+            # operations field disappear from the GraphQL inspection view.
+            name = _multipart_part_name(part_head)
+            if name is False:
+                return False
             start = e + 1
             if name == field:
-                k = start - 1                     # 中身が空なら空行の LF の直後が区切り
-                while True:
-                    k = body.find(pat, k + 1)
-                    if k < 0:
-                        return False
-                    if body[k - 1] == 0x0A:
-                        break
+                k = next_marker(start)            # 中身が空なら空行の LF の直後が区切り
+                if k < 0:
+                    return False
                 end = k - 1
                 if end > start and body[end - 1] == 0x0D:
                     end -= 1
@@ -1109,10 +1299,9 @@ def _disposition_upload_filename(values, deny_exts):
     if not deny or not values:
         return None
     for v in ((values,) if isinstance(values, str) else values):
-        for fn in _cd_filenames(str(v)):
-            ext = _upload_bad_ext(fn, deny)
-            if ext:
-                return fn[:120], ext
+        hit = _upload_filename_hit(str(v), deny)
+        if hit:
+            return hit
     return None
 
 
@@ -2187,6 +2376,32 @@ _ALLOW_LIST_OF = {("ip_mode", "whitelist"): "ip_whitelist", ("geo_mode", "allow"
 _HEADER_STR_KEYS = frozenset({"origin_header", "open_redirect_safe_path"})
 _CTRL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f-\x9f  ]")
 _HDR_TOKEN_RE = re.compile(r"[!#$%&'*+\-.^_`|~0-9A-Za-z]+")
+_REQUEST_FIELD_NAME_MAX = 128  # matches the forwarding selector's accepted name
+_REQUEST_MUTATION_PROTECTED = frozenset({
+    "host", "content-length", "transfer-encoding", "content-encoding",
+    "content-type", "content-disposition", "connection", "proxy-connection",
+    "keep-alive", "upgrade", "te", "trailer", "expect",
+    "authorization", "proxy-authorization", "cookie", "user-agent", "range",
+    "origin", "referer", "x-api-key", "x-forwarded-for", "x-real-ip",
+    "forwarded", "x-forwarded-proto", "accept-encoding",
+})
+_ORIGIN_FIELD_PROTECTED = _REQUEST_MUTATION_PROTECTED | frozenset({
+    "x-forwarded-host", "x-forwarded-scheme", "x-forwarded-server",
+    "x-forwarded-port", "x-forwarded-prefix", "x-host",
+    "x-original-url", "x-rewrite-url", "x-override-url",
+    "x-http-method-override", "x-method-override", "x-http-method",
+})
+
+
+def _request_mutation_name_valid(name: str, *, origin=False) -> bool:
+    """A configurable mutation must not change an inspected field's meaning."""
+    if (not isinstance(name, str) or not 0 < len(name) <= _REQUEST_FIELD_NAME_MAX
+            or not name.isascii() or _HDR_TOKEN_RE.fullmatch(name) is None):
+        return False
+    alias = name.lower().replace("_", "-")  # same CGI aliases as serialization
+    return alias not in (_ORIGIN_FIELD_PROTECTED if origin else _REQUEST_MUTATION_PROTECTED)
+
+
 _SEC_EXTRA_FORBIDDEN = frozenset({
     "content-length", "transfer-encoding", "content-encoding", "content-type",
     "content-range", "connection", "trailer", "upgrade", "host", "set-cookie",
@@ -2839,6 +3054,7 @@ class NetShield:
                                     self._traffic_path: MISSING_FINGERPRINT,
                                     self._usage_path: MISSING_FINGERPRINT}
         self._cfg_state_untrusted = False
+        self._request_mutation_untrusted = False  # structural gate, also while OFF/audit
         self._active_fork_clusters = 0  # parent-local reservation for finite quota edits
         self._sig_state_untrusted = False
         self._custom: list = []         # [{name,category,pattern,weight,enabled,source}]
@@ -3040,6 +3256,25 @@ class NetShield:
                 self._event("system", "cfg_load_rejected",
                             {"keys": (["quota_enabled"] if bad_enabled else []) + invalid_quota,
                              "reason": "invalid active signed quota"})
+            # Replacing/removing an inspected Host, framing or identity field
+            # changes the ordinary request sent to the origin. Preserve the
+            # signed evidence and deny active unsafe legacy mutations rather
+            # than silently selecting another proof name or backend reading.
+            bad_request_mutation = []
+            for switch, key, default in (
+                    ("origin_cloaking_enabled", "origin_header", False),
+                    ("strip_cache_poison_headers", "cache_poison_headers", True)):
+                active = raw_cfg.get(switch, default)
+                if (key in raw_cfg and active is not False
+                        and (active is True or default)
+                        and not self._coerce_cfg(key, raw_cfg[key], strict=True)[0]):
+                    bad_request_mutation.append(key)
+            if bad_request_mutation:
+                status, migrate = "invalid", False
+                self._request_mutation_untrusted = True
+                self._event("system", "cfg_load_rejected",
+                            {"keys": bad_request_mutation,
+                             "reason": "invalid active signed request header mutation"})
         if status in ("tampered", "rolled_back", "invalid"):
             self._cfg_state_untrusted = True
         fingerprint = (payload_fingerprint(d) if status in ("ok", "unsigned") else
@@ -3805,7 +4040,7 @@ class NetShield:
                     return False, None
                 if k == "origin_header":      # 名前の前後の空白は落とし、token だけ受理
                     v = v.strip(" ")
-                    if not _HDR_TOKEN_RE.fullmatch(v):
+                    if not _request_mutation_name_valid(v, origin=True):
                         return False, None
                 if k == "open_redirect_safe_path":
                     # Location must stay on this origin even when the backend
@@ -3818,6 +4053,13 @@ class NetShield:
         if isinstance(dflt, list):          # path_limits 以外のリストは文字列の配列
             if not isinstance(v, list):
                 return False, None
+            if k == "cache_poison_headers":
+                # This is a replacement list: never retain only its safe
+                # elements, including while reading a dormant legacy value.
+                if (_scan_list_problem(v)
+                        or any(not _request_mutation_name_valid(name) for name in v)):
+                    return False, None
+                return True, list(v)
             if strict and k in _IP_CIDR_LIST_KEYS:
                 # IP/CIDR の外側 ASCII space は従来の照合で除去されていた。
                 # サイズと制御文字を先に調べ、正規化後も空・重複・総量を検証する。
@@ -5209,6 +5451,12 @@ class NetShield:
                 header_names=None, auth: str = "", cred="",
                 override_method: str = "", override_path: str = "",
                 range_header: str = "") -> dict:
+        if self._request_mutation_untrusted:
+            # An unsafe active legacy serializer is a structural mismatch,
+            # not an optional detection policy. Do not downgrade it in audit
+            # or while Shield is OFF. The verified evidence stays latched
+            # until a new instance loads a safe published configuration.
+            return {"action": "block", "reason": "request header configuration is untrusted", "score": 0}
         if not self.is_enabled():
             return {"action": "allow", "reason": "shield OFF(パススルー)", "score": 0}
         # ── ロック外: 入力検査(純粋・CPU重)。共有状態に触れないのでロックを取らない。
@@ -5690,6 +5938,15 @@ class NetShield:
                 raw_fields += extra_raw
             except Exception:
                 return scan_failed("multipart_charset")
+        # A form receiver percent-decodes each field before applying charset.
+        # Decoding the raw '%' representation as a whole misses that reading.
+        try:
+            for reading in saferegex.declared_form_readings((text, *alts), declared_type):
+                extra_scans, extra_raw = part_scans(reading)
+                scans += extra_scans
+                raw_fields += extra_raw
+        except Exception:
+            return scan_failed("form_charset")
         # Each part may have its own charset. Read raw part bytes so a non-UTF-8
         # form value (or JSON operations variable) cannot hide from signatures.
         if data.startswith(b"--") or content_type.lower().startswith("multipart/"):
@@ -5700,6 +5957,12 @@ class NetShield:
                 return scan_failed("multipart_part")
             for part_head, part_body in raw_parts:
                 part_head_text = part_head.decode("latin1", "replace")
+                if _multipart_transfer_uninspectable(part_head_text):
+                    if self.cfg.get("mode") != "audit":
+                        return scan_failed("multipart_part_encoding")
+                    self._event(ip, "audit", {"would": "block", "rule": "body_scan_error",
+                                              "stage": "multipart_part_encoding"})
+                    continue
                 part_types = [value for name, value in _multipart_header_fields(part_head_text)
                               if name == "content-type"]
                 if len(part_types) > 1:
@@ -5816,15 +6079,17 @@ class NetShield:
             return {"action": "allow"}
         return self.upload_violation(ip, *hit)
 
-    def upload_scanner(self, content_type: str, sample: bytes = b"", chunked: bool = False):
+    def upload_scanner(self, content_type: str, sample: bytes = b"", chunked: bool = False,
+                       *, operations_limit=None):
         """本文を転送しながら全パートのヘッダを検査する逐次スキャナ(_UploadScan)を返す(#33)。
         アップロード検査が無効/拒否リストが空/multipart でない(境界が取れない)なら None。
         feed(生の本文バイト) が (filename, ext) を返したら upload_violation へ渡す。"""
-        if not self.is_enabled() or not self.cfg.get("upload_scan_enabled"):
+        if not self.is_enabled():
             return None
-        deny = {str(e).lower().lstrip(".") for e in (self.cfg.get("upload_deny_ext") or [])}
-        bnds = _mp_boundaries(content_type, sample) if deny else []
-        return _UploadScan(bnds, deny, chunked) if bnds else None
+        deny = ({str(e).lower().lstrip(".") for e in (self.cfg.get("upload_deny_ext") or [])}
+                if self.cfg.get("upload_scan_enabled") else set())
+        bnds = _mp_boundaries(content_type, sample) if deny or operations_limit is not None else []
+        return _UploadScan(bnds, deny, chunked, operations_limit) if bnds else None
 
     def upload_violation(self, ip: str, fn: str, ext: str) -> dict:
         """危険なアップロード(ext="" は検査できない壊れた/過大な multipart)を加点し遮断する。"""
@@ -5872,8 +6137,12 @@ class NetShield:
                               form_persisted_uninspectable, check)
         body = bytes(body or b"")
         qs = (path or "").split("?", 1)[1].split("#", 1)[0] if "?" in (path or "") else ""
-        url_q = form_queries(qs) if qs else []
-        url_uninspectable = form_persisted_uninspectable(qs) if qs else False
+        url_error = ""
+        try:
+            url_q = form_queries(qs) if qs else []
+            url_uninspectable = form_persisted_uninspectable(qs) if qs else False
+        except saferegex.FormInspectionLimit as error:
+            url_q, url_uninspectable, url_error = [], False, str(error)
         # 本文の読み方ごとの (queries, err)。JSON の仕様どおりの判定(UTF-16/32 も)と、宣言された
         # charset の読み方の両方を照合する(バックエンドによって読み方が違う)。
         readings, too_big = [], False
@@ -5914,15 +6183,17 @@ class NetShield:
             res = {"allowed": False, "reason": err} if err else check(body_q, **lims)
             if not res["allowed"]:
                 break
+        if res["allowed"] and url_error:
+            res = {"allowed": False, "reason": url_error}
         if res["allowed"] and url_uninspectable:
             res = {"allowed": False, "reason": "persisted-query-uninspectable"}
         if res["allowed"] and url_q:
             res = check(url_q, **lims)
         if res["allowed"]:
             return {"action": "allow"}
-        if res["reason"] == "persisted-query-uninspectable":
-            # This is a valid APQ shape, but its cached document is unavailable
-            # to the edge. Reject without scoring or banning the client.
+        if res["reason"] in ("persisted-query-uninspectable", "form-fields-too-large", "form-readings-too-large"):
+            # The complete operation is unavailable or exceeds the bounded
+            # form parser's budget. Reject without scoring or banning.
             audit = self.cfg.get("mode") == "audit"
             self._event(ip, "audit" if audit else "graphql_unscannable",
                         {"would": "block", "rule": "graphql_unscannable",

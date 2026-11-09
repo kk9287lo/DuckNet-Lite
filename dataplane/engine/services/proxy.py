@@ -665,17 +665,13 @@ def _dlp_head_problem(head: bytes, *, bodyless=False) -> str:
     if _is_interim(status) or (content_lengths and int(content_lengths[0]) == 0):
         bodyless = True
     for value in (() if bodyless else content_types):
-        charsets = []
-        for param in value.split(b";")[1:]:
-            name, sep, raw = param.partition(b"=")
-            if name.strip().lower() == b"charset":
-                if not sep:
-                    return "charset"
-                charset = raw.strip().strip(b'"').lower()
-                if not charset:
-                    return "charset"
-                charsets.append(charset)
-        if len(charsets) > 1 or any(c not in _DLP_ASCII_CHARSETS for c in charsets):
+        metadata = value.decode("latin1")
+        if saferegex.mime_parameters_uninspectable(metadata, max_len=_RESPONSE_HEAD_MAX):
+            return "content-type"
+        charsets = saferegex._charset_parameters(metadata)
+        if (len(charsets) > 1 or any(name != "charset" or
+                charset.strip().lower().encode("latin1") not in _DLP_ASCII_CHARSETS
+                for name, charset in charsets)):
             return "charset"
     return ""
 
@@ -718,6 +714,9 @@ def _dlp_filename_head_values(head: bytes) -> tuple[bytes, bool]:
     for line in head.split(b"\r\n")[1:]:
         name, sep, value = line.partition(b":")
         if not sep or name.lower() != b"content-disposition":
+            continue
+        if saferegex.mime_parameters_uninspectable(value.decode("latin1"), max_len=_RESPONSE_HEAD_MAX):
+            bad = True
             continue
         if seen:
             bad = True
@@ -1629,7 +1628,6 @@ _PROTECTED_REQUEST_OPTIONS = frozenset((
 _HOST_REG_NAME = re.compile(rb"\A[A-Za-z0-9_.~-]+\Z")
 _BOUNDARY_PARAM = re.compile(rb"(?:\A|[; \t])boundary[ \t]*=", re.I)
 _BOUNDARY_EXT_PARAM = re.compile(rb"(?:\A|[; \t])boundary\*[^;= \t]*[ \t]*=", re.I)
-_CHARSET_PARAM = re.compile(rb"(?:\A|[; \t])charset[ \t]*=", re.I)
 
 
 def _valid_host_authority(raw: bytes) -> bool:
@@ -1677,6 +1675,7 @@ def _framing_ambiguous(buf: bytes, *, origin_header: bytes = b"",
       · 複数 Transfer-Encoding(TE.TE)・最終コーディングが chunked でない TE
       · 複数 Host / HTTP/1.1 で Host 欠落(RFC 7230 §5.4: 1.1 はちょうど1個=ルーティングの的)
       · 重複 User-Agent / Range(専用検査面と backend の採用値が割れる)
+      · Bearer の複数値(credential 識別と backend の採用値が割れる)
       · ヘッダ領域の NUL バイト(パーサにより打ち切り位置が割れる)
       · 不正なヘッダ名/行/値(片側だけを無視・別名解釈させる)
       · CGI/WSGI が '-' と '_' を同一視する保護ヘッダの別名
@@ -1753,6 +1752,14 @@ def _framing_ambiguous(buf: bytes, *, origin_header: bytes = b"",
             if kl in singleton_fields:
                 return True
             singleton_fields.add(kl)
+        if kl == b"authorization":
+            credentials = v.strip(b" \t").split()
+            if (credentials and credentials[0].lower() == b"bearer"
+                    and (len(credentials) > 2 or b"," in v)):
+                # First-token, last-token and whole-value origins disagree.
+                # Bearer credentials cannot contain SP/HTAB or commas: do not forward
+                # several readings under one credential-rate identity.
+                return True
         if kl == b"content-length":
             cls.append(v.strip())
         elif kl == b"transfer-encoding":
@@ -1786,7 +1793,7 @@ def _framing_ambiguous(buf: bytes, *, origin_header: bytes = b"",
         return True                              # 単一の content-coding token だけ受ける
     if len(cts) > 1:
         return True                              # multipart 境界の検査/上流解釈差を拒否
-    if cts and len(_CHARSET_PARAM.findall(cts[0])) > 1:
+    if cts and saferegex.ambiguous_charset(cts[0].decode("latin1")):
         return True                              # 先勝ち/後勝ち/中間採用の charset 差を拒否
     if cts and cts[0].lower().startswith(b"multipart/"):
         if (_BOUNDARY_EXT_PARAM.search(cts[0]) or
@@ -3895,7 +3902,13 @@ class AsyncEdgeGuard:
         protected_headers_at_head = ()
         try:
             from ..lifeform.pipeline import net_shield as _ns
-            _cfg_at_head = _ns().cfg
+            _shield_at_head = _ns()
+            if getattr(_shield_at_head, "_request_mutation_untrusted", False):
+                self.metrics["dropped"] += 1
+                self._defense_unavailable("request_header_config",
+                                          RuntimeError("unsafe signed request header mutation"))
+                return self._close(writer)
+            _cfg_at_head = _shield_at_head.cfg
             _tp = _cfg_at_head.get("trusted_proxies")
             if _cfg_at_head.get("strip_cache_poison_headers", True):
                 protected_headers_at_head = _cfg_at_head.get("cache_poison_headers") or ()
@@ -4126,7 +4139,8 @@ class AsyncEdgeGuard:
             # #70: クレデンシャル識別子は *載っている全部* を渡す(Bearer と X-API-Key の両方)。
             #   Bearer があると X-API-Key を数えていなかったため、毎回ランダムな Bearer を添えて
             #   盗んだ API キーで認証させると識別子が毎回変わり、キー単位の上限が発動しなかった。
-            _creds = ((_auth[7:].strip() if _auth[:7].lower() == "bearer " else ""),
+            from ..lifeform.pipeline import _bearer_token
+            _creds = (_bearer_token(_auth),
                       (_keys[0] if _keys else ""))
             _ovr = _ovrs[0] if _ovrs else ""             # #72: メソッド override
             # backend ごとに採る別名/重複行が違うので、全候補を入口policyへ渡す。
@@ -5098,6 +5112,9 @@ class AsyncEdgeGuard:
                 if not data:
                     result = "incomplete"
                     break
+            if complete and ctx.get("on_body_end") is not None and ctx["on_body_end"]():
+                complete = False
+                result = "blocked"
             if complete:
                 if loop.time() >= deadline:
                     self._on_slow_body(ip)
@@ -5236,26 +5253,35 @@ class AsyncEdgeGuard:
             pass
         return False
 
+    @staticmethod
+    def _multipart_metadata_action(us, sh, ip):
+        audit = sh.cfg.get("mode") == "audit"
+        sh._event(ip, "audit" if audit else "graphql_unscannable",
+                  {"would": "reject", "rule": "graphql_multipart_unscannable",
+                   "reason": us.hit[0]})
+        return "allow" if audit else "block"
+
     def _upload_stream_check(self, us, sh, ip):
         """staging 中のアップロード検査(#33)。未読部分の on_body コールバックを返す。
         危険なパートを見つけたら upload_violation(加点/BAN)し、遮断なら True=backend に渡さない。
         監査モード(遮断しない)は 1 回記録したら以後は見ない。検査中の例外は止める側(#111)。"""
         fired = []
 
-        def on_body(chunk):
+        def on_body(chunk, *, complete=False):
             if fired:
                 return False
             try:
-                hit = us.feed(chunk)
+                hit = us.finish() if complete else us.feed(chunk)
                 if not hit:
                     return False
                 fired.append(1)
-                act = sh.upload_violation(ip, *hit).get("action")
+                act = (self._multipart_metadata_action(us, sh, ip) if us.metadata_bad
+                       else sh.upload_violation(ip, *hit).get("action"))
             except Exception:
                 act = "block"
             if act != "block":
                 return False
-            self.metrics["dropped"] = self.metrics.get("dropped", 0) + 1
+            # The staging/admission owner counts this refused request once.
             return True
         return on_body
 
@@ -5280,7 +5306,7 @@ class AsyncEdgeGuard:
         読む前に 100 Continue を返して ctx["continued"]=True を入れる(#10。呼び出し側は backend へ
         Expect を外して渡す)。"""
         try:
-            from ..lifeform.pipeline import net_shield
+            from ..lifeform.pipeline import net_shield, _multipart_field, _mp_boundaries
             sh = net_shield()
             if not sh.is_enabled():
                 return b"", False               # OFF は本文検査を止める(構造検査は後段で継続)
@@ -5580,17 +5606,36 @@ class AsyncEdgeGuard:
                 # backend が採っても読めるように全部を渡す(どれかで読み直して走査する)。
                 kw["charsets"] = ", ".join(cts)
             blocked = sh.inspect_body(ip, pb[:cap], **kw).get("action") == "block"   # 無効なら allow
-            if not blocked and upload_on:              # #66: 危険なアップロード拡張子も拒否
-                us = None if encoded else sh.upload_scanner(mp_ct, pb, chunked_te)
+            metadata_on = bool(gql_lim and mp_ct)
+            if not blocked and (upload_on or metadata_on):
+                operations_limit = None
+                if metadata_on:
+                    inspected = _multipart_field(pb[:gql_lim + 1], _mp_boundaries(mp_ct),
+                                                 "operations", want_type=True)
+                    operations_limit = 0 if inspected is None or inspected is False else 1
+                us = (sh.upload_scanner(mp_ct, pb, False if encoded else chunked_te,
+                                        operations_limit=operations_limit)
+                      if metadata_on else sh.upload_scanner(mp_ct, pb, False if encoded else chunked_te))
                 if us is None:
+                    if metadata_on:
+                        return reject_unscannable(bytes(extra))
                     # 圧縮 multipart は全量が cap 以内で復号済みの場合に限る。
                     blocked = sh.scan_upload(ip, pb, mp_ct).get("action") == "block"
                 else:
-                    hit = us.feed(raw)                 # 生の本文(chunked は枠を解いて)のパートヘッダ
+                    hit = us.feed(pb if encoded else raw)
+                    if not hit and complete:
+                        hit = us.finish()
                     if hit:
-                        blocked = sh.upload_violation(ip, *hit).get("action") == "block"
+                        if us.metadata_bad:
+                            if self._multipart_metadata_action(us, sh, ip) == "block":
+                                return bytes(extra), "too_large"
+                            gql_lim = 0            # audit already recorded the opaque receiver view
+                        else:
+                            blocked = sh.upload_violation(ip, *hit).get("action") == "block"
                     elif not complete and ctx is not None:
-                        ctx["on_body"] = self._upload_stream_check(us, sh, ip)
+                        check_upload = self._upload_stream_check(us, sh, ip)
+                        ctx["on_body"] = check_upload
+                        ctx["on_body_end"] = lambda: check_upload(b"", complete=True)
             if not blocked and gql_lim:                # #67: GraphQL の深さ/複雑度/イントロスペクション
                 g = sh.inspect_graphql(ip, path, pb, mp_ct or _header_value(buf, b"content-type"),
                                        complete=complete).get("action")

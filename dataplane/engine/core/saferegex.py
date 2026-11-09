@@ -329,13 +329,92 @@ def safe_json_loads(text, *, max_len: int = 2_000_000, max_depth: int = 200, def
 # charset=… で本文を文字にする。ASCII と違う字に読む符号化(EBCDIC の IBM037/IBM500・UTF-16/32・UTF-7)や、
 # 2 バイト目に ASCII の値を含む符号化(Shift_JIS・GBK・Big5 等)では、検査が UTF-8/latin-1 で読んだ字面と
 # バックエンドが見る字面が食い違う。呼び出し側が宣言どおりの読み方も照合できるよう、その読み方を返す。
-_CHARSET_RE = re.compile(r'(?i)(?:^|[;\s])charset[ \t]*=[ \t]*(?:"([^"]*)"|([^;\s"]*))')
+_EXTENDED_CHARSET = re.compile(r"charset\*(?:[0-9]+\*?)?\Z")
+
+
+def mime_parameters_uninspectable(value: str, *, max_len: int = 16384) -> bool:
+    """Reject outside MIME comments without treating quoted data as syntax."""
+    if type(max_len) is not int or max_len < 1:
+        return True
+    if not isinstance(value, str) or len(value) > min(max_len, 65536):
+        return True
+    index, size, quoted = 0, len(value), False
+    while index < size:
+        char = value[index]
+        if quoted and char == "\\":
+            if index + 1 >= size:
+                return True
+            index += 2
+            continue
+        if char == '"':
+            quoted = not quoted
+        elif not quoted and char in "()":
+            return True
+        index += 1
+    return quoted
+
+
+def _charset_parameters(content_type: str) -> list:
+    """Read actual MIME parameter keys without searching inside quoted values."""
+    if "charset" not in content_type.lower():
+        return []
+    out = []
+    size = len(content_type)
+    index = 0
+    while index < size:
+        while index < size and content_type[index] in "; \t\r\n":
+            index += 1
+        start = index
+        while index < size and content_type[index] not in "=; \t\r\n":
+            index += 1
+        name = content_type[start:index].lower()
+        while index < size and content_type[index] in " \t\r\n":
+            index += 1
+        if index >= size or content_type[index] != "=":
+            if name == "charset" or _EXTENDED_CHARSET.fullmatch(name):
+                out.append((name, ""))
+            continue
+        index += 1
+        while index < size and content_type[index] in " \t\r\n":
+            index += 1
+        if index < size and content_type[index] == '"':
+            index += 1
+            parts = []
+            while index < size:
+                char = content_type[index]
+                if char == "\\" and index + 1 < size:
+                    parts.append(content_type[index + 1])
+                    index += 2
+                    continue
+                index += 1
+                if char == '"':
+                    break
+                parts.append(char)
+            value = "".join(parts)
+        else:
+            start = index
+            while index < size and content_type[index] not in "; \t\r\n":
+                index += 1
+            value = content_type[start:index]
+        if name == "charset" or _EXTENDED_CHARSET.fullmatch(name):
+            out.append((name, value))
+    return out
+
+
+def _declared_codec(value: str) -> str:
+    # A long label must not become a valid shorter one through truncation.
+    if len(value) > 64:
+        return ""
+    label = re.sub(r"[^0-9a-z]+", "_", value.lower()).strip("_")
+    return _codec_name(label) if label else ""
 
 
 def ambiguous_charset(content_type: str) -> bool:
     """A single Content-Type with repeated charset parameters has no stable reading."""
     ct = content_type or ""
-    return len(ct) > 16384 or sum(1 for _ in _CHARSET_RE.finditer(ct)) > 1
+    if mime_parameters_uninspectable(ct):
+        return True
+    return len(_charset_parameters(ct)) > 1
 # UTF-8/ASCII は呼び出し側が既に読んでいる(同じ字面)ので返さない。
 _DECL_SKIP = frozenset(("utf-8", "utf-8-sig", "ascii"))
 # 本文の符号化ではない Python 固有の codec と、入力長に対して線形でない codec(punycode)は使わない。
@@ -380,12 +459,10 @@ def _codec_name(label: str) -> str:
 def unsupported_charset(content_type: str) -> bool:
     """True if a declared charset cannot be decoded by the bounded body scanner."""
     ct = content_type or ""
-    if len(ct) > 16384:
+    if mime_parameters_uninspectable(ct):
         return True
-    for m in _CHARSET_RE.finditer(ct):
-        raw = (m.group(1) if m.group(1) is not None else m.group(2))[:64].lower()
-        label = re.sub(r"[^0-9a-z]+", "_", raw).strip("_")
-        if not label or not _codec_name(label):
+    for name, value in _charset_parameters(ct):
+        if name != "charset" or not _declared_codec(value):
             return True
     return False
 
@@ -394,19 +471,14 @@ def declared_charsets(content_type: str) -> list:
     """Content-Type の charset 引数を Python の codec 名で返す。UTF-8/ASCII・未知・使わない codec は除く。
     重複(1 本の中の重複も、重複ヘッダをカンマで連結したものも)は、最初と最後の 2 つ(実装によって
     最初を採るものと最後を採るものがある)。"""
-    ct = (content_type or "")[:16384]
-    if "charset" not in ct.lower():
+    ct = content_type or ""
+    if mime_parameters_uninspectable(ct):
         return []
-    found = []
-    for m in _CHARSET_RE.finditer(ct):
-        raw = (m.group(1) if m.group(1) is not None else m.group(2))[:64].lower()
-        label = re.sub(r"[^0-9a-z]+", "_", raw).strip("_")
-        name = _codec_name(label) if label else ""
-        if name and name not in _DECL_SKIP:
-            found.append(name)
-    if not found:
+    names = [_declared_codec(value) for name, value in _charset_parameters(ct) if name == "charset"]
+    names = [name for name in names if name and name not in _DECL_SKIP]
+    if not names:
         return []
-    return [found[0]] if found[0] == found[-1] else [found[0], found[-1]]
+    return [names[0]] if names[0] == names[-1] else [names[0], names[-1]]
 
 
 def declared_readings(data, content_type: str = "") -> list:
@@ -439,6 +511,66 @@ def declared_readings(data, content_type: str = "") -> list:
             t = t.lstrip("\N{ZERO WIDTH NO-BREAK SPACE}")
             if t not in out:
                 out.append(t)
+    return out
+
+
+MAX_FORM_FIELDS = 1024
+_MAX_FORM_READINGS = 8
+_MAX_FORM_READING_BYTES = 8 << 20
+
+
+class FormInspectionLimit(ValueError):
+    """The complete form cannot be inspected within its fixed budgets."""
+
+
+def check_form_field_budget(text: str) -> None:
+    # Match urllib's count before allocating pairs, including empty fields.
+    if text and text.count("&") >= MAX_FORM_FIELDS:
+        raise FormInspectionLimit("form-fields-too-large")
+
+
+def declared_form_readings(texts, content_type: str = "") -> list:
+    """Decode percent-escaped form fields using the declared bounded codecs.
+
+    The form separators belong to its wire representation. Re-encode each
+    decoded key/value separately so an escaped '&' or '=' cannot become a new
+    field in a scan-only UTF-8 reading. Caller byte limits, the item limit and
+    aggregate reading limits all apply; exceeding any is not partial success.
+    """
+    if (content_type or "").split(";", 1)[0].strip().lower() != "application/x-www-form-urlencoded":
+        return []
+    from urllib.parse import parse_qsl, urlencode
+    names = declared_charsets(content_type)
+    if any(name == "charset" and _declared_codec(value) == "utf-8-sig"
+           for name, value in _charset_parameters(content_type)):
+        names.append("utf-8-sig")
+    sources = (texts,) if isinstance(texts, str) else tuple(dict.fromkeys(texts))
+    if len(sources) > _MAX_FORM_READINGS:
+        raise FormInspectionLimit("form-readings-too-large")
+    out = []
+    total = sum(len(text.encode("utf-8", "replace")) for text in sources)
+    if total > _MAX_FORM_READING_BYTES:
+        raise FormInspectionLimit("form-readings-too-large")
+    for text in sources:
+        check_form_field_budget(text)
+        if "=" not in text:
+            continue                              # a whole-body codec alternate may not be a form
+        for name in names:
+            encodings = ((name, name + "-be", name + "-le") if name in ("utf-16", "utf-32")
+                         else ("cp037",) if name == "cp1047" else (name,))
+            for encoding in encodings:
+                fields = parse_qsl(text, keep_blank_values=True, encoding=encoding,
+                                   errors="replace", max_num_fields=MAX_FORM_FIELDS)
+                if name == "cp1047":
+                    fields = [(key.translate(_CP1047_FROM_037), value.translate(_CP1047_FROM_037))
+                              for key, value in fields]
+                reading = urlencode(fields, encoding="utf-8", errors="replace")
+                if reading in sources or reading in out:
+                    continue
+                total += len(reading)              # urlencode's result is ASCII: chars == bytes
+                if len(sources) + len(out) >= _MAX_FORM_READINGS or total > _MAX_FORM_READING_BYTES:
+                    raise FormInspectionLimit("form-readings-too-large")
+                out.append(reading)
     return out
 
 

@@ -19,6 +19,7 @@ from __future__ import annotations
 import errno
 import json
 import os
+import queue
 import stat
 import tempfile
 import threading
@@ -452,56 +453,58 @@ def append_jsonl(path: str, obj: Any, *, max_bytes: int = 5_000_000,
                 if cur + line_bytes > max_bytes:
                     # Check before rotating: a torn active row must not be
                     # hidden in a backup while this append reports success.
+                    fd = None
+                    rotation_locked = False
                     try:
                         if os.path.islink(path):
                             return False
-                        fd = os.open(path, os.O_RDONLY | _O_NOFOLLOW
-                                     | getattr(os, "O_BINARY", 0))
-                        try:
-                            if os.fstat(fd).st_size != cur or not _complete_jsonl_tail(fd):
+                        fd = _open_append_fd(path, os.O_RDWR | _O_NOFOLLOW
+                                             | getattr(os, "O_NONBLOCK", 0)
+                                             | getattr(os, "O_BINARY", 0),
+                                             wait=wait, deadline=deadline)
+                        if not _unique_regular_file(fd, path):
+                            return False
+                        rotation_locked = _lock_append_fd(fd, wait=wait, deadline=deadline)
+                        if not rotation_locked:
+                            return False
+                        if (os.fstat(fd).st_size != cur or not _complete_jsonl_tail(fd)
+                                or not _unique_regular_file(fd, path)
+                                or not _unique_regular_file(file_lock, path + ".append.lock")):
+                            return False
+                        # Windows denies rename while this file handle is
+                        # open. POSIX retains the inode lock through rotation.
+                        if os.name == "nt":
+                            _unlock_append_fd(fd)
+                            rotation_locked = False
+                            _close_append_fd(fd)
+                            fd = None
+                        key = os.path.abspath(path)
+                        now = time.monotonic()
+                        last = _ROTATE_BLOCKED.get(key)
+                        if last is None or now - last >= _ROTATE_RETRY_SEC:
+                            if _rotate(path, max(1, backups)):
+                                _ROTATE_BLOCKED.pop(key, None)
+                            else:
+                                _ROTATE_BLOCKED[key] = now
                                 return False
-                        finally:
-                            os.close(fd)
+                        else:
+                            # A held reader must not turn the retry interval
+                            # into unbounded log growth.
+                            return False
                     except OSError:
                         return False
-                    key = os.path.abspath(path)
-                    now = time.monotonic()
-                    last = _ROTATE_BLOCKED.get(key)
-                    if last is None or now - last >= _ROTATE_RETRY_SEC:
-                        if _rotate(path, max(1, backups)):
-                            _ROTATE_BLOCKED.pop(key, None)
-                        else:
-                            _ROTATE_BLOCKED[key] = now
-                            return False
-                    else:
-                        # A held reader must not turn the retry interval into
-                        # unbounded log growth.
-                        return False
-                opened = (_retry_sharing(_open_append_nofollow, path, encoding) if wait
-                          else _open_append_nofollow(path, encoding))
+                    finally:
+                        if fd is not None:
+                            if rotation_locked:
+                                _unlock_append_fd(fd)
+                            _close_append_fd(fd)
+                open_target = lambda: _open_append_nofollow(path, encoding,
+                                                            wait=wait, deadline=deadline)
+                opened = _retry_sharing(open_target) if wait else open_target()
                 with opened as f:
-                    # Capture the post-rotation size, not the old generation's
-                    # size. A short disk write must not leave a JSONL fragment
-                    # which a later successful append joins into a bad row.
-                    before = os.fstat(f.fileno()).st_size
-                    if before + line_bytes > max_bytes or not _complete_jsonl_tail(f.fileno()):
+                    if not _append_locked_target(f, path, file_lock, wire_line,
+                                                 max_bytes, wait=wait, deadline=deadline):
                         return False
-                    try:
-                        remaining = memoryview(wire_line)
-                        while remaining:
-                            written = f.write(remaining)
-                            if written is None or written <= 0:
-                                raise OSError("short JSONL append")
-                            remaining = remaining[written:]
-                    except BaseException:
-                        # Binary/unbuffered output cannot flush a hidden suffix
-                        # after this rollback. Shrinking is normally possible
-                        # even when the original write failed with ENOSPC.
-                        try:
-                            os.ftruncate(f.fileno(), before)
-                        except OSError:
-                            pass
-                        raise
             finally:
                 _release_append_file_lock(file_lock)
         finally:
@@ -529,6 +532,257 @@ class _AppendLock:
 # append_jsonl and any waiting caller retain the holder until after release.
 _APPEND_LOCKS = weakref.WeakValueDictionary()
 _APPEND_LOCKS_GUARD = threading.Lock()
+
+
+class _AppendFDGate:
+    """A short registry mutex whose release also retires deferred owners."""
+
+    def __init__(self):
+        self._lock = threading.RLock()
+
+    def acquire(self, blocking=True, timeout=-1):
+        if not blocking:
+            return self._lock.acquire(False)
+        return self._lock.acquire() if timeout == -1 else self._lock.acquire(timeout=timeout)
+
+    def release(self):
+        try:
+            _drain_append_closes()
+        finally:
+            self._lock.release()
+        # A put may land after the last get but before unlock. The requester
+        # also tries this gate after enqueueing. Either it or a later owner
+        # drains the queue; no background thread or unbounded close wait.
+        while not _APPEND_PENDING_CLOSE.empty():
+            if not self._lock.acquire(False):
+                break
+            try:
+                _drain_append_closes()
+            finally:
+                self._lock.release()
+
+    def __enter__(self):
+        self.acquire()
+        return self
+
+    def __exit__(self, *_exc):
+        self.release()
+
+
+class _AppendFD:
+    __slots__ = ("fd", "file", "wait", "deadline", "closed", "retired")
+
+    def __init__(self, wait, deadline):
+        self.fd = None
+        self.file = None
+        self.wait = wait
+        self.deadline = deadline
+        self.closed = False
+        self.retired = False
+
+
+_APPEND_FD_GUARD = _AppendFDGate()
+_APPEND_OPEN_FDS = {}  # fd -> generation/owner token, retained until actual close
+_APPEND_PENDING_CLOSE = queue.SimpleQueue()
+
+
+def _acquire_append_fd_gate(*, wait, deadline, cleanup=False):
+    if not wait:
+        return _APPEND_FD_GUARD.acquire(False)
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        return _APPEND_FD_GUARD.acquire(False) if cleanup else False
+    return _APPEND_FD_GUARD.acquire(timeout=remaining)
+
+
+def _close_append_owner(owner):
+    # All actual close/unregister operations own the registry gate. The
+    # generation token prevents a duplicate retirement from closing a reused fd.
+    if owner.closed or _APPEND_OPEN_FDS.get(owner.fd) is not owner:
+        return
+    owner.closed = True
+    try:
+        if owner.file is None:
+            os.close(owner.fd)
+        elif not owner.file.closed:
+            owner.file.close()
+    finally:
+        _APPEND_OPEN_FDS.pop(owner.fd, None)
+
+
+def _drain_append_closes():
+    while True:
+        try:
+            owner = _APPEND_PENDING_CLOSE.get_nowait()
+        except queue.Empty:
+            return
+        try:
+            _close_append_owner(owner)
+        except OSError:
+            pass
+
+
+def _retire_append_owner(owner):
+    if owner.closed:
+        return
+    if _acquire_append_fd_gate(wait=owner.wait, deadline=owner.deadline, cleanup=True):
+        try:
+            _close_append_owner(owner)
+        finally:
+            _APPEND_FD_GUARD.release()
+    else:
+        if not owner.retired:
+            owner.retired = True
+            try:
+                _APPEND_PENDING_CLOSE.put(owner)
+            except BaseException:
+                owner.retired = False
+                raise
+        # The previous holder may have released immediately before this put.
+        if _APPEND_FD_GUARD.acquire(False):
+            _APPEND_FD_GUARD.release()
+
+
+def _open_append_fd(path, flags, mode=0o600, *, wait=True, deadline=None):
+    # freeze_fork holds this short registry gate while the kernel duplicates
+    # descriptors. Never leave an open-but-unregistered inheritance window.
+    if deadline is None and wait:
+        deadline = time.monotonic() + _APPEND_FILE_WAIT_SEC
+    if not _acquire_append_fd_gate(wait=wait, deadline=deadline):
+        raise OSError(errno.EAGAIN, "append descriptor registry is busy")
+    try:
+        owner = _AppendFD(wait, deadline)
+        fd = None
+        try:
+            fd = os.open(path, flags, mode)
+            owner.fd = fd
+            _APPEND_OPEN_FDS[fd] = owner
+            return fd
+        except BaseException:
+            if fd is not None:
+                os.close(fd)
+            raise
+    finally:
+        _APPEND_FD_GUARD.release()
+
+
+def _close_append_fd(fd):
+    owner = _APPEND_OPEN_FDS.get(fd)
+    if owner is not None:
+        _retire_append_owner(owner)
+
+
+class _AppendFile:
+    """Keep FileIO close and registry removal indivisible relative to fork."""
+
+    def __init__(self, owner):
+        self._owner = owner
+        self._file = owner.file
+
+    def __getattr__(self, name):
+        return getattr(self._file, name)
+
+    def __enter__(self):
+        self._file.__enter__()
+        return self
+
+    def __exit__(self, *_exc):
+        self.close()
+
+    def close(self):
+        _retire_append_owner(self._owner)
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        return next(self._file)
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
+
+
+def _append_after_fork_child():
+    global _APPEND_FD_GUARD, _APPEND_OPEN_FDS, _APPEND_LOCKS, _APPEND_LOCKS_GUARD, _APPEND_PENDING_CLOSE
+    inherited = tuple(_APPEND_OPEN_FDS.values())
+    _APPEND_FD_GUARD = _AppendFDGate()
+    _APPEND_OPEN_FDS = {}
+    _APPEND_PENDING_CLOSE = queue.SimpleQueue()  # never read a copied queue lock
+    _APPEND_LOCKS = weakref.WeakValueDictionary()
+    _APPEND_LOCKS_GUARD = threading.Lock()
+    # Closing a fork copy leaves the parent's flock intact. LOCK_UN here
+    # would release the shared open-file description owned by the parent.
+    for owner in inherited:
+        try:
+            if owner.closed:
+                continue
+            owner.closed = True
+            if owner.file is None:
+                os.close(owner.fd)
+            elif not owner.file.closed:
+                owner.file.close()
+        except OSError:
+            pass
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_append_after_fork_child)
+
+
+def _unique_regular_file(fd: int, path: str) -> bool:
+    """A writable log/lock must name exactly one stable regular file."""
+    try:
+        opened, named = os.fstat(fd), os.lstat(path)
+        reparse = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+        return (stat.S_ISREG(opened.st_mode) and stat.S_ISREG(named.st_mode)
+                and not stat.S_ISLNK(named.st_mode)
+                and not (getattr(opened, "st_file_attributes", 0) & reparse)
+                and not (getattr(named, "st_file_attributes", 0) & reparse)
+                and opened.st_nlink == named.st_nlink == 1
+                and (opened.st_dev, opened.st_ino) == (named.st_dev, named.st_ino))
+    except OSError:
+        return False
+
+
+def _append_locked_target(f, path, file_lock, wire_line, max_bytes, *, wait, deadline):
+    """Pin the real log inode across capacity checking, writing and rollback.
+
+    A companion lock name can be unlinked on POSIX. Locking only that inode
+    lets a second process open a replacement and evade mutual exclusion.
+    Both processes must also lock the actual append target before inspecting
+    its size, so a pause after the final pathname check cannot exceed its cap.
+    """
+    fd = f.fileno()
+    if not _lock_append_fd(fd, wait=wait, deadline=deadline):
+        return False
+    try:
+        before = os.fstat(fd).st_size
+        if before + len(wire_line) > max_bytes or not _complete_jsonl_tail(fd):
+            return False
+        if (not _unique_regular_file(file_lock, path + ".append.lock")
+                or not _unique_regular_file(fd, path)):
+            return False
+        try:
+            remaining = memoryview(wire_line)
+            while remaining:
+                written = f.write(remaining)
+                if written is None or written <= 0:
+                    raise OSError("short JSONL append")
+                remaining = remaining[written:]
+        except BaseException:
+            # The inode lock also excludes another appender during rollback.
+            # Binary/unbuffered output cannot flush a hidden suffix afterward.
+            try:
+                os.ftruncate(fd, before)
+            except OSError:
+                pass
+            raise
+        return True
+    finally:
+        _unlock_append_fd(fd)
 
 
 def _append_lock(path: str, *, wait: bool = True, deadline=None):
@@ -566,18 +820,27 @@ def _append_file_lock(path: str, *, wait: bool, deadline):
                  | getattr(os, "O_CLOEXEC", 0)
                  | getattr(os, "O_NOINHERIT", 0)
                  | getattr(os, "O_BINARY", 0))
-        fd = os.open(lock_path, flags, 0o600)
-        if not stat.S_ISREG(os.fstat(fd).st_mode):
-            os.close(fd)
-            return None
+        fd = _open_append_fd(lock_path, flags, wait=wait, deadline=deadline)
+        if not _unique_regular_file(fd, lock_path):
+            raise OSError("append lock is not a unique regular file")
     except OSError:
         if fd is not None:
-            os.close(fd)
+            _close_append_fd(fd)
         return None
-    if wait and time.monotonic() >= deadline:
-        os.close(fd)
+    if not _lock_append_fd(fd, wait=wait, deadline=deadline):
+        _close_append_fd(fd)
         return None
+    if not _unique_regular_file(fd, lock_path):
+        _unlock_append_fd(fd)
+        _close_append_fd(fd)
+        return None
+    return fd
+
+
+def _lock_append_fd(fd: int, *, wait: bool, deadline) -> bool:
     while True:
+        if wait and time.monotonic() >= deadline:
+            return False
         try:
             if os.name == "nt":
                 import msvcrt
@@ -586,20 +849,21 @@ def _append_file_lock(path: str, *, wait: bool, deadline):
             else:
                 import fcntl
                 fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            return fd
+            if wait and time.monotonic() >= deadline:
+                _unlock_append_fd(fd)
+                return False
+            return True
         except OSError as exc:
             if (not wait or time.monotonic() >= deadline
                     or exc.errno not in (errno.EACCES, errno.EAGAIN,
                                          getattr(errno, "EWOULDBLOCK", errno.EAGAIN))):
-                os.close(fd)
-                return None
+                return False
             time.sleep(0.005)
         except (ImportError, AttributeError):
-            os.close(fd)
-            return None
+            return False
 
 
-def _release_append_file_lock(fd: int) -> None:
+def _unlock_append_fd(fd: int) -> None:
     try:
         if os.name == "nt":
             import msvcrt
@@ -610,11 +874,16 @@ def _release_append_file_lock(fd: int) -> None:
             fcntl.flock(fd, fcntl.LOCK_UN)
     except (OSError, ImportError, AttributeError):
         pass  # close releases the OS lock even if explicit unlock failed
+
+
+def _release_append_file_lock(fd: int) -> None:
+    try:
+        _unlock_append_fd(fd)
     finally:
-        os.close(fd)
+        _close_append_fd(fd)
 
 
-def _open_append_nofollow(path: str, encoding: str):
+def _open_append_nofollow(path: str, encoding: str, *, wait=True, deadline=None):
     """追記用に symlink を経由せず開く(#symlink-arbitrary-write)。
     共有ディレクトリに置かれる監査ログを攻撃者が任意ファイルへの symlink に差し替えると、
     素の open(path, "a") はそれを追従してしまい、ログ行の注入や対象ファイルの肥大を許す。
@@ -624,12 +893,34 @@ def _open_append_nofollow(path: str, encoding: str):
             os.unlink(path)
     except OSError:
         pass
-    fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_APPEND | _O_NOFOLLOW
-                 | getattr(os, "O_BINARY", 0), 0o600)
-    # The caller pre-encodes the complete JSONL row with backslashreplace and
-    # platform newlines. Unbuffered binary output permits exact short-write
-    # accounting and rollback before the file descriptor is closed.
-    return os.fdopen(fd, "a+b", buffering=0)
+    if deadline is None and wait:
+        deadline = time.monotonic() + _APPEND_FILE_WAIT_SEC
+    if not _acquire_append_fd_gate(wait=wait, deadline=deadline):
+        raise OSError(errno.EAGAIN, "append descriptor registry is busy")
+    try:
+        fd = _open_append_fd(path, os.O_RDWR | os.O_CREAT | os.O_APPEND | _O_NOFOLLOW
+                             | getattr(os, "O_NONBLOCK", 0)
+                             | getattr(os, "O_BINARY", 0), wait=wait, deadline=deadline)
+        # Binary/unbuffered output permits exact short-write rollback.
+        file = None
+        try:
+            if not _unique_regular_file(fd, path):
+                raise OSError("append target is not a unique regular file")
+            file = os.fdopen(fd, "a+b", buffering=0)
+            owner = _APPEND_OPEN_FDS[fd]
+            owner.file = file
+            return _AppendFile(owner)
+        except BaseException:
+            if file is not None:
+                try:
+                    file.close()
+                finally:
+                    _APPEND_OPEN_FDS.pop(fd, None)
+            else:
+                _close_append_fd(fd)
+            raise
+    finally:
+        _APPEND_FD_GUARD.release()
 
 
 _TAIL_AVG_LINE = 512   # 末尾読みの初期見積り(1行あたりバイト数)

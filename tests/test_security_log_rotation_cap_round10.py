@@ -70,8 +70,8 @@ class _ShortChunks(_PartialWriter):
 def _short_write(path, row, max_bytes):
     opened = atomic_io._open_append_nofollow
 
-    def partial(target, encoding):
-        return _PartialWriter(opened(target, encoding))
+    def partial(target, encoding, **budget):
+        return _PartialWriter(opened(target, encoding, **budget))
 
     with patch.object(atomic_io, "_open_append_nofollow", side_effect=partial):
         return append_jsonl(str(path), row, max_bytes=max_bytes)
@@ -320,8 +320,8 @@ def test_short_successful_writes_are_completed_before_reporting_success():
         path = Path(state) / "audit.jsonl"
         opened = atomic_io._open_append_nofollow
 
-        def chunks(target, encoding):
-            return _ShortChunks(opened(target, encoding))
+        def chunks(target, encoding, **budget):
+            return _ShortChunks(opened(target, encoding, **budget))
 
         with patch.object(atomic_io, "_open_append_nofollow", side_effect=chunks):
             assert append_jsonl(str(path), {"row": "A" * 40}, max_bytes=80) is True

@@ -385,6 +385,11 @@ def parse_readings(body, content_type: str = "", charsets: str = None) -> list:
     1 つでも上限を超える/読めない読み方があれば拒否する。charsets は charset を読む Content-Type の値
     (省略時は content_type。multipart の欄はパートの Content-Type を渡す)。"""
     texts = _readings(body, content_type if charsets is None else charsets)
+    from ..core import saferegex
+    try:
+        texts += saferegex.declared_form_readings(texts, content_type if charsets is None else charsets)
+    except saferegex.FormInspectionLimit as error:
+        return [([], str(error))]
     return [_parse_text(t, content_type) for t in texts]
 
 
@@ -395,9 +400,7 @@ def _parse_text(text: str, content_type: str = "") -> tuple:
         return [], ""
     ct = (content_type or "").split(";", 1)[0].strip().lower()
     if ct == "application/x-www-form-urlencoded":
-        if form_persisted_uninspectable(text):
-            return [], "persisted-query-uninspectable"
-        return form_queries(text), ""
+        return _parse_form(text)
     # 再帰爆弾([[[[…]]]] 等)は深さで *パース前* に弾く(json の深さ制限の甘さ=自己DoS回避)。
     # JSON の値で始まらない本文は JSON として読めないので、1 文字ずつの深さ検査を省く。
     from ..core import saferegex
@@ -410,20 +413,30 @@ def _parse_text(text: str, content_type: str = "") -> tuple:
     if _JSONISH.match(text):
         return [], "malformed"                     # JSON の封筒なのに読めない(切断/破損/深すぎ)
     if _FORMISH.match(text):                       # Content-Type 無しの query=… 等(生文書は name= で始まらない)
-        if form_persisted_uninspectable(text):
-            return [], "persisted-query-uninspectable"
-        return form_queries(text), ""
+        return _parse_form(text)
     head = text[:12].lower()                      # JSON でない=application/graphql 生クエリ判定
     if text[:1] == "{" or head.startswith(("query", "mutation", "subscription", "fragment")):
         return [text], ""
     return [], ""
 
 
+def _parse_form(text: str) -> tuple:
+    from ..core import saferegex
+    try:
+        if form_persisted_uninspectable(text):
+            return [], "persisted-query-uninspectable"
+        return form_queries(text), ""
+    except saferegex.FormInspectionLimit as error:
+        return [], str(error)
+
+
 def form_queries(qs: str) -> list:
     """クエリ文字列/urlencoded 本文の query 欄と大小文字別名をすべて読む。"""
     from urllib.parse import parse_qs
+    from ..core import saferegex
+    saferegex.check_form_field_budget(qs)
     try:
-        fields = parse_qs(qs, keep_blank_values=True)
+        fields = parse_qs(qs, keep_blank_values=True, max_num_fields=saferegex.MAX_FORM_FIELDS)
     except Exception:
         return []
     return [value for name, vals in fields.items() if name.lower() == "query"
@@ -434,8 +447,9 @@ def form_persisted_uninspectable(qs: str) -> bool:
     """Whether a URL/form operation may execute a cached, unseen document."""
     from urllib.parse import parse_qs
     from ..core import saferegex
+    saferegex.check_form_field_budget(qs)
     try:
-        fields = parse_qs(qs, keep_blank_values=True)
+        fields = parse_qs(qs, keep_blank_values=True, max_num_fields=saferegex.MAX_FORM_FIELDS)
     except Exception:
         return False
     persisted_hashes = []

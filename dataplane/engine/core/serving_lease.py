@@ -12,6 +12,7 @@ from __future__ import annotations
 import errno
 import math
 import os
+import queue
 import stat
 import threading
 import time
@@ -21,9 +22,61 @@ from .signed_state import _require_private_state_dir
 
 
 _NAME = ".ducknet-serving.lock"
-_REGISTRY_LOCK = threading.Lock()
+_REGISTRY_WAIT_SEC = 2.0
+
+
+class _LeaseRegistryGate:
+    """Serialize fd ownership and drain bounded nonwaiting close requests.
+
+    Only lease metadata and nonblocking OS lock operations run under this
+    gate. No policy, commit or append registry lock is acquired from here.
+    """
+
+    def __init__(self):
+        self._lock = threading.RLock()
+
+    def acquire(self, blocking=True, timeout=-1):
+        if not blocking:
+            return self._lock.acquire(False)
+        return self._lock.acquire() if timeout == -1 else self._lock.acquire(timeout=timeout)
+
+    def release(self):
+        try:
+            _drain_retirements()
+        finally:
+            self._lock.release()
+        while not _RETIREMENTS.empty():
+            if not self._lock.acquire(False):
+                break
+            try:
+                _drain_retirements()
+            finally:
+                self._lock.release()
+
+    def __enter__(self):
+        self.acquire()
+        return self
+
+    def __exit__(self, *_exc):
+        self.release()
+
+
+_REGISTRY_LOCK = _LeaseRegistryGate()
 _ACTIVE: dict[str, ServingLease] = {}
 _INSTANCES: weakref.WeakSet[ServingLease] = weakref.WeakSet()
+_RETIREMENTS = queue.SimpleQueue()
+
+
+def _drain_retirements():
+    while True:
+        try:
+            lease, generation, close = _RETIREMENTS.get_nowait()
+        except queue.Empty:
+            return
+        try:
+            lease._retire(generation, close)
+        except OSError:
+            pass
 
 
 def _is_reparse(info) -> bool:
@@ -59,9 +112,21 @@ class ServingLease:
         self._fd: int | None = None
         self._held = False
         self._pid = os.getpid()
-        self._fd = self._open()
-        with _REGISTRY_LOCK:
-            _INSTANCES.add(self)
+        self._generation = 0
+        self._release_generation = None
+        self._close_requested = False
+        if not _REGISTRY_LOCK.acquire(timeout=_REGISTRY_WAIT_SEC):
+            raise OSError("serving lease registry is busy")
+        try:
+            self._fd = self._open()
+            try:
+                _INSTANCES.add(self)
+            except BaseException:
+                fd, self._fd = self._fd, None
+                os.close(fd)
+                raise
+        finally:
+            _REGISTRY_LOCK.release()
 
     def _open(self) -> int:
         if os.path.lexists(self.path):
@@ -150,54 +215,85 @@ class ServingLease:
         if (type(timeout) not in (int, float) or not math.isfinite(timeout)
                 or timeout < 0 or timeout > 30):
             raise ValueError("serving lease timeout must be 0..30 seconds")
-        if self._pid != os.getpid() or self._fd is None:
-            raise OSError("serving lease cannot be reused after fork or close")
-        if self._held:
-            if not self.verify_path():
-                raise OSError("serving lease path changed")
-            return True
         deadline = time.monotonic() + timeout
         while True:
-            if not self.verify_path():
-                raise OSError("serving lease path changed")
-            with _REGISTRY_LOCK:
+            remaining = max(0.0, deadline - time.monotonic())
+            acquired = (_REGISTRY_LOCK.acquire(False) if timeout == 0 else
+                        _REGISTRY_LOCK.acquire(timeout=remaining))
+            if not acquired:
+                return False
+            try:
+                _drain_retirements()
+                if self._pid != os.getpid() or self._fd is None or self._close_requested:
+                    raise OSError("serving lease cannot be reused after fork or close")
+                if timeout and time.monotonic() >= deadline:
+                    return False
+                if not self.verify_path():
+                    raise OSError("serving lease path changed")
+                if self._held and self._release_generation != self._generation:
+                    return True
                 other = _ACTIVE.get(self.path)
                 if other is None:
                     _ACTIVE[self.path] = self
                     reserved = True
                 else:
-                    reserved = other is self
-            if reserved:
-                try:
-                    if self._try_os_lock():
-                        if not self.verify_path():
-                            self._unlock_os()
-                            raise OSError("serving lease path changed after acquisition")
-                        self._held = True
-                        return True
-                except BaseException:
-                    with _REGISTRY_LOCK:
-                        if _ACTIVE.get(self.path) is self:
+                    reserved = other is self and not self._held
+                if reserved:
+                    try:
+                        if self._try_os_lock():
+                            if not self.verify_path():
+                                self._unlock_os()
+                                raise OSError("serving lease path changed after acquisition")
+                            if self._close_requested or (timeout and time.monotonic() >= deadline):
+                                self._unlock_os()
+                                return False
+                            self._generation += 1
+                            self._held = True
+                            return True
+                    finally:
+                        if not self._held and _ACTIVE.get(self.path) is self:
                             _ACTIVE.pop(self.path, None)
-                    raise
-                with _REGISTRY_LOCK:
-                    if _ACTIVE.get(self.path) is self:
-                        _ACTIVE.pop(self.path, None)
+            finally:
+                _REGISTRY_LOCK.release()
             if time.monotonic() >= deadline:
                 return False
             time.sleep(min(0.01, max(0.0, deadline - time.monotonic())))
 
     @property
     def held(self) -> bool:
-        return self._held and self._pid == os.getpid() and self.verify_path()
+        return (self._held and not self._close_requested
+                and self._release_generation != self._generation
+                and self._pid == os.getpid() and self.verify_path())
 
     def release(self) -> None:
+        """Retire ownership without waiting for another metadata operation."""
         if self._pid != os.getpid():
             raise OSError("fork child cannot release the parent serving lease")
-        if not self._held:
+        if not self._held or self._release_generation == self._generation:
+            return
+        generation = self._generation
+        self._release_generation = generation
+        self._request_retirement(generation, False)
+
+    def _request_retirement(self, generation, close):
+        if _REGISTRY_LOCK.acquire(False):
+            try:
+                self._retire(generation, close)
+            finally:
+                _REGISTRY_LOCK.release()
+        else:
+            _RETIREMENTS.put((self, generation, close))
+            if _REGISTRY_LOCK.acquire(False):
+                _REGISTRY_LOCK.release()
+
+    def _retire(self, generation, close):
+        if not close and generation != self._generation:
+            if self._release_generation == generation:
+                self._release_generation = None
             return
         try:
-            self._unlock_os()
+            if self._held:
+                self._unlock_os()
         except BaseException:
             # Closing also drops the OS lock if an explicit unlock failed.
             fd, self._fd = self._fd, None
@@ -206,11 +302,19 @@ class ServingLease:
             raise
         finally:
             self._held = False
-            with _REGISTRY_LOCK:
-                if _ACTIVE.get(self.path) is self:
-                    _ACTIVE.pop(self.path, None)
+            self._release_generation = None
+            if _ACTIVE.get(self.path) is self:
+                _ACTIVE.pop(self.path, None)
+            if close:
+                try:
+                    fd, self._fd = self._fd, None
+                    if fd is not None:
+                        os.close(fd)
+                finally:
+                    _INSTANCES.discard(self)
 
     def close(self) -> None:
+        """Request final close; a busy registry drains it before releasing."""
         if self._pid != os.getpid():
             # Normally handled by the at-fork callback. Never unlock here:
             # POSIX fork copies share one flock file description with parent.
@@ -219,14 +323,10 @@ class ServingLease:
                 os.close(fd)
             self._held = False
             return
-        try:
-            self.release()
-        finally:
-            fd, self._fd = self._fd, None
-            if fd is not None:
-                os.close(fd)
-            with _REGISTRY_LOCK:
-                _INSTANCES.discard(self)
+        if self._fd is None or self._close_requested:
+            return
+        self._close_requested = True
+        self._request_retirement(self._generation, True)
 
     def __enter__(self) -> ServingLease:
         if not self.acquire():
@@ -239,7 +339,7 @@ class ServingLease:
 
 
 def _after_fork_child() -> None:
-    global _REGISTRY_LOCK, _ACTIVE, _INSTANCES
+    global _REGISTRY_LOCK, _ACTIVE, _INSTANCES, _RETIREMENTS
     # Never unlock a copied flock: that releases the parent's lease too.
     for lease in tuple(_INSTANCES):
         fd, lease._fd = lease._fd, None
@@ -249,9 +349,10 @@ def _after_fork_child() -> None:
             except OSError:
                 pass
         lease._held = False
-    _REGISTRY_LOCK = threading.Lock()
+    _REGISTRY_LOCK = _LeaseRegistryGate()
     _ACTIVE = {}
     _INSTANCES = weakref.WeakSet()
+    _RETIREMENTS = queue.SimpleQueue()
 
 
 if hasattr(os, "register_at_fork"):

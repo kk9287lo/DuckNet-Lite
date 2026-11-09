@@ -70,6 +70,16 @@ sys.path.insert(0, _HERE)   # test_*.py を import 可能に
 os.environ["DUCKNET_OFFLINE"] = "1"
 
 MODULES = [
+    "test_security_request_round27", # configured request mutations preserve framing and identity
+    "test_security_response_round27", # MIME response metadata uses the recipient's interpretation
+    "test_security_inspection_round27", # unsupported per-part transfer encodings cannot hide body fields
+    "test_security_form_charset_round27", # form percent decoding, charset order and whole-form budgets
+    "test_security_state_round27", # serving lease descriptor registry and fork/retirement deadlines
+    "test_security_request_round26", # one Bearer credential interpretation at inspection and forwarding
+    "test_security_filename_round26", # MIME filename charsets agree with the actual saved name
+    "test_security_multipart_names_round26", # all GraphQL multipart metadata is checked through EOF
+    "test_security_charset_params_round26", # unsupported extended charset parameters cannot hide a decoded view
+    "test_security_state_round26", # append inode locks, file identity and fork descriptor ownership
     "test_gui_auth_modal", # masked unlock, retry and instance-bound signed HTTP
     "test_gui_auth_transport", # bounded responses, cancellation and session ownership
     "test_gui_operations", # ACL/policy/events and cluster-aware mutations

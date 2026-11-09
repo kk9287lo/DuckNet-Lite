@@ -169,13 +169,17 @@ def release_cluster(lock) -> bool:
 def freeze_fork(shield, firewall):
     """Wait until signed mutations finish, then hold their locks for fork.
 
-    Object locks precede the registry lock, matching setter lock order. The
-    caller must call thaw_parent or thaw_child immediately after os.fork.
+    Object locks precede the commit, append-FD and serving-lease registries.
+    No descriptor open/close takes an object lock in the reverse order.
+    This also prevents an open-but-unregistered descriptor crossing fork.
+    The caller must call thaw_parent or thaw_child immediately after os.fork.
     """
     deadline = time.monotonic() + WAIT_SEC
     held = []
+    from .atomic_io import _APPEND_FD_GUARD
+    from .serving_lease import _REGISTRY_LOCK as lease_registry
     try:
-        for lock in (shield._lock, firewall._lock, _REGISTRY):
+        for lock in (shield._lock, firewall._lock, _REGISTRY, _APPEND_FD_GUARD, lease_registry):
             remaining = deadline - time.monotonic()
             if remaining <= 0 or not lock.acquire(timeout=remaining):
                 raise TimeoutError("cluster policy locks unavailable for fork")
