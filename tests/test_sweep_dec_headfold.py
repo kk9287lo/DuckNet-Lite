@@ -105,7 +105,7 @@ def test_fullwidth_letters_and_angle_brackets_still_fold_in_head():
     """畳み込みによる検知は落とさない: 全角の ＜＞ と全角英字は、クエリ・ヘッダ値として生でも %XX でも
     \\u エスケープでも検知され、inspect() で加点される。"""
     with tempfile.TemporaryDirectory() as d:
-        sh = _shield(d, block_score=10000)
+        sh = _shield(d, block_score=1000)
         for n, (s, sig) in enumerate(_FW_EVASION):
             for v in (s,) + _escaped_forms(s) + _query_forms(s) + _header_forms(s)[1:]:
                 assert sh._scan_field(v)[0] == sig, (s, v)

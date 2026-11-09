@@ -13,10 +13,10 @@ import time
 
 from dataplane.engine.core.atomic_io import append_jsonl, tail_jsonl
 from dataplane.engine.lifeform.pipeline import (
-    _SUBNET_IP_CAP, _SUBNET_IP_LOW, _USAGE_HOSTS_CAP, _USAGE_HOSTS_LOW, NetShield)
+    _SUBNET_IP_CAP, _USAGE_HOSTS_CAP, _USAGE_HOSTS_LOW, NetShield)
 from dataplane.engine.lifeform.policy import _PENDING_MAX, AppFirewall
 from dataplane.engine.services.proxy import (
-    _CONN_RATE_CAP, _CONN_RATE_LOW, AsyncEdgeGuard)
+    _CONN_RATE_CAP, AsyncEdgeGuard)
 
 
 def _shield(d, **cfg):
@@ -28,16 +28,19 @@ def _shield(d, **cfg):
 
 
 # ── 間引きは「上限ちょうど」ではなく「低水位」まで落ちること ──
-def test_conn_rate_table_shrinks_even_when_nothing_expired():
-    """期限切れが 1 件も無い(=窓内の別IPで埋まった)状態でも表が縮むこと。
-    旧実装は期限切れだけを最大 5000 件消す実装で、この状況では回収 0 件のまま
-    *毎接続* 5 万件を走査し続けた(実測 1.53ms/接続)。"""
+def test_conn_rate_table_rejects_new_ip_without_evicting_active_windows():
+    """満杯の活動中窓を捨てると既存IPの接続レートをリセットできる。
+    新規IPをO(1)で拒否し、期限切れの最古窓だけ再利用する。"""
     g = AsyncEdgeGuard()
     now = time.monotonic()
-    for i in range(_CONN_RATE_CAP + 1):
+    for i in range(_CONN_RATE_CAP):
         g._conn_rate["10.%d.%d.%d" % (i // 65536, (i // 256) % 256, i % 256)] = [now, 1]
-    g._conn_rate_exceeded("172.16.0.1", 100)
-    assert len(g._conn_rate) <= _CONN_RATE_LOW + 1, len(g._conn_rate)
+    assert g._conn_rate_exceeded("172.16.0.1", 100) is True
+    assert len(g._conn_rate) == _CONN_RATE_CAP
+    assert g._conn_rate_exceeded("10.0.0.0", 1) is True
+    g._conn_rate["10.0.0.0"][0] = now - 2
+    assert g._conn_rate_exceeded("172.16.0.1", 100) is False
+    assert len(g._conn_rate) == _CONN_RATE_CAP
 
 
 def test_conn_rate_still_limits():
@@ -46,20 +49,20 @@ def test_conn_rate_still_limits():
     assert hits[:5] == [False] * 5 and all(hits[5:])
 
 
-def test_subnet_ban_table_shrinks_to_low_water():
-    """サブネット内 distinct IP の表。IPv4 は /24 に畳まれるので最大 256 個=上限と同値で
-    この分岐に到達しない。実際に溢れるのは /64 に畳まれる IPv6 側なのでそちらで確かめる。"""
+def test_subnet_ban_table_preserves_active_entries_at_cap():
+    """IPv6 /64 の現役BAN記録は容量超過で低水位まで消してはならない。"""
     with tempfile.TemporaryDirectory() as d:
         sh = _shield(d, subnet_defense=True)
         for i in range(_SUBNET_IP_CAP + 40):
             sh._record_subnet_ban("2001:db8::%x" % i)
         rec = next(iter(sh._subnets.values()))
-        assert len(rec) <= _SUBNET_IP_CAP, len(rec)
-        # 上限を跨いだ直後は低水位まで落ちていること(上限ちょうどで止めない)
+        assert len(rec) == _SUBNET_IP_CAP and "2001:db8::0" in rec, len(rec)
         sh2 = _shield(d, subnet_defense=True)
         for i in range(_SUBNET_IP_CAP + 1):
             sh2._record_subnet_ban("2001:db8:1::%x" % i)
-        assert len(next(iter(sh2._subnets.values()))) == _SUBNET_IP_LOW
+        other = next(iter(sh2._subnets.values()))
+        assert len(other) == _SUBNET_IP_CAP and "2001:db8:1::0" in other
+        assert sh2._subnet_entries == _SUBNET_IP_CAP
 
 
 def test_usage_hosts_shrink_to_low_water():

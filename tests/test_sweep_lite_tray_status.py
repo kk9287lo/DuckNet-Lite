@@ -16,6 +16,7 @@ import http.server
 import importlib.util
 import json
 import os
+import secrets
 import shutil
 import socket
 import struct
@@ -68,6 +69,10 @@ def _patched(obj, **attrs):
 def _G():
     import dataplane.gui.__main__ as G
     return G
+
+
+def _fetch_for_test(G, url, token, *, child=None, timeout=2.0):
+    return G._fetch_shield_state(url, token, timeout=timeout, owned_child=child)
 
 
 def _u16(s: str) -> int:
@@ -209,13 +214,11 @@ def test_poller_does_not_show_after_stop():
     assert shown == [], shown                        # 消えかけのトレイを触らない
 
 
-# ── 実際の管理ダッシュボードに対する状態取得 ──────────────────────────
+# ── Real state proof and untrusted listeners ────────────────────────────
 def _free_port() -> int:
-    s = socket.socket()
-    s.bind(("127.0.0.1", 0))
-    p = s.getsockname()[1]
-    s.close()
-    return p
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
 
 
 @contextlib.contextmanager
@@ -224,130 +227,89 @@ def _dashboard():
     import dataplane.engine.lifeform.pipeline as ND
     from dataplane.admin import AdminDashboard
     tmp = tempfile.mkdtemp(prefix="ducknet-tray-status-")
-    ofw, osh = FW._FW, ND._SHIELD
+    old_fw, old_sh = FW._FW, ND._SHIELD
+    key = secrets.token_hex(32)
     adm = None
     try:
-        with _env(DUCKNET_STATE_DIR=tmp):
+        with _env(DUCKNET_STATE_DIR=tmp, DUCKNET_TRAY_PROOF_KEY=key):
             FW._FW = FW.AppFirewall(state_dir=tmp)
             ND._SHIELD = ND.NetShield(state_dir=tmp)
-            adm = AdminDashboard(host="127.0.0.1", port=0, token="tray-test-token",
-                                 state_dir=tmp)
+            adm = AdminDashboard(host="127.0.0.1", port=0,
+                                 token="tray-test-token", state_dir=tmp)
             info = adm.start()
-            yield info["url"], adm.token, ND._SHIELD
+
+            class Child:
+                _ducknet_tray_proof_key = key
+
+                def poll(self):
+                    return None
+
+            yield info["url"], ND._SHIELD, Child()
     finally:
         if adm is not None:
             adm.stop()
-        FW._FW, ND._SHIELD = ofw, osh
+        FW._FW, ND._SHIELD = old_fw, old_sh
         shutil.rmtree(tmp, True)
 
 
-def test_fetch_reads_shield_enabled_from_real_dashboard():
+def test_fetch_reads_signed_state_from_real_dashboard_without_token():
     G = _G()
-    with _dashboard() as (url, tok, sh):
-        sh.disable()
-        assert G._fetch_shield_state(url, tok) == "off"
-        sh.enable()
-        assert G._fetch_shield_state(url, tok) == "on"
-        sh.disable()
-        assert G._fetch_shield_state(url, tok) == "off"
-        assert G._fetch_shield_state(url, "wrong-token") == "auth"
-        assert G._fetch_shield_state(url, "") == "auth"      # トークン不明でも ON/OFF を偽らない
+    with _dashboard() as (url, sh, child):
+        assert sh.disable()["ok"]
+        assert _fetch_for_test(G, url, "secret", child=child) == "off"
+        assert sh.enable()["ok"]
+        assert _fetch_for_test(G, url, "wrong", child=child) == "on"
+        assert sh.set_config(mode="audit")["ok"]
+        assert _fetch_for_test(G, url, "", child=child) == "audit"
+        assert _fetch_for_test(G, url, "secret") == "auth"
 
 
 def test_fetch_never_routes_through_a_system_proxy():
-    """管理トークンを載せた要求がプロキシ(とそのログ)へ平文で渡らない/プロキシがループバックへ
-    届かずに『接続不可』と誤表示しない。http_proxy を死んだ宛先へ向けても直接続で読める。"""
     G = _G()
     dead = "http://127.0.0.1:%d" % _free_port()
-    with _dashboard() as (url, tok, sh):
-        sh.enable()
+    with _dashboard() as (url, sh, child):
+        assert sh.enable()["ok"]
         with _env(http_proxy=dead, HTTP_PROXY=dead, no_proxy=None, NO_PROXY=None):
-            assert G._fetch_shield_state(url, tok, timeout=2.0) == "on"
+            assert _fetch_for_test(G, url, "secret", child=child) == "on"
 
 
-def test_fetch_unreachable_port_is_unreachable():
+def test_unreachable_and_fake_listener_never_receives_token():
     G = _G()
-    url = "http://127.0.0.1:%d" % _free_port()
-    assert G._fetch_shield_state(url, "tok", timeout=0.5) == "unreachable"
-    assert G._fetch_shield_state(url, "", timeout=0.5) == "unreachable"
+    class Child:
+        _ducknet_tray_proof_key = secrets.token_hex(32)
 
+        def poll(self):
+            return None
 
-class _Canned(http.server.BaseHTTPRequestHandler):
-    """決まった応答を返す偽の管理 API(壊れた応答・リダイレクト・別物の待受を模す)。
-    guard=True は本製品と同じく、トークン無しの要求へ 401 "token required" を返す(トレイは
-    トークンを送る前にこれで相手を確かめる=guard 無しの偽物にはトークン付きの要求が届かない)。"""
-    status, body, location, seen, guard = 200, b"", None, None, False
-
-    def do_GET(self):
-        if self.seen is not None:
-            self.seen.append((self.path, self.headers.get("X-Token")))
-        if self.guard and not self.headers.get("X-Token"):
-            deny = b'{"ok": false, "error": "token required"}'
-            self.send_response(401)
-            self.send_header("Content-Length", str(len(deny)))
-            self.end_headers()
-            self.wfile.write(deny)
-            return
-        self.send_response(self.status)
-        if self.location:
-            self.send_header("Location", self.location)
-        self.send_header("Content-Type", "text/plain")
-        self.send_header("Content-Length", str(len(self.body)))
-        self.end_headers()
-        self.wfile.write(self.body)
-
-    def log_message(self, *a):
-        pass
-
-
-@contextlib.contextmanager
-def _canned(status=200, body=b"", location=None, seen=None, guard=False):
-    H = type("H", (_Canned,), {"status": status, "body": body, "location": location,
-                               "seen": seen, "guard": guard})
-    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
-    t = threading.Thread(target=srv.serve_forever, daemon=True)
-    t.start()
-    try:
-        yield "http://127.0.0.1:%d" % srv.server_address[1]
-    finally:
-        srv.shutdown()
-        srv.server_close()
-        t.join(3)
-
-
-def test_fetch_malformed_or_foreign_answers_are_unreachable():
-    G = _G()
-    for body in (b"hello", b"", b"ducknet_shield_enabled 2\n", b"ducknet_shield_enabled\n",
-                 b"ducknet_shield_enabled_total 1\n", b"\xff\xfe\x00garbage",
-                 json.dumps({"enabled": True}).encode()):
-        with _canned(200, body, guard=True) as url:
-            assert G._fetch_shield_state(url, "tok", timeout=2.0) == "unreachable", body
-    for code in (404, 421, 500, 503):
-        with _canned(code, b"{}", guard=True) as url:
-            assert G._fetch_shield_state(url, "tok", timeout=2.0) == "unreachable", code
-    # 本製品は無認証の要求に 200 を返さない。トークン無しで 200 が来たら別物の待受(ON と誤表示しない)
-    with _canned(200, b"ducknet_shield_enabled 1\n") as url:
-        assert G._fetch_shield_state(url, "", timeout=2.0) == "unreachable"
-    # 正しい形なら読める(本製品と同じ 401 で相手確認に通る偽サーバなら、形式どおりの応答から
-    # ON/OFF を返す=パーサ自体の確認)。無認証にも 200 を返す偽物にはトークンを送らない(#26)。
-    on_body = b"# HELP x\nducknet_requests_total 3\nducknet_shield_enabled 1\n"
-    with _canned(200, on_body, guard=True) as url:
-        assert G._fetch_shield_state(url, "tok", timeout=2.0) == "on"
-    with _canned(200, b"ducknet_shield_enabled 0\r\n", guard=True) as url:
-        assert G._fetch_shield_state(url, "tok", timeout=2.0) == "off"
-    with _canned(200, on_body) as url:
-        assert G._fetch_shield_state(url, "tok", timeout=2.0) == "unreachable"
-
-
-def test_fetch_does_not_follow_redirects_with_the_token():
-    """管理トークンをリダイレクト先へ持ち出させない(urllib の既定は X-Token ごと追従する)。"""
-    G = _G()
+    child = Child()
+    assert _fetch_for_test(G, "http://127.0.0.1:%d" % _free_port(),
+                           "secret", child=child, timeout=0.5) == "unreachable"
     seen = []
-    with _canned(200, b"ducknet_shield_enabled 1\n", seen=seen) as target:
-        # guard=True: 相手確認には通し、トークン付きの要求の方をリダイレクトさせる
-        with _canned(302, b"", location=target + "/steal", guard=True) as url:
-            assert G._fetch_shield_state(url, "secret-tok", timeout=2.0) == "unreachable"
-    assert seen == [], seen
+
+    class Fake(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+        def do_GET(self):
+            seen.append((self.path, self.headers.get("X-Token")))
+            body = b'{"ok":false,"error":"token required"}'
+            self.send_response(401)
+            self.send_header("X-DuckNet-Tray-Proof", "0" * 64)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Fake)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        url = "http://127.0.0.1:%d" % server.server_port
+        assert _fetch_for_test(G, url, "secret", child=child) == "unreachable"
+        assert seen and all(token is None for _path, token in seen)
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(3)
 
 
 # ── main() がポーラを配線する ──────────────────────────────────────────
@@ -370,15 +332,30 @@ def test_main_polls_and_shows_state_until_quit():
         def stop(self):
             rec["stopped"] = True
 
-    def _fetch(url, tok, timeout=2.0):
+    def _fetch(url, tok, timeout=2.0, *, owned_child=None):
         rec["fetch"].append((url, tok))
         return "off"
     out = {}
+    class _Child:
+        exited = False
+
+        def poll(self):
+            return 0 if self.exited else None
+
+        def terminate(self):
+            self.exited = True
+
+        def wait(self, timeout=None):
+            self.exited = True
+            return 0
+
     with tempfile.TemporaryDirectory() as d:
+        with open(os.path.join(d, "none.env"), "w", encoding="utf-8"):
+            pass
         with _env(DUCKNET_ENV_FILE=os.path.join(d, "none.env"), DUCKNET_COVER="Disk Indexer",
                   DUCKNET_ADMIN_URL="http://127.0.0.1:18097", DUCKNET_ICON_DIR=None), \
                 _patched(G.tray, available=lambda: True, TrayIcon=_Tray), \
-                _patched(G, _ensure_gateway=lambda url, tok: ("tok-1", None),
+                _patched(G, _ensure_gateway=lambda url, tok: ("tok-1", _Child()),
                          _fetch_shield_state=_fetch, _POLL_SEC=0.01):
             th = threading.Thread(target=lambda: out.setdefault("rc", G.main([])), daemon=True)
             th.start()
@@ -394,7 +371,8 @@ def test_main_polls_and_shows_state_until_quit():
     tip, icon = rec["status"][0]
     assert tip.startswith("Disk Indexer — ") and "防御 OFF" in tip, tip
     assert os.path.basename(icon) == "DuckNet-off.ico", icon
-    assert os.path.basename(rec["icon"]) == "DuckNet.ico", rec["icon"]
+    assert os.path.basename(rec["icon"]) == "DuckNet-off.ico", rec["icon"]
+    assert "状態を確認できません" in rec["tip"], rec["tip"]
     assert len(rec["status"]) == 1, rec["status"]    # 変化が無ければ再表示しない
     # 終了でポーラも止まる(デーモンでも残り続けない)
     assert _wait(lambda: not any(t.name == "tray-status" and t.is_alive()

@@ -1,10 +1,8 @@
 """
 test_sweep_det2_body.py — 本文検査の追補(sweep: det2_body 群)。
 ====================================================================================
-· T1(決定) multipart でないバイナリ本文(application/octet-stream・protobuf・image/*・audio/*・
-  video/*・zip・pdf 等)は、ランダムなバイト列がシェルのメタ文字を含むため rce として約 42 点
-  (64KB・単発拒否の deny_score 超)加点されていた。宣言型がバイナリ *かつ* 中身がバイナリ(タブ/CR/LF
-  以外の制御バイトを含む)のときだけ署名走査を省き、body_binary_skipped に数える。
+· T1 クライアントが宣言するバイナリ型と制御バイトだけで本文署名を省略しない。
+  型を偽った本文にも通常の署名走査を行う。
 · T2(決定) アップロードの拡張子ポリシーは multipart のパートにしか効かず、要求ヘッダの
   Content-Disposition で名前を渡す生本文アップロード(WordPress REST の media 等)は素通りした。
 """
@@ -21,7 +19,7 @@ XSS_BODY = b"comment=<script>alert(document.cookie)</script>"   # test_bodyscan.
 _BIN = b"\x89PNG\r\n\x1a\n" + random.Random(20261009).randbytes(65536 - 8)
 _BIN_TYPES = ("application/octet-stream", "application/x-protobuf", "application/protobuf",
               "image/png", "audio/ogg", "video/mp4", "application/zip", "application/pdf",
-              "Application/Octet-Stream; charset=binary")
+              "Application/Octet-Stream")
 _IP = "203.0.113.90"
 
 
@@ -37,10 +35,6 @@ def _score(sh, ip) -> float:
     return {t["ip"]: t["score"] for t in sh.top_talkers(200)}.get(ip, 0.0)
 
 
-def _skipped(sh) -> int:
-    return int(sh.metrics().get("body_binary_skipped", 0))
-
-
 def _scan_with(buf, path="/x"):
     """差し込んだ shield の下で _scan_request_body を 1 回走らせ、blocked を返す。"""
     g = AsyncEdgeGuard()
@@ -51,24 +45,26 @@ def _scan_with(buf, path="/x"):
     return asyncio.run(go())[1]
 
 
-# ── T1: バイナリ型+バイナリの中身は署名走査しない ───────────────────────────────
-def test_t1_binary_body_with_binary_type_is_not_signature_scanned():
-    """T1: バイナリ型の本文がバイナリなら走査せず加点しない(body_binary_skipped に数える)。"""
+# ── T1: クライアント宣言のバイナリ型でも署名走査する ──────────────────────────
+def test_t1_binary_type_does_not_disable_signature_scan():
+    """The supplied media type cannot suppress the existing signature engine."""
     with tempfile.TemporaryDirectory() as d:
         sh = _sh(d)
-        # 前提: 型が分からなければ従来どおり走査する(=ランダムなバイト列が署名に当たる)
+        # 既存署名はランダム列にも当たり得るが、攻撃者に選べる型で無効化しない。
         r = sh.inspect_body("192.0.2.60", _BIN)
         assert r["action"] == "score" and r.get("signature"), r
         for i, ct in enumerate(_BIN_TYPES):
             ip = f"192.0.2.{61 + i}"
             r = sh.inspect_body(ip, _BIN, content_type=ct)
-            assert r["action"] == "allow" and not r.get("signature"), (ct, r)
-            assert _score(sh, ip) == 0, ct
-        assert _skipped(sh) == len(_BIN_TYPES)
+            assert r.get("signature") and _score(sh, ip) > 0, (ct, r)
+        # A declared charset that the scanner cannot decode is not clean allow.
+        r = sh.inspect_body("192.0.2.80", _BIN,
+                            content_type="application/octet-stream; charset=binary")
+        assert r["action"] == "block" and r.get("reason"), r
 
 
 def test_t1_text_like_body_with_binary_type_is_still_scanned():
-    """T1: 型がバイナリでも中身がテキスト(タブ/CR/LF 以外の制御バイト無し)なら走査する。"""
+    """Text signatures remain visible even under a binary declaration."""
     with tempfile.TemporaryDirectory() as d:
         sh = _sh(d)
         for ct in ("application/octet-stream", "image/png", "application/x-protobuf"):
@@ -77,7 +73,6 @@ def test_t1_text_like_body_with_binary_type_is_still_scanned():
         r = sh.inspect_body("192.0.2.71", b"a=1\r\n\t" + XSS_BODY,
                             content_type="application/octet-stream")
         assert r.get("signature") == "xss", r
-        assert _skipped(sh) == 0
 
 
 def test_t1_text_type_is_always_scanned():
@@ -91,21 +86,19 @@ def test_t1_text_type_is_always_scanned():
                    "multipart/form-data; boundary=b", ""):
             r = sh.inspect_body("192.0.2.72", body, content_type=ct)
             assert r.get("signature") == "xss", (ct, r)
-        assert _skipped(sh) == 0
 
 
 def test_t1_proxy_passes_request_content_type():
-    """T1: proxy は要求の Content-Type を inspect_body へ渡す。重複した Content-Type は backend が
-    どれを採るか分からないので渡さない(=走査する)。"""
+    """The scan helper does not trust a binary media type to skip signatures."""
     req = _post(b"/upload/raw", _BIN, b"application/octet-stream") + _BIN
     with _shield() as sh:
         assert _scan_with(req) is False
-        assert _score(sh, _IP) == 0 and _skipped(sh) == 1
+        assert _score(sh, _IP) > 0
     dup = req.replace(b"Content-Type: application/octet-stream\r\n",
                       b"Content-Type: application/octet-stream\r\nContent-Type: text/plain\r\n")
     with _shield() as sh:
         _scan_with(dup)
-        assert _score(sh, _IP) > 0 and _skipped(sh) == 0
+        assert _score(sh, _IP) > 0
 
 
 # ── T2: 生本文アップロードは要求ヘッダのファイル名で検査 ───────────────────────────

@@ -28,9 +28,9 @@ _MARK = "DECRB"
 _NEEDLES = ("内部コマンドまたは外部コマンド", "is not recognized as an internal or external command")
 # 注釈行: rem / @rem(大文字小文字を問わない)と :: 。
 _REM = re.compile(rb"^[ \t]*(@?rem([ \t].*)?|::.*)$", re.I)
-# 注釈を英語化した時点の『注釈以外の行』(行末の改行を除いて \n で連結)の SHA-256。Full / Lite で同じ。
-# コマンドや echo の文言を意図して変えたときは、ここを新しい値に更新する。
-_CMD_LINES_SHA256 = "26aaf126e6e003b7aa711de01e30ab40df838cd4204f1157b141b6b91747d788"
+# レビュー済みの『注釈以外の行』(行末の改行を除いて \n で連結)の SHA-256。
+# Round25 は存在しない既定 app.env を明示指定扱いにしないための変更を含む。
+_CMD_LINES_SHA256 = "317023d09d4f68bb0a60255c6cffb59e64d876c29234e1da6c03a0d0e6f0b742"
 
 
 def _bat_lines():
@@ -38,11 +38,12 @@ def _bat_lines():
         return [ln[:-1] if ln.endswith(b"\r") else ln for ln in f.read().split(b"\n")]
 
 
-def _bat_dir(d):
+def _bat_dir(d, with_env=True):
     """run.bat+普通の値の app.env+『受け取った引数と環境を出すだけ』の偽 dataplane を d に置く。"""
     shutil.copy(os.path.join(ROOT, "run.bat"), os.path.join(d, "run.bat"))
-    with open(os.path.join(d, "app.env"), "w", encoding="utf-8", newline="\n") as f:
-        f.write("# comment line\nDUCKNET_SWEEP_DEC=plain value\n")
+    if with_env:
+        with open(os.path.join(d, "app.env"), "w", encoding="utf-8", newline="\n") as f:
+            f.write("# comment line\nDUCKNET_SWEEP_DEC=plain value\n")
     pkg = os.path.join(d, "dataplane")
     os.makedirs(pkg)
     with open(os.path.join(pkg, "__init__.py"), "w", encoding="utf-8"):
@@ -50,7 +51,7 @@ def _bat_dir(d):
     with open(os.path.join(pkg, "__main__.py"), "w", encoding="utf-8") as f:
         f.write("import json, os, sys\n"
                 "env = {k.upper(): v for k, v in os.environ.items()\n"
-                "       if k.upper().startswith('DUCKNET_SWEEP_') or k.upper() in ('PYTHONUTF8', 'PYTHONIOENCODING')}\n"
+                "       if k.upper().startswith('DUCKNET_SWEEP_') or k.upper() in ('PYTHONUTF8', 'PYTHONIOENCODING', 'DUCKNET_ENV_FILE')}\n"
                 "sys.stdout.write(%r + json.dumps({'argv': sys.argv[1:], 'env': env}))\n" % _MARK)
 
 
@@ -110,6 +111,18 @@ def test_dec_runbat_starts_without_stray_command_error():
     _assert_no_stray_command(r)
 
 
+def test_dec_runbat_absent_default_app_env_is_not_made_explicit():
+    """An absent optional default must not become a missing configured file in Python."""
+    if not WIN:
+        raise SkipTest("cmd.exe が無い環境")
+    with tempfile.TemporaryDirectory(prefix="dec-runbat-") as d:
+        _bat_dir(d, with_env=False)
+        r, got = _run_bat(d, sys.executable)
+    assert got is not None and r.returncode == 0, (r.returncode, r.stderr[-300:])
+    assert "DUCKNET_ENV_FILE" not in got["env"], got
+    _assert_no_stray_command(r)
+
+
 def test_dec_runbat_error_message_without_stray_command_error():
     """起動できない DUCKNET_PYTHON の案内(日本語の echo)を出す経路でも、余計なエラーが混ざらない
     (終了コードは従来どおり 9)。"""
@@ -130,7 +143,7 @@ def test_dec_runbat_comments_are_ascii():
 
 
 def test_dec_runbat_only_comments_changed():
-    """注釈を英語化したときにコマンド行(echo の文言を含む)をバイト単位で変えていない。"""
+    """レビュー済みコマンド行(echo の文言を含む)を意図せず変えていない。"""
     lines = [ln for ln in _bat_lines() if not _REM.match(ln)]
     got = hashlib.sha256(b"\n".join(lines)).hexdigest()
     assert got == _CMD_LINES_SHA256, "run.bat の注釈以外の行が変わった: sha256=%s" % got

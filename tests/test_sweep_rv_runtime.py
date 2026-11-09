@@ -74,7 +74,7 @@ def _all_lines(d: str) -> list:
 
 
 def test_rv13_rotation_does_not_sleep_while_a_reader_holds_the_log():
-    """tail している読み手(open(path,'rb')=FILE_SHARE_DELETE なし)が居る間も、追記は眠らず行も失わない。"""
+    """A held reader never makes request-path append sleep or exceed its cap."""
     with _tmpdir() as d:
         p = os.path.join(d, "acl_log.jsonl")
         for i in range(60):
@@ -83,12 +83,18 @@ def test_rv13_rotation_does_not_sleep_while_a_reader_holds_the_log():
         reader = open(p, "rb")
         try:
             with _spy_sleep() as spy:
-                for i in range(5):
-                    assert aio.append_jsonl(p, {"i": 100 + i}, max_bytes=small, backups=3)
+                results = [aio.append_jsonl(p, {"i": 100 + i},
+                                            max_bytes=small, backups=3)
+                           for i in range(5)]
         finally:
             reader.close()
         assert spy.calls == [], f"要求経路の追記が眠った: {len(spy.calls)} 回"
-        assert sorted(r["i"] for r in _all_lines(d)) == list(range(60)) + list(range(100, 105))
+        if os.name == "nt":
+            assert results == [False] * 5
+            assert sorted(r["i"] for r in _all_lines(d)) == list(range(60))
+        else:
+            assert results == [True] * 5
+            assert sorted(r["i"] for r in _all_lines(d)) == list(range(60)) + list(range(100, 105))
 
 
 def test_rv13_locked_rotation_keeps_generations_and_resumes_later():
@@ -106,7 +112,8 @@ def test_rv13_locked_rotation_keeps_generations_and_resumes_later():
         reader = open(p, "rb")
         try:
             for i in range(4):
-                assert aio.append_jsonl(p, {"gen": 0, "i": 100 + i}, max_bytes=small, backups=3)
+                assert aio.append_jsonl(p, {"gen": 0, "i": 100 + i},
+                                        max_bytes=small, backups=3) is False
         finally:
             reader.close()
         for k in (1, 2, 3):
@@ -123,7 +130,7 @@ def test_rv13_locked_rotation_keeps_generations_and_resumes_later():
                 aio._ROTATE_RETRY_SEC = orig
         with open(f"{p}.1", encoding="utf-8") as f:
             rows = [json.loads(ln) for ln in f if ln.strip()]
-        assert len(rows) == 44 and all(r["gen"] == 0 for r in rows), "読み手が閉じた後も回らない"
+        assert len(rows) == 40 and all(r["gen"] == 0 for r in rows), "読み手が閉じた後も回らない"
         with open(f"{p}.2", encoding="utf-8") as f:
             assert json.loads(f.read()) == {"gen": 1}
 

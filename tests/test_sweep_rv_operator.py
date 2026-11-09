@@ -162,11 +162,16 @@ def test_rv23_r2_ipsource_runner_isolates_state_dir():
     状態dirを一時dirへ向ける。HOME を捨てdirへ向けて走らせ、そこに何も書かれないこと。"""
     path = os.path.join(ROOT, "tests", "test_sweep_r2_ipsource.py")
     home = tempfile.mkdtemp(prefix="rvop-home-")
+    env_dir = tempfile.mkdtemp(prefix="rvop-empty-env-",
+                               dir=os.environ.get("DUCKNET_STATE_DIR") or None)
     try:
+        env_file = os.path.join(env_dir, "none.env")
+        with open(env_file, "w", encoding="utf-8"):
+            pass
         env = {k: v for k, v in os.environ.items() if not k.upper().startswith("DUCKNET_")
                and k.upper() != "PYTHONPATH"}
         env.update({"HOME": home, "USERPROFILE": home, "PYTHONPATH": ROOT,
-                    "DUCKNET_OFFLINE": "1", "DUCKNET_ENV_FILE": os.path.join(home, "none.env"),
+                    "DUCKNET_OFFLINE": "1", "DUCKNET_ENV_FILE": env_file,
                     "PYTHONIOENCODING": "utf-8"})
         code = ("import os, runpy, sys\n"
                 "if os.path.expanduser('~') != sys.argv[1]:\n"
@@ -186,6 +191,7 @@ def test_rv23_r2_ipsource_runner_isolates_state_dir():
         assert not written, written
     finally:
         shutil.rmtree(home, True)
+        shutil.rmtree(env_dir, True)
 
 
 # ── #24 test_sweep_service_gui が開いたファイルを閉じていなかった ───────────────────
@@ -219,7 +225,14 @@ def test_rv24_service_gui_tests_close_their_files():
 # ── #29/#30 ダッシュボード: node でスクリプトを動かす ───────────────────────────
 # ブラウザの代わりの最小 DOM(要素は id ごとに 1 つ作り、書き込みを覚える)。
 _PRELUDE = r"""
-var __els={},__toasts=[],__routes={};
+var __els={},__toasts=[],__routes={},__requests=[],__storage={},__prompts=[];
+var __nodeCrypto=require("crypto");globalThis.crypto=__nodeCrypto.webcrypto;
+var __instance="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+var location={href:"http://127.0.0.1:8081/"};
+var history={replaceState(_a,_b,url){location.href="http://127.0.0.1:8081"+url;}};
+var sessionStorage={getItem(k){return __storage[k]||null;},
+ setItem(k,v){__storage[k]=String(v);},removeItem(k){delete __storage[k];}};
+function prompt(message){__prompts.push(message);return "rv-browser-token";}
 function __mk(id){
  const t={id:id||"",style:{},dataset:{},children:[],
   classList:{add(){},remove(){},toggle(){},contains(){return false}},
@@ -244,10 +257,14 @@ function addEventListener(){}
 URL.createObjectURL=function(){return "blob:x";};
 URL.revokeObjectURL=function(){};
 async function fetch(p,opt){
+ __requests.push({path:p,headers:{...((opt&&opt.headers)||{})}});
  const r=__routes[p];
  if(!r)throw new TypeError("Failed to fetch");
- return {status:r.status,ok:r.status>=200&&r.status<300,
-  json:async()=>JSON.parse(r.body),text:async()=>r.body};
+ const raw=Buffer.from(r.body,"utf8"),nonce=(opt&&opt.headers||{})["X-Admin-Auth-Nonce"]||"";
+ const hash=__nodeCrypto.createHash("sha256").update(raw).digest("hex");
+ const mac=(r.status===401||r.fake)?"":__nodeCrypto.createHmac("sha256","rv-browser-token")
+  .update(__instance+"\n"+nonce+"\n"+r.status+"\n"+hash).digest("hex");
+ return new Response(raw,{status:r.status,headers:{"X-Admin-Response-Mac":mac,"Content-Type":"application/json"}});
 }
 function __emit(o){
  process.stdout.write(JSON.stringify(o).replace(/[\u007f-\uffff]/g,
@@ -258,8 +275,17 @@ function __emit(o){
 _HARNESS = r"""
 (async()=>{
  const out={};
+ __routes["/api/state"]={status:200,body:JSON.stringify(__input.state)};
+ document.getElementById("adminTokenInput").value="rv-browser-token";
+ await submitAdminAuth({preventDefault(){}});delete __routes["/api/state"];
  const T=async(name,fn)=>{try{out[name]=await fn();}catch(e){out[name+"_err"]=String(e&&e.stack||e);}};
- for(let i=0;i<30;i++)await new Promise(r=>setImmediate(r));   // 読込時の refresh() などを流し切る
+ const bootstrapDeadline=Date.now()+2000;
+ while(Date.now()<bootstrapDeadline&&!__requests.some(r=>r.headers?.["X-Admin-Auth-Mac"]))
+  await new Promise(resolve=>require("timers").setTimeout(resolve,5));
+ await T("auth_bootstrap",()=>({stored:__storage["ducknet-admin-token"]||null,
+  memory:TOKEN,
+  prompts:__prompts.length,hasMac:!!(__requests[0]||{}).headers?.["X-Admin-Auth-Mac"],
+  raw:(__requests[0]||{}).headers?.["X-Token"]||null}));
  toast=function(m,k){__toasts.push([String(m),k]);};
  const W=async(lang,st)=>{
   __routes["/api/state"]={status:200,body:JSON.stringify(st)};
@@ -274,8 +300,8 @@ _HARNESS = r"""
  const P="/api/shield/paranoia";
  await T("paranoia",async()=>{__toasts.length=0;
   __routes[P]={status:200,body:JSON.stringify(__input.set)};
-  try{const h=document.getElementById("paranoia").onchange;
-   await h({target:{value:"2"}});}finally{delete __routes[P];}
+  try{const el=document.getElementById("paranoia");el.value="2";
+   await el.onchange({target:el});}finally{delete __routes[P];}
   return __toasts.splice(0);});
  await T("undo",async()=>{__toasts.length=0;
   __routes[P]={status:200,body:JSON.stringify(__input.undo)};
@@ -292,7 +318,7 @@ _HARNESS = r"""
 def _script(A) -> str:
     page = A._HTML
     i = page.index("<script>") + len("<script>")
-    return page[i:page.index("</script>", i)]
+    return page[i:page.index("</script>", i)].replace("__AUTH_INSTANCE__", "a" * 32)
 
 
 @contextlib.contextmanager
@@ -375,6 +401,7 @@ def _run_dashboard(A, data):
         p = os.path.join(d, "dash.js")
         with open(p, "w", encoding="utf-8") as f:
             f.write(_PRELUDE + "\nconst __input=" + json.dumps(data) + ";\n"
+                    + "__routes['/api/state']={status:200,body:JSON.stringify(__input.state)};\n"
                     + _script(A) + "\n" + _HARNESS)
         r = subprocess.run([node, p], capture_output=True, timeout=120)
     err = r.stderr.decode("utf-8", "replace")
@@ -426,7 +453,9 @@ def test_rv29_config_warning_badge_follows_language():
     """config_warnings() の message は日本語だけ。バッジはそれを tr() も通さず出していたので、
     英語表示でも日本語の文が出た。英語表示では既知の code を英文にし(サーバが message_en を付けて
     いればそれ)、日本語表示はサーバの message のまま。未知の code はサーバの message を出す。"""
-    r = _dash("warn_en", "warn_ja", "more_en", "more_ja")
+    r = _dash("auth_bootstrap", "warn_en", "warn_ja", "more_en", "more_ja")
+    assert r["auth_bootstrap"] == {"stored": None, "memory": "rv-browser-token", "prompts": 0,
+                                   "hasMac": True, "raw": None}, r["auth_bootstrap"]
     en, ja = r["warn_en"], r["warn_ja"]
     assert en["display"] == "" and ja["display"] == "", (en, ja)
     assert "site_whitelist" in en["html"] and not _JA.search(en["html"]), en["html"]

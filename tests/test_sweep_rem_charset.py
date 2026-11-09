@@ -248,8 +248,8 @@ def test_b1_body_in_declared_charset_is_signature_scanned():
         assert r.get("signature") == "marker-rule", r
 
 
-def test_b2_duplicate_content_type_charset_is_read_through_the_proxy():
-    """Content-Type が重複すると proxy は型を渡さない(T1)が、charset はどれを backend が採っても読む。"""
+def test_b2_duplicate_content_type_charset_is_rejected_before_proxying():
+    """A single declared charset is scanned; duplicate Content-Type is ambiguous."""
     from dataplane.engine.services.proxy import AsyncEdgeGuard
     from test_sweep_det_body import _Reads
     body = ("note " + _MARK).encode("cp037")
@@ -266,8 +266,11 @@ def test_b2_duplicate_content_type_charset_is_read_through_the_proxy():
                 async def go():
                     return await AsyncEdgeGuard()._scan_request_body(head + body, _Reads(),
                                                                      "192.0.2.53", "/f")
-                asyncio.run(go())
+                _, blocked = asyncio.run(go())
                 hits = dict(ND._SHIELD._sig_hits)
             finally:
                 ND._SHIELD = old
-        assert hits.get("marker-rule") == 1, (cts, hits)
+        if len(cts) == 1:
+            assert blocked is False and hits.get("marker-rule") == 1, (cts, hits)
+        else:
+            assert blocked is True and hits == {}, (cts, blocked, hits)

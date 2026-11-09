@@ -8,6 +8,7 @@ import asyncio
 import tempfile
 
 from dataplane.engine.services.proxy import AsyncEdgeGuard
+from guard_support import stop_guard_owned
 
 
 class _HangReader:
@@ -34,6 +35,55 @@ class _NullWriter:
 
     def close(self):
         pass
+
+
+class _BoundaryWriter(_NullWriter):
+    def __init__(self):
+        self.data = b""
+        self.closed = self.finished = self.aborted = False
+        self.transport = self
+
+    def write(self, data):
+        self.data += data
+
+    def write_eof(self):
+        self.finished = True
+
+    def can_write_eof(self):
+        return True
+
+    def close(self):
+        self.closed = True
+
+    def abort(self):
+        self.aborted = self.closed = True
+
+
+def test_incomplete_or_malformed_body_aborts_backend_connection():
+    """Only a completely framed body may receive graceful write_eof."""
+    guard = AsyncEdgeGuard()
+    penalties = []
+    guard._on_slow_body = penalties.append
+
+    async def run(parts, remaining, chunked=False, expired=False, ip=""):
+        writer = _BoundaryWriter()
+        deadline = asyncio.get_running_loop().time() - 1 if expired else None
+        await guard._pipe_body_bounded(_ListReader(parts), writer, remaining,
+                                       chunked, deadline, ip=ip)
+        return writer
+
+    valid = asyncio.run(run([b"abc"], 3))
+    assert valid.data == b"abc" and valid.finished and not valid.closed
+    short = asyncio.run(run([b"ab"], 3))
+    assert short.data == b"ab" and short.aborted and not short.finished
+    expired = asyncio.run(run([], 3, expired=True, ip="198.51.100.5"))
+    assert expired.aborted and not expired.finished
+    assert penalties == ["198.51.100.5"]
+    valid_chunk = asyncio.run(run([b"1\r\na\r\n0\r\n\r\n"], None, chunked=True))
+    assert valid_chunk.finished and not valid_chunk.closed
+    bad_chunk = asyncio.run(run([b"1\r\na\r\n0\r\nHost: x\r\n\r\n"], None,
+                                chunked=True))
+    assert bad_chunk.data == b"" and bad_chunk.aborted and not bad_chunk.finished
 
 
 def test_pipe_deadline_drops_stalled_body():
@@ -129,24 +179,52 @@ def test_scan_body_total_deadline_stops_dribble():
     # #82: 走査読取にも総デッドライン。小出しでボディ走査フェーズを保持できない。
     from dataplane.engine.lifeform.pipeline import net_shield
     sh = net_shield()
-    saved = {k: sh.cfg.get(k) for k in ("body_scan_enabled", "body_timeout_enabled", "body_max_sec")}
+    saved = {k: sh.cfg.get(k) for k in ("enabled", "body_scan_enabled",
+                                        "body_timeout_enabled", "body_max_sec",
+                                        "body_scan_max_bytes")}
+    sh.cfg["enabled"] = True
     sh.cfg["body_scan_enabled"] = True
     sh.cfg["body_timeout_enabled"] = True
     sh.cfg["body_max_sec"] = 0.25
+    sh.cfg["body_scan_max_bytes"] = 65536
     try:
         g = AsyncEdgeGuard(head_timeout=10.0)
-        buf = b"POST /x HTTP/1.1\r\nHost: x\r\nContent-Length: 100000\r\n\r\n"  # 巨大CL宣言
+        # 宣言長が scan 上限を超えると、現在は本文を待たず 413 で拒否される。
+        # dribble の総期限を測るため、上限内だが期限内には届かない長さにする。
+        buf = b"POST /x HTTP/1.1\r\nHost: x\r\nContent-Length: 4096\r\n\r\n"
         loop = asyncio.new_event_loop()
         try:
             before = g.metrics.get("slow_body", 0)
             t0 = loop.time()
-            loop.run_until_complete(g._scan_request_body(buf, _Dribbler(), "203.0.113.51"))
+            _, reason = loop.run_until_complete(
+                g._scan_request_body(buf, _Dribbler(), "203.0.113.51"))
             assert loop.time() - t0 < 2.0              # 総時間で打切り(保持されない)
+            assert reason == "timeout"
             assert g.metrics.get("slow_body", 0) == before + 1
         finally:
             loop.close()
             with net_shield()._lock:
                 net_shield()._ips.pop("203.0.113.51", None)
+    finally:
+        sh.cfg.update(saved)
+
+
+def test_scan_body_deadline_allows_prompt_body():
+    """A complete body received before the same scan deadline passes unchanged."""
+    from dataplane.engine.lifeform.pipeline import net_shield
+    sh = net_shield()
+    saved = {k: sh.cfg.get(k) for k in ("enabled", "body_scan_enabled",
+                                        "body_timeout_enabled", "body_max_sec")}
+    sh.cfg.update({"enabled": True, "body_scan_enabled": True,
+                   "body_timeout_enabled": True, "body_max_sec": 0.25})
+    try:
+        g = AsyncEdgeGuard(head_timeout=10.0)
+        buf = b"POST /x HTTP/1.1\r\nHost: x\r\nContent-Length: 3\r\n\r\n"
+        before = g.metrics.get("slow_body", 0)
+        extra, reason = asyncio.run(g._scan_request_body(buf, _ListReader([b"abc"]),
+                                                         "203.0.113.52"))
+        assert extra == b"abc" and reason is False
+        assert g.metrics.get("slow_body", 0) == before
     finally:
         sh.cfg.update(saved)
 
@@ -218,7 +296,7 @@ def test_slow_read_releases_backend_within_timeout():
     g = AsyncEdgeGuard(backend_host="127.0.0.1", backend_port=bport,
                        listen_host="127.0.0.1", listen_port=0)
     g.write_timeout = 0.5                       # 兵糧攻めをこの秒数で断つ
-    g.start()
+    assert g.start().get("ok") is True
     c = None
     try:
         c = socket.create_connection(("127.0.0.1", g.listen_port), timeout=5)
@@ -232,6 +310,8 @@ def test_slow_read_releases_backend_within_timeout():
                 c.close()
             except Exception:
                 pass
-        g.stop()
-        srv.shutdown()
-        srv.server_close()
+        try:
+            stop_guard_owned(g)
+        finally:
+            srv.shutdown()
+            srv.server_close()

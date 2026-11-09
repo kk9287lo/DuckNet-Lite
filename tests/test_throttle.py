@@ -7,9 +7,11 @@ Retry-After が設定可能なこと・opt-out(throttle_response=False)で従来
 実ソケットは使わず fake async stream で _handle を直接駆動(クロスプラットフォーム・決定論)。
 """
 import asyncio
+import contextlib
 import tempfile
 
 import dataplane.engine.lifeform.pipeline as ND
+import dataplane.engine.lifeform.policy as FW
 from dataplane.engine.services.proxy import AsyncEdgeGuard
 
 
@@ -36,57 +38,56 @@ def _drive(req: bytes) -> _W:
 
 def _throttling_shield(tmp, **cfg):
     """/x を burst=1 で絞るシールド。1発目=allow(バケツ消費)、2発目=throttle。"""
-    sh = ND.NetShield(state_dir=tmp); sh.enable()
-    sh.set_path_limits([{"path": "/x", "rate": 0.001, "burst": 1}])
-    sh.cfg.update(cfg)
+    sh = ND.NetShield(state_dir=tmp)
+    assert sh.enable()["ok"]
+    assert sh.set_path_limits([{"path": "/x", "rate": 0.001, "burst": 1}])["ok"]
+    if cfg:
+        assert sh.set_config(**cfg)["ok"]
     return sh
 
 
+@contextlib.contextmanager
+def _isolated_protection(tmp, **cfg):
+    old_shield, old_firewall = ND._SHIELD, FW._FW
+    try:
+        FW._FW = FW.AppFirewall(state_dir=tmp)
+        assert FW._FW.add_rule("203.0.113.50/32", "allow")["ok"]
+        ND._SHIELD = _throttling_shield(tmp, **cfg)
+        yield
+    finally:
+        ND._SHIELD, FW._FW = old_shield, old_firewall
+
+
 def test_throttle_returns_429_with_retry_after():
-    osh = ND._SHIELD
     with tempfile.TemporaryDirectory() as tmp:
-        ND._SHIELD = _throttling_shield(tmp)
-        try:
-            _drive(b"GET /x HTTP/1.1\r\nHost: h\r\n\r\n")            # 1発目=バケツ消費(allow)
+        with _isolated_protection(tmp):
+            first = _drive(b"GET /x HTTP/1.1\r\nHost: h\r\n\r\n")  # 1発目=backend 不達まで進む
+            assert b"502 Bad Gateway" in first.buf
             w = _drive(b"GET /x HTTP/1.1\r\nHost: h\r\n\r\n")        # 2発目=throttle
             assert b"429 Too Many Requests" in w.buf
             assert b"Retry-After: 1" in w.buf
             assert b'rate-limit' in w.buf and w.closed       # 防御種別=rate-limit を明示
-        finally:
-            ND._SHIELD = osh
 
 
 def test_throttle_retry_after_configurable():
-    osh = ND._SHIELD
     with tempfile.TemporaryDirectory() as tmp:
-        ND._SHIELD = _throttling_shield(tmp, throttle_retry_after=7)
-        try:
-            _drive(b"GET /x HTTP/1.1\r\nHost: h\r\n\r\n")
+        with _isolated_protection(tmp, throttle_retry_after=7):
+            assert b"502 Bad Gateway" in _drive(b"GET /x HTTP/1.1\r\nHost: h\r\n\r\n").buf
             w = _drive(b"GET /x HTTP/1.1\r\nHost: h\r\n\r\n")
             assert b"Retry-After: 7" in w.buf
-        finally:
-            ND._SHIELD = osh
 
 
 def test_throttle_response_opt_out_bare_close():
-    osh = ND._SHIELD
     with tempfile.TemporaryDirectory() as tmp:
-        ND._SHIELD = _throttling_shield(tmp, throttle_response=False)
-        try:
-            _drive(b"GET /x HTTP/1.1\r\nHost: h\r\n\r\n")
+        with _isolated_protection(tmp, throttle_response=False):
+            assert b"502 Bad Gateway" in _drive(b"GET /x HTTP/1.1\r\nHost: h\r\n\r\n").buf
             w = _drive(b"GET /x HTTP/1.1\r\nHost: h\r\n\r\n")
             assert b"429" not in w.buf and w.buf == b"" and w.closed   # 従来の無言切断
-        finally:
-            ND._SHIELD = osh
 
 
 def test_allowed_request_is_not_throttled():
     # 制限外パスは 429 にならない(allow→backend へ。backend 不達でも 429 は出ない)。
-    osh = ND._SHIELD
     with tempfile.TemporaryDirectory() as tmp:
-        ND._SHIELD = _throttling_shield(tmp)
-        try:
+        with _isolated_protection(tmp):
             w = _drive(b"GET /other HTTP/1.1\r\nHost: h\r\n\r\n")
-            assert b"429" not in w.buf
-        finally:
-            ND._SHIELD = osh
+            assert b"502 Bad Gateway" in w.buf and b"429" not in w.buf

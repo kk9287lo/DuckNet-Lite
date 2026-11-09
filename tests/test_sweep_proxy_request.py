@@ -15,6 +15,7 @@ test_sweep_proxy_request.py — 前衛プロキシの要求解析/応答加工�
 import asyncio
 import contextlib
 import gzip
+import select
 import socket
 import tempfile
 import threading
@@ -26,6 +27,7 @@ from dataplane.engine.services.proxy import (AsyncEdgeGuard, _location_host,
                                              _redirect_violation_host,
                                              inject_security_headers)
 from test_jwt import _jwt
+from guard_support import stop_guard_owned
 
 
 # ── 共通ヘルパ ──────────────────────────────────────────────────────────────
@@ -48,9 +50,90 @@ def _shield(**cfg):
 _OK = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok"
 
 
+def _framed_request_end(raw: bytes):
+    """Find a complete valid HTTP request boundary, independent of TCP FIN."""
+    head_end = raw.find(b"\r\n\r\n")
+    if head_end < 0:
+        return None
+    head_end += 4
+    lines = raw[:head_end - 4].split(b"\r\n")
+    lengths = []
+    chunked = False
+    for line in lines[1:]:
+        name, _, value = line.partition(b":")
+        if name.lower() == b"content-length":
+            lengths.append(value.strip())
+        elif name.lower() == b"transfer-encoding":
+            chunked = b"chunked" in value.lower()
+    if chunked:
+        index = head_end
+        while True:
+            line_end = raw.find(b"\r\n", index)
+            if line_end < 0:
+                return None
+            token = raw[index:line_end].split(b";", 1)[0]
+            try:
+                size = int(token, 16)
+            except ValueError:
+                return len(raw)  # invalid framing is visible in captured wire
+            index = line_end + 2
+            if size:
+                if len(raw) < index + size + 2:
+                    return None
+                if raw[index + size:index + size + 2] != b"\r\n":
+                    return len(raw)
+                index += size + 2
+                continue
+            while True:
+                line_end = raw.find(b"\r\n", index)
+                if line_end < 0:
+                    return None
+                if line_end == index:
+                    return line_end + 2
+                index = line_end + 2
+    if lengths:
+        try:
+            return head_end + int(lengths[0])
+        except ValueError:
+            return len(raw)
+    return head_end
+
+
+def _read_framed_request(conn, *, limit=262144, suffix_wait=0.05):
+    """Read the declared request, then briefly observe any smuggled suffix.
+
+    Test origins must answer a complete HTTP request without requiring the
+    gateway to half-close TCP. The suffix observation preserves the separate
+    inspect-once/pipelining regressions, including a delayed second packet.
+    """
+    data = bytearray()
+    try:
+        while len(data) < limit:
+            end = _framed_request_end(data)
+            if end is not None and len(data) >= end:
+                break
+            part = conn.recv(min(65536, limit - len(data)))
+            if not part:
+                break
+            data.extend(part)
+        if _framed_request_end(data) is not None:
+            deadline = time.monotonic() + suffix_wait
+            while len(data) < limit:
+                left = deadline - time.monotonic()
+                if left <= 0 or not select.select([conn], [], [], left)[0]:
+                    break
+                part = conn.recv(min(65536, limit - len(data)))
+                if not part:
+                    break
+                data.extend(part)
+    except OSError:
+        pass
+    return bytes(data)
+
+
 class _Backend:
     """接続ごとに受信バイトを記録して固定応答を返す backend。Connection: close を *尊重しない*
-    近似として、EOF か 1 秒無通信まで読み続ける(パイプライン第2要求が届いたかを観測できる)。"""
+    近似として、HTTP 境界の後も短時間だけ読む(パイプライン第2要求を観測できる)。"""
 
     def __init__(self, resp: bytes = _OK):
         self.resp = resp
@@ -76,15 +159,7 @@ class _Backend:
 
     def _one(self, c):
         c.settimeout(1.0)
-        data = b""
-        try:
-            while len(data) < 262144:
-                ch = c.recv(65536)
-                if not ch:
-                    break
-                data += ch
-        except OSError:
-            pass
+        data = _read_framed_request(c)
         self.got.append(data)
         try:
             c.sendall(self.resp)
@@ -111,7 +186,7 @@ def _guard(backend, **kw):
     try:
         yield g
     finally:
-        g.stop()
+        stop_guard_owned(g)
 
 
 def _exchange(g, parts, delay=0.05, timeout=5.0) -> bytes:
@@ -149,6 +224,49 @@ def _through(parts, *, guard_kw=None, backend_resp=_OK, **cfg):
         return be.saw(), resp, m
     finally:
         be.close()
+
+
+def test_literal_route_block_is_enforced_before_backend_receives_bytes():
+    for target in (b"/admin/../public", b"/admin/%2e%2e/public", b"/public;x=secret.bak"):
+        request = b"GET " + target + b" HTTP/1.1\r\nHost: app.example\r\n\r\n"
+        got, response, _ = _through([request], blocked_urls=["/admin"], blocked_extensions=[".bak"])
+        assert got == b"", (target, got)
+        assert b"403" in response.split(b"\r\n", 1)[0], (target, response)
+    request = b"GET /public/report.txt HTTP/1.1\r\nHost: app.example\r\n\r\n"
+    got, response, _ = _through([request], blocked_urls=["/admin"], blocked_extensions=[".bak"])
+    assert b"GET /public/report.txt HTTP/1.1\r\n" in got
+    assert response.startswith(b"HTTP/1.1 200")
+
+
+def test_literal_graphql_route_cannot_bypass_body_guard():
+    body = b'{"query":"{ a { b { c } } }"}'
+    for target in (b"/graphql/../public", b"/graphql/%2e%2e/public"):
+        request = (b"POST " + target + b" HTTP/1.1\r\nHost: app.example\r\n"
+                   b"Content-Type: application/json\r\nContent-Length: "
+                   + str(len(body)).encode() + b"\r\n\r\n" + body)
+        got, response, metrics = _through([request], graphql_enabled=True, graphql_max_depth=1)
+        assert got == b"", (target, got)
+        assert metrics["dropped"] == 1, (target, response, metrics)
+    body = b'{"query":"{ a }"}'
+    request = (b"POST /graphql/../public HTTP/1.1\r\nHost: app.example\r\n"
+               b"Content-Type: application/json\r\nContent-Length: "
+               + str(len(body)).encode() + b"\r\n\r\n" + body)
+    got, response, metrics = _through([request], graphql_enabled=True, graphql_max_depth=1)
+    assert body in got and response.startswith(b"HTTP/1.1 200"), (got, response)
+    assert metrics["dropped"] == 0
+
+
+def test_ambiguous_graphql_json_never_reaches_backend_in_enforce():
+    for audit in (False, True):
+        body = b'{"query":"{ __schema { types { name } } }","query":"{ safe }"}'
+        request = (b"POST /graphql HTTP/1.1\r\nHost: app.example\r\nContent-Type: application/json\r\n"
+                   b"Content-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body)
+        got, response, metrics = _through([request], graphql_enabled=True,
+                                          mode="audit" if audit else "enforce")
+        if audit:
+            assert body in got and response.startswith(b"HTTP/1.1 200")
+        else:
+            assert got == b"" and metrics["dropped"] == 1, (got, metrics)
 
 
 class _Sink:
@@ -362,9 +480,9 @@ def test_c59_dlp_scans_response_head_when_head_processing_on():
     assert sh.metrics().get("dlp_leak", 0) >= 1
 
 
-def test_c59_dlp_scans_oversized_response_head():
-    # 64KiB 超の head(加工を諦める経路)も DLP は通す。終端より前に 64KiB 超が届く分割にして、
-    # 実際にその経路(head 書換なし)を通ったことも確かめる(#53: 旧入力は通常の書換経路だった)。
+def test_c59_dlp_rejects_oversized_response_head():
+    # 64KiB 超の head は、DLP と既定の応答加工を適用できないため切断する。
+    # 終端より前に 64KiB 超が届く分割にして、未加工の応答が漏れないことを確かめる。
     import dataplane.engine.services.proxy as P
     resp = (b"HTTP/1.1 200 OK\r\nX-Debug-Key: " + _LEAK + b"\r\nX-Pad: " + b"p" * 70000
             + b"\r\n\r\nok")
@@ -382,8 +500,8 @@ def test_c59_dlp_scans_oversized_response_head():
     finally:
         P.inject_security_headers = orig
     assert not calls, "oversized-head branch was not taken"
-    assert _LEAK not in out
-    assert sh.metrics().get("dlp_leak", 0) >= 1
+    assert out == b"", out[-100:]
+    assert sh.metrics().get("dlp_unscannable", 0) == 1
 
 
 # ── #60: 1xx 中間応答 ─────────────────────────────────────────────────────
@@ -421,6 +539,63 @@ def test_c60_interim_103_does_not_skip_final_head_processing():
     assert head2.startswith(b"HTTP/1.1 302"), out
     assert b"elsewhere.example" not in head2, out       # 外部リダイレクトは無害化
     assert b"SameSite=" in head2 and b"nosniff" in head2, out
+
+
+def test_duplicate_response_singletons_are_hardened_on_the_wire():
+    """Every Location is checked, and conflicting CORS values cannot retain credentials."""
+    head = (b"HTTP/1.1 302 Found\r\nLocation: /safe\r\n"
+            b"Location: https://evil.example/phish\r\n"
+            b"Access-Control-Allow-Origin: *\r\n"
+            b"Access-Control-Allow-Origin: https://app.example\r\n"
+            b"Access-Control-Allow-Credentials: true\r\nContent-Length: 0\r\n\r\n")
+    _, response, _ = _through([b"GET / HTTP/1.1\r\nHost: app.example\r\n\r\n"],
+                              backend_resp=head, open_redirect_enabled=True,
+                              open_redirect_mode="enforce", open_redirect_allow=[],
+                              cors_harden_enabled=True)
+    assert response.count(b"Location: /") == 2 and b"evil.example" not in response
+    assert b"Access-Control-Allow-Credentials" not in response
+
+    benign = (b"HTTP/1.1 302 Found\r\nLocation: /safe\r\n"
+              b"Access-Control-Allow-Origin: https://app.example\r\n"
+              b"Access-Control-Allow-Credentials: true\r\nContent-Length: 0\r\n\r\n")
+    _, response, _ = _through([b"GET / HTTP/1.1\r\nHost: app.example\r\n\r\n"],
+                              backend_resp=benign, open_redirect_enabled=True,
+                              open_redirect_mode="enforce", open_redirect_allow=[],
+                              cors_harden_enabled=True)
+    assert b"Location: /safe" in response
+    assert b"Access-Control-Allow-Credentials: true" in response
+
+    subdomain = (b"HTTP/1.1 302 Found\r\n"
+                 b"Location: https://evil.app.example.com/phish\r\n"
+                 b"Content-Length: 0\r\n\r\n")
+    _, response, _ = _through([b"GET / HTTP/1.1\r\nHost: app.example.com\r\n\r\n"],
+                              backend_resp=subdomain, open_redirect_enabled=True,
+                              open_redirect_mode="enforce", open_redirect_allow=[])
+    assert b"evil.app.example.com" not in response and b"Location: /" in response
+
+
+def test_split_oversized_response_head_never_skips_hardening():
+    """A padded HTTP head must not switch default response checks to raw pass-through."""
+    tail = (b"\r\nAccess-Control-Allow-Origin: *\r\n"
+            b"Access-Control-Allow-Credentials: true\r\nContent-Length: 2\r\n\r\nok")
+    padded = b"HTTP/1.1 200 OK\r\nX-Pad: " + b"A" * 140000
+    out, _ = _run_pipe([padded, tail], cors_harden_enabled=True)
+    assert out == b"", out[-160:]
+    out, _ = _run_pipe([padded + tail], cors_harden_enabled=True)
+    assert out == b"", out[-160:]
+    out, sh = _run_pipe([padded, tail], dlp_enabled=True, dlp_action="audit",
+                        cors_harden_enabled=False, cookie_harden_enabled=False,
+                        sec_headers_enabled=False, open_redirect_enabled=False)
+    assert out == b""  # HTTP head admission is mandatory, including DLP audit.
+    assert sh.metrics().get("dlp_unscannable", 0) == 1
+    _, network_out, _ = _through([b"GET / HTTP/1.1\r\nHost: app.example\r\n\r\n"],
+                                 backend_resp=padded + tail, cors_harden_enabled=True)
+    assert network_out == b"", network_out[-160:]
+
+    normal = b"HTTP/1.1 200 OK\r\nX-Pad: fine" + tail
+    out, _ = _run_pipe([normal[:30], normal[30:]], cors_harden_enabled=True)
+    assert b"Access-Control-Allow-Credentials: true" not in out
+    assert out.endswith(b"\r\n\r\nok")
 
 
 # ── #61: Location の正規化 ────────────────────────────────────────────────

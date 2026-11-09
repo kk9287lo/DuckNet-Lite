@@ -11,6 +11,7 @@ import threading
 import time
 
 from dataplane.engine.services.proxy import AsyncEdgeGuard, _force_conn_close
+from guard_support import stop_guard_owned
 
 
 def test_rewrites_keepalive_to_close():
@@ -97,7 +98,7 @@ def test_close_is_forwarded_to_backend_end_to_end():
         low = got[0].lower()
         assert b"connection: close" in low and b"keep-alive" not in low   # 検査回避を封じた
     finally:
-        guard.stop()
+        stop_guard_owned(guard)
 
 
 def _greedy_backend():
@@ -158,7 +159,7 @@ def _send_through(sends):
             time.sleep(0.02)
         return got[0] if got else b""
     finally:
-        guard.stop()
+        stop_guard_owned(guard)
 
 
 def test_pipelined_second_request_does_not_reach_backend():
@@ -171,7 +172,7 @@ def test_pipelined_second_request_does_not_reach_backend():
 
 
 def test_dribbled_second_request_does_not_reach_backend():
-    # 2本目を別パケットで遅延送信しても封じる(write_eof で client→backend を流さない)。
+    # 2本目を別パケットで遅延送信しても封じる(client→backend パイプを張らない)。
     saw = _send_through([b"GET /benign HTTP/1.1\r\nHost: x\r\n\r\n",
                          b"GET /admin-secret HTTP/1.1\r\nHost: x\r\n\r\n"])
     assert b"/benign" in saw

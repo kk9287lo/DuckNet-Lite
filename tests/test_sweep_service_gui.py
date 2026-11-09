@@ -12,7 +12,15 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 from unittest import SkipTest
+
+
+def _empty_env_path(directory):
+    path = os.path.join(directory, "none.env")
+    with open(path, "w", encoding="utf-8"):
+        pass
+    return path
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 WIN = sys.platform.startswith("win")
@@ -119,7 +127,7 @@ def test_c22_abbreviated_autostart_flags_are_stripped():
              ["--install-autos=runkey", "--autostart-n", "Svc", "--backend", "127.0.0.1:9000"],
              ["--ins", "--autostart-name=Svc", "--backend", "127.0.0.1:9000"])
     with tempfile.TemporaryDirectory() as d, \
-            _env(DUCKNET_ENV_FILE=os.path.join(d, "none.env")), \
+            _env(DUCKNET_ENV_FILE=_empty_env_path(d)), \
             _patched(A, install=lambda args, **kw: (seen.append(list(args)), {"ok": True})[1]), \
             open(os.devnull, "w") as devnull, contextlib.redirect_stdout(devnull):
         for argv in cases:
@@ -318,14 +326,42 @@ def test_c64_quit_stops_spawned_gateway_gracefully():
     fd, marker = tempfile.mkstemp(prefix="sweep-flush-")
     os.close(fd)
     os.unlink(marker)
-    code = ("import sys;sys.path.insert(0,sys.argv[1]);"
-            "from dataplane.service import _block_until_shutdown;"
-            "_block_until_shutdown(lambda: open(sys.argv[2],'w').write('flushed'))")
+    fd, ready = tempfile.mkstemp(prefix="sweep-stop-ready-")
+    os.close(fd)
+    os.unlink(ready)
+    code = "\n".join((
+        "import sys",
+        "sys.path.insert(0, sys.argv[1])",
+        "open(sys.argv[3], 'w').write('spawned')",
+        "import dataplane.service as service",
+        "open(sys.argv[3], 'w').write('imported')",
+        "original = service._watch_stdin_stop",
+        "def marked_watch(event):",
+        "    installed = original(event)",
+        "    if installed:",
+        "        open(sys.argv[3], 'w').write('ready')",
+        "    return installed",
+        "service._watch_stdin_stop = marked_watch",
+        "service._block_until_shutdown(lambda: open(sys.argv[2], 'w').write('flushed'))",
+    ))
     kw = dict(kw)
     kw["stdout"] = subprocess.DEVNULL
-    kw["stderr"] = subprocess.DEVNULL
-    child = subprocess.Popen([sys.executable, "-c", code, ROOT, marker], **kw)
+    kw["stderr"] = subprocess.PIPE
+    child = subprocess.Popen([sys.executable, "-c", code, ROOT, marker, ready], **kw)
     try:
+        def ready_stage():
+            if not os.path.exists(ready):
+                return "missing"
+            with open(ready, encoding="ascii") as observed:
+                return observed.read()
+
+        deadline = time.monotonic() + 30
+        while ready_stage() != "ready" and child.poll() is None and time.monotonic() < deadline:
+            time.sleep(0.05)
+        if ready_stage() != "ready":
+            detail = (child.stderr.read().decode("utf-8", "replace")[-500:]
+                      if child.poll() is not None else "still running")
+            raise AssertionError(f"子の停止受け口が起動していない: stage={ready_stage()} {detail}")
         G._stop_child(child)
         assert child.poll() is not None
         assert os.path.exists(marker), "停止処理(flush 等)が走らないまま終了した"
@@ -334,8 +370,11 @@ def test_c64_quit_stops_spawned_gateway_gracefully():
         assert child.returncode == 0, child.returncode
     finally:
         _kill(child)
+        child.stderr.close()
         if os.path.exists(marker):
             os.unlink(marker)
+        if os.path.exists(ready):
+            os.unlink(ready)
 
 
 def test_c64_stdin_stop_is_opt_in():
@@ -452,12 +491,14 @@ def test_c66_run_ps1_strips_quotes_like_load_env_file():
 def test_c81_tray_spawns_gateway_on_the_probed_admin_host():
     """DUCKNET_ADMIN_URL が http://[::1]:PORT のとき、到達確認は ::1 に行うのに本体へは
     --admin-host 127.0.0.1 を渡しており、起動した本体を永遠に見つけられなかった。
-    ループバック以外のアドレスは従来どおり 127.0.0.1(管理画面を勝手に外へ出さない)。"""
+    ループバック以外/HTTPS へ別の plain HTTP 子を誤って起動しない。"""
     G = _tray_main()
     fake = _FakeSubprocess()
     with _patched(G, subprocess=fake, _gateway_up=lambda h, p, timeout=0.5: False):
         G._ensure_gateway("http://[::1]:18081", "tok")
+        G._ensure_gateway("http://127.0.0.1:18081", "tok")
         G._ensure_gateway("http://192.0.2.10:18081", "tok")
+        G._ensure_gateway("https://127.0.0.1:18081", "tok")
     hosts = [c[c.index("--admin-host") + 1] for c, _kw in fake.calls]
     assert hosts == ["::1", "127.0.0.1"], hosts
 
@@ -490,4 +531,5 @@ def test_c94_tray_reads_admin_url_and_cover_after_app_env():
                 open(os.devnull, "w") as devnull, contextlib.redirect_stderr(devnull):
             G.main([])
     assert seen.get("url") == "http://127.0.0.1:18099", seen
-    assert seen.get("brand") == "Disk Indexer", seen
+    assert seen.get("brand", "").startswith("Disk Indexer — "), seen
+    assert "状態を確認できません" in seen["brand"], seen

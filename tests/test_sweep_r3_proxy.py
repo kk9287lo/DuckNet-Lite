@@ -14,6 +14,7 @@ import time
 import dataplane.engine.lifeform.pipeline as ND
 import dataplane.engine.lifeform.policy as FW
 from dataplane.engine.services.proxy import AsyncEdgeGuard
+from guard_support import stop_guard_owned
 
 
 # ── 共通ヘルパ ──────────────────────────────────────────────────────────────
@@ -121,7 +122,7 @@ def _proxy_once(req: bytes):
                 resp = _exchange(g.listen_port, req)
                 assert _wait(lambda: sh.usage_log(limit=5), 3.0), "使用量が記録されない"
             finally:
-                g.stop()
+                stop_guard_owned(g)
             return resp, sh.usage_list()["rows"], sh.usage_log(limit=5)
     finally:
         be.close()

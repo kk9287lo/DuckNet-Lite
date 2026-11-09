@@ -17,6 +17,13 @@ import tempfile
 import xml.etree.ElementTree as ET
 from unittest import SkipTest
 
+
+def _empty_env_path(directory):
+    path = os.path.join(directory, "none.env")
+    with open(path, "w", encoding="utf-8"):
+        pass
+    return path
+
 WIN = sys.platform.startswith("win")
 # python.org の既定(ユーザー単位)インストールと、その site-packages へ pip install した配置
 PER_USER_PY = r"C:\Users\Taro\AppData\Local\Programs\Python\Python312\python.exe"
@@ -270,7 +277,7 @@ def test_rv0_install_autostart_cli_succeeds_for_long_command_line():
              "--health-path", "/healthz"]
     argv = ["--install-autostart"] + serve + ["--autostart-name", "DuckNetSweepRv"]
     with tempfile.TemporaryDirectory() as d, \
-            _env(DUCKNET_ENV_FILE=os.path.join(d, "none.env"), DUCKNET_LANG="en"), \
+            _env(DUCKNET_ENV_FILE=_empty_env_path(d), DUCKNET_LANG="en"), \
             _patched(A, python_exe=lambda: PER_USER_PY,
                      install_windows_task=functools.partial(A.install_windows_task, run=fake),
                      install_windows_runkey=_no_real_schtasks), \

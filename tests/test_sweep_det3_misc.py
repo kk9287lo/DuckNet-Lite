@@ -46,12 +46,13 @@ def test_t3_open_redirect_safe_path_rejects_control_chars():
     """Location に書く値に改行などの制御文字を受け付けていた。"""
     with tempfile.TemporaryDirectory() as d:
         sh = _shield(d)
-        for bad in tuple(s.replace("X-Edge", "/home") for s in _BAD_CTRL) + ("/a b",):
+        for bad in tuple(s.replace("X-Edge", "/home") for s in _BAD_CTRL) + (
+                "/a b", "https://www.example.com/", "//evil.example/", r"/\evil.example"):
             r = sh.set_config(open_redirect_safe_path=bad)
             assert r["ok"] is False and r.get("rejected") == ["open_redirect_safe_path"], (
                 bad, r["changed"])
             assert sh.cfg["open_redirect_safe_path"] == "/", bad
-        for good in ("/home", "/login?next=%2F", "/a b", "https://www.example.com/"):
+        for good in ("/home", "/login?next=%2F", "/a b"):
             r = sh.set_config(open_redirect_safe_path=good)
             assert r["changed"] == {"open_redirect_safe_path": good}, (good, r.get("rejected"))
 

@@ -7,10 +7,17 @@ test_origin.py — バックエンド・バイパス防止(オリジントーク
 import os
 import socket
 import threading
+import tempfile
 import time
+from unittest.mock import patch
 
+import dataplane.engine.lifeform.pipeline as pipeline
+import dataplane.engine.lifeform.policy as policy
 from dataplane.engine.core.origin import origin_token, verify_origin_token
+from dataplane.engine.lifeform.pipeline import NetShield
+from dataplane.engine.lifeform.policy import AppFirewall
 from dataplane.engine.services.proxy import _set_request_header, AsyncEdgeGuard
+from guard_support import stop_guard_owned
 
 
 def test_token_roundtrip():
@@ -66,39 +73,38 @@ def _capture_backend():
 
 
 def test_origin_token_injected_end_to_end():
-    from dataplane.engine.lifeform.pipeline import net_shield
-    sh = net_shield()
-    saved = {k: sh.cfg.get(k) for k in ("origin_cloaking_enabled", "origin_header")}
-    os.environ["DUCKNET_ORIGIN_KEY"] = "shared-edge-key"
-    sh.cfg["origin_cloaking_enabled"] = True
-    sh.cfg["origin_header"] = "X-Edge-Token"
-    try:
-        got, bport = _capture_backend()
-        g = AsyncEdgeGuard(backend_host="127.0.0.1", backend_port=bport, listen_port=0)
-        g.start()
-        try:
-            c = socket.create_connection(("127.0.0.1", g.listen_port), timeout=5)
-            # 攻撃者が偽トークンを付けても差し替えられる
-            c.sendall(b"GET / HTTP/1.1\r\nHost: x\r\nX-Edge-Token: FORGED\r\n\r\n")
+    with tempfile.TemporaryDirectory(prefix="origin-wire-",
+                                     dir=os.environ["DUCKNET_STATE_DIR"]) as state:
+        sh = NetShield(state_dir=state)
+        fw = AppFirewall(state_dir=state)
+        assert sh.set_config(enabled=True, origin_cloaking_enabled=True,
+                             origin_header="X-Edge-Token")["ok"]
+        assert fw.disable()["ok"]
+        with patch.dict(os.environ, {"DUCKNET_ORIGIN_KEY": "shared-edge-key"}), \
+                patch.object(pipeline, "_SHIELD", sh), patch.object(policy, "_FW", fw):
+            got, bport = _capture_backend()
+            g = AsyncEdgeGuard(backend_host="127.0.0.1", backend_port=bport, listen_port=0)
+            assert g.start().get("ok") is True
             try:
-                c.recv(1024)
-            except Exception:
-                pass
-            c.close()
-            for _ in range(50):
-                if got:
-                    break
-                time.sleep(0.02)
-            assert got, "backend received nothing"
-            req = got[0]
-            assert b"FORGED" not in req                                 # 偽装は除去
-            # backend が受け取ったトークンは正規鍵で検証できる(=エッジ経由の証明)
-            line = [l for l in req.split(b"\r\n") if l.lower().startswith(b"x-edge-token:")]
-            assert line, "no edge token injected"
-            tok = line[0].split(b":", 1)[1].strip().decode()
-            assert verify_origin_token(tok, "shared-edge-key")
-        finally:
-            g.stop()
-    finally:
-        sh.cfg.update(saved)
-        os.environ.pop("DUCKNET_ORIGIN_KEY", None)
+                c = socket.create_connection(("127.0.0.1", g.listen_port), timeout=5)
+                # 攻撃者が偽トークンを付けても差し替えられる
+                c.sendall(b"GET / HTTP/1.1\r\nHost: x\r\nX-Edge-Token: FORGED\r\n\r\n")
+                try:
+                    c.recv(1024)
+                except Exception:
+                    pass
+                c.close()
+                for _ in range(50):
+                    if got:
+                        break
+                    time.sleep(0.02)
+                assert got, "backend received nothing"
+                req = got[0]
+                assert b"FORGED" not in req                                 # 偽装は除去
+                # backend が受け取ったトークンは正規鍵で検証できる(=エッジ経由の証明)
+                line = [l for l in req.split(b"\r\n") if l.lower().startswith(b"x-edge-token:")]
+                assert line, "no edge token injected"
+                tok = line[0].split(b":", 1)[1].strip().decode()
+                assert verify_origin_token(tok, "shared-edge-key")
+            finally:
+                stop_guard_owned(g)

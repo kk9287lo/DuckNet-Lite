@@ -9,13 +9,26 @@ Web サーバの前に置く L7 の WAF / DDoS ゲートウェイです。外部
 ## まず動かす
 
 ```bash
-python -m dataplane --backend 127.0.0.1:8080 --listen 8443 --admin 8081
-#   前衛 0.0.0.0:8443 → バックエンドへ転送。管理画面 http://127.0.0.1:8081(トークンは起動時に表示)
+python -m dataplane --backend 127.0.0.1:8080 --listen 8443 --host 127.0.0.1 --admin 8081
+#   前衛 http://127.0.0.1:8443 → バックエンドへ転送。管理画面 http://127.0.0.1:8081/ を開き、起動時の管理トークンを入力
 
-docker compose up -d      # Docker で動かすなら
+docker compose up -d      # Docker のネットワーク制約は下記を確認
 ```
 
-Python 3.10 以上なら `pip install` は要りません。起動ラッパ(`run.sh` / `run.bat` / `run.ps1`)も同梱していて、Python の自動検出や `app.env` の読み込みをやってくれます。
+Python 3.10 以上なら `pip install` は要りません。起動ラッパ(`run.sh` / `run.bat` / `run.ps1`)も同梱していて、Python の自動検出や `app.env` の読み込みをやってくれます。`DUCKNET_ENV_FILE` で明示したファイルが存在しない場合、または `app.env` が読めない、不正なUTF-8やNULを含む、1 MiBを超える場合は、状態保存先・署名鍵などを一部だけ読み替えず、起動を拒否します。既定の `app.env` を置かない構成は引き続き起動できます。
+
+状態の新しい既定保存先は `~/.cache/ducknet-lite` です。旧版の `~/.cache/dataplane` は FalcoNet と同じ場所・署名鍵・ファイル名を使い得るため、そこに署名状態や DuckNet の監査記録が残る間は、毎回の起動前に `DUCKNET_STATE_DIR` で保存先を明示してください。旧ファイルは自動移動・削除しません。所有元が確認できない状態を新しい空の保存先へ推測でコピーしたり、両製品に同じ保存先を指定したりしないでください。
+同じ状態保存先を2つの DuckNet-Lite 本体で同時に使用する起動は拒否します。通常の単一起動でも外部の署名付き設定・BAN更新を検証し、クォータ・使用量の古い保存が新しい署名履歴を上書きする場合は拒否します。
+
+本文を持つ要求は、宣言された `Content-Length` または chunked の終端・trailer を全て受信・検証してから backend へ接続します。本文の wire 上限は1要求64MiB、進行中の全要求合計256MiB、受信とbackendへの転送はそれぞれ最大300秒です。超過は413、合計容量を確保できない場合は503で拒否します。大容量・対話型アップロードは全量受信後に転送されるため、遅延が増え、64MiB超は受け付けません。POSIXでは私有の状態ディレクトリへ一時退避し、Windowsではメモリに保持します。本文末尾の構文異常による先行バイトのbackend到達を防ぎます。転送途中でbackendが確定した処理を取り消すには、backend自身が全量受信後に確定する設計が必要です。
+
+Docker イメージにはローカルの `app.env` や鍵を含めません。コンテナで使う秘密は起動時の環境変数やマウントで渡してください。Compose の `/data` ボリュームは ACL・BAN・署名鍵を再作成後も保持します。
+前衛の `8443` は HTTPS ではなく平文 HTTP です。Compose の既定公開先は `127.0.0.1:8443` に限定しています。外部へ出す場合は同じホストの TLS 終端プロキシからこのポートへ転送するか、信頼できる非公開ネットワーク内だけで接続してください。バックエンドのポートも DuckNet を迂回して外部から直接到達できないようにします。
+Docker Desktop のブリッジでは、ホストの `127.0.0.1` から公開ポートへ接続しても、コンテナ側にはブリッジのゲートウェイIPとして届く場合があります。既定ACLの private=prompt はこれを保留するため、コンテナが `healthy` でも通常のbackend転送ができる証拠にはなりません。同じComposeネットワークの別コンテナも `host.docker.internal` 経由で同じゲートウェイIPとして届くことを確認しており、ゲートウェイIPの一括許可や未認証の転送ヘッダ信頼は安全な解決ではありません。Docker Desktopでこの経路を使う前に接続元と認証の設計を確定してください。ホストのlocalhostで使う場合は上の直接起動が接続元を保持します。
+Docker・systemd等の非対話運用では、管理用の `DUCKNET_ADMIN_TOKEN` を起動環境へ設定してください。
+設定済みトークンと非対話で自動生成した値は起動ログへ出しません。自動生成値を表示するのは対話端末だけです。
+Composeでは `docker-compose.yml` のサービスの `environment` に、この変数を明示して渡してください。
+ホストのシェルへ設定するだけでは、コンテナの環境へ自動転送されません。
 
 ## 何をするか
 
@@ -30,7 +43,7 @@ Python 3.10 以上なら `pip install` は要りません。起動ラッパ(`run
 - BAN や設定は HMAC 署名で保存するので、状態ファイルを書き換えられても弾けます。
 - 管理画面で ON/OFF・グラフ・BAN・設定をクリック操作。
 
-防御と設定キーの一覧は [docs/defenses.md](docs/defenses.md)、画面の使い方は [docs/dashboard.md](docs/dashboard.md)、全オプションは [docs/options.md](docs/options.md)。変更履歴は [CHANGELOG.md](CHANGELOG.md)。高度な防御はたいてい既定 OFF で、必要なときだけ点けます。
+防御と設定キーの一覧は [docs/defenses.md](docs/defenses.md)、画面の使い方は [docs/dashboard.md](docs/dashboard.md)、全オプションは [docs/options.md](docs/options.md)。変更履歴は [CHANGELOG.md](CHANGELOG.md)。基本のシールドとアプリ層ファイアウォールは状態欠落時も ON、高度な任意防御はたいてい既定 OFF です。署名済み設定で明示した OFF は維持されます。
 
 ## フル版との違い
 
@@ -57,7 +70,11 @@ export DUCKNET_STATE_KEY=...   # 署名鍵を外に置くと改竄耐性が一�
 - 守るのは L7。サーバが受け取った HTTP 要求を検査して弾きます。
 - L3/L4 の物量攻撃(UDP/SYN flood など)は守れません。そこは Anycast やクラウドの DDoS 保護、ISP の領分です。
 - 反撃はしません。OS のファイアウォールにも触れません。
-- 全コアを使うなら Linux で `--cluster`(SO_REUSEPORT)。Windows などは単一プロセスになります。
+- `--cluster` は Linux/macOS の `SO_REUSEPORT` 対応時だけ複数ワーカーを検討します。既定の Shield・ACL・全体接続上限はプロセス間で共有しないため、既定設定では理由を示して単一ワーカーで起動します。複数ワーカーになるのは両防御と接続上限を明示的に無効にした場合だけで、集計テレメトリはワーカー間で未統合です。管理APIの防御変更は子ワーカーを停止・回収してから適用します。
+
+情報流出対策の設定例・PHP本体の更新・非公開ストレージの適用物は
+[privacy-protection.md](docs/privacy-protection.md) を参照してください。
+非公開経路の認可とキャッシュ禁止は、任意データ全般の内容検知に頼らず適用します。
 
 ## ライセンス
 

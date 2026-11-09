@@ -16,7 +16,7 @@ import threading
 
 if __name__ == "__main__":
     # 単体で走らせたとき(python tests/test_sweep_r2_ipsource.py)も run_all.py と同じく、製品の import
-    # より前に状態dirを使い捨ての一時dirへ向ける(利用者の ~/.cache/dataplane に触れない。Full と同じ形)。
+    # より前に状態dirを使い捨ての一時dirへ向ける(利用者の旧共用・現専用の保存先に触れない)。
     import atexit
     import os
     import shutil
@@ -28,12 +28,12 @@ if __name__ == "__main__":
 import dataplane.engine.lifeform.pipeline as ND
 import dataplane.engine.lifeform.policy as FW
 from dataplane.engine.services.proxy import AsyncEdgeGuard, _real_client_ip
+from guard_support import stop_guard_owned
 
 
 # ── 共通ヘルパ ──────────────────────────────────────────────────────────────
 def _tmpdir():
-    # Windows ではワーカースレッドが閉じかけのログを掴んでいることがある=掃除失敗は無視
-    return tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+    return tempfile.TemporaryDirectory()
 
 
 @contextlib.contextmanager
@@ -116,7 +116,7 @@ def _guard(backend):
     try:
         yield g
     finally:
-        g.stop()
+        stop_guard_owned(g)
 
 
 def _exchange(g, req: bytes, timeout=5.0) -> bytes:
@@ -172,11 +172,16 @@ def test_r2_xff_scope_id_not_used_as_client_key():
     be = _Backend()
     try:
         with _shield(trusted_proxies=list(_TRUSTED)) as sh, _guard(be) as g:
+            # 状態欠落時の ACL は既定 ON。解決済み IP だけを通して、
+            # ゾーンID除去と backend 転送の検証を実行する。
+            assert FW._FW.add_rule("fe80::1/128", "allow")["ok"]
             _exchange(g, _xff_req("/r2-scope", scoped))
             keys = list(sh._ips)
+        assert "fe80::1" in keys, keys
         assert not any("%" in k for k in keys), keys
         saw = be.saw()
         assert b"/r2-scope" in saw                 # 要求自体は通る(誤遮断しない)
+        assert b"x-forwarded-for: fe80::1" in saw.lower(), saw
         assert b"a'b" not in saw and b"%" not in saw, saw
     finally:
         be.close()
@@ -198,6 +203,10 @@ def test_r2_ban_applies_to_noncanonical_trusted_xff():
     be = _Backend()
     try:
         with _shield(trusted_proxies=list(_TRUSTED)) as sh, _guard(be) as g:
+            # BAN 側も ACL では許可する。遮断されたなら NetShield の
+            # 正規化済み BAN によるものと判定できるようにする。
+            assert FW._FW.add_rule("2001:db8::1/128", "allow")["ok"]
+            assert FW._FW.add_rule("2001:db8::2/128", "allow")["ok"]
             assert sh.ban("2001:db8::1", ttl_sec=600)["ok"]
             _exchange(g, _xff_req("/r2-banned", "2001:DB8::1"))
             _exchange(g, _xff_req("/r2-banned-mapped", "2001:db8:0:0:0:0:0:1"))
@@ -205,6 +214,7 @@ def test_r2_ban_applies_to_noncanonical_trusted_xff():
         saw = be.saw()
         assert b"/r2-banned" not in saw, "BAN 済みクライアントが別表記の XFF で通過した"
         assert b"/r2-other" in saw
+        assert len(be.got) == 1, be.got
     finally:
         be.close()
 

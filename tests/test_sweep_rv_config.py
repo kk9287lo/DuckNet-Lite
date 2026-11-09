@@ -235,12 +235,12 @@ def test_rv18_every_config_warning_has_english_message():
         assert "geo_cidrs" not in en, en                # 許可リストが空でなければ全遮断の注記は無い
 
 
-# ── #19: 削除された署名付き状態ファイルの警報は削除 1 回につき 1 回 ─────────
+# ── #19: 署名履歴のある欠損は復元まで毎回警報・転送拒否 ───────────────
 def _tamper_count(sh):
     return sh._tamper["by_kind"].get("state_tamper", 0)
 
 
-def test_rv19_deleted_state_json_alarms_once_and_stays_fail_closed():
+def test_rv19_deleted_state_json_alarms_until_restored_and_stays_fail_closed():
     with tempfile.TemporaryDirectory() as d:
         sh = _shield(d)
         assert sh.set_config(rate_per_sec=33.0)["ok"] is True
@@ -248,16 +248,15 @@ def test_rv19_deleted_state_json_alarms_once_and_stays_fail_closed():
         sh2 = _shield(d)
         assert _tamper_count(sh2) == 1 and sh2.cfg["enabled"] is True
         assert _events(sh2, "cfg_fail_closed")
+        assert sh2._cfg_state_untrusted and not os.path.exists(sh2.path)
         sh3 = _shield(d)
-        assert _tamper_count(sh3) == 0, sh3.events(50)
-        assert not _events(sh3, "cfg_fail_closed")
-        assert sh3.cfg["enabled"] is True
-        os.remove(sh3.path)
-        sh4 = _shield(d)
-        assert _tamper_count(sh4) == 1 and sh4.cfg["enabled"] is True
+        assert _tamper_count(sh3) == 1 and _events(sh3, "cfg_fail_closed")
+        assert sh3._cfg_state_untrusted and sh3.cfg["enabled"] is True
+        assert sh3.inspect("192.0.2.8", path="/public")["action"] == "block"
+        assert not os.path.exists(sh3.path)
 
 
-def test_rv19_deleted_rules_and_bans_alarm_once():
+def test_rv19_deleted_rules_and_bans_alarm_until_restored():
     with tempfile.TemporaryDirectory() as d:
         sh = _shield(d)
         sh.enable()
@@ -269,7 +268,12 @@ def test_rv19_deleted_rules_and_bans_alarm_once():
         files = sorted(e.get("file") for e in _events(sh2, "state_tamper"))
         assert files == ["blocklist.json", "rules.json"], sh2.events(50)
         sh3 = _shield(d)
-        assert _tamper_count(sh3) == 0, sh3.events(50)
+        files = sorted(e.get("file") for e in _events(sh3, "state_tamper"))
+        assert files == ["blocklist.json", "rules.json"], sh3.events(50)
+        assert sh3._sig_state_untrusted and sh3._ban_state_untrusted
+        assert sh3.inspect("192.0.2.8", path="/public")["action"] == "block"
+        assert not os.path.exists(os.path.join(d, "rules.json"))
+        assert not os.path.exists(os.path.join(d, "blocklist.json"))
 
 
 def test_rv19_tampered_file_that_still_exists_keeps_alarming():

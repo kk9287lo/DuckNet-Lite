@@ -32,6 +32,16 @@ def test_static_origin_with_credentials_untouched():
     assert _neutralize_cors(lines) == lines
 
 
+def test_duplicate_or_joined_origin_never_keeps_credentials():
+    for origins in (("Access-Control-Allow-Origin: *",
+                     "Access-Control-Allow-Origin: https://app.example.com"),
+                    ("Access-Control-Allow-Origin: *, https://app.example.com",),
+                    ("Access-Control-Allow-Origin: https://a.example",
+                     "Access-Control-Allow-Origin: https://b.example")):
+        out = _neutralize_cors([*origins, "Access-Control-Allow-Credentials: true"])
+        assert not any("allow-credentials" in line.lower() for line in out), origins
+
+
 def test_wildcard_without_credentials_untouched():
     lines = _lines("Access-Control-Allow-Origin: *", "Content-Type: application/json")
     assert _neutralize_cors(lines) == lines                         # credentials 無し=無害

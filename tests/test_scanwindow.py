@@ -8,6 +8,7 @@ WAF の「転送する量」と「検査する量」がずれると、そのず�
   · 展開で走査窓の予算を先頭チャンクに独占させ、後続チャンクを丸ごと未走査にする
 併せて、走査面の総量・チャレンジ nonce 表・BAN 永続化の間引きといった資源境界も確認する。
 """
+import statistics
 import tempfile
 import time
 
@@ -66,15 +67,17 @@ def test_window_count_is_bounded():
 
 
 def test_expansion_bomb_stays_affordable():
-    # 展開爆弾でイベントループを占有できないこと(全域走査を諦めず、展開自体を抑える)。
+    # 展開爆弾で CPU を占有できないこと(全域走査を諦めず、展開自体を抑える)。
+    # OS の deschedule を製品の正規化コストに数えず、同じ 0.30 秒/回の CPU 上限を測る。
     with tempfile.TemporaryDirectory() as d:
         sh = _shield(d)
         sh.inspect("198.51.100.1", path="/warm")          # 初回 import 等を計測から外す
         payload = BOMB * 8000
-        t = time.perf_counter()
-        for _ in range(5):
+        clock = getattr(time, "thread_time", time.process_time)
+        t = clock()
+        for _ in range(10):
             sh.inspect("198.51.100.2", path="/" + payload, query="x=" + payload)
-        per = (time.perf_counter() - t) / 5
+        per = (clock() - t) / 10
         assert per < 0.30, per
 
 
@@ -112,10 +115,19 @@ def test_signature_guard_cuts_cost_of_decoy_input():
         sh = _shield(d)
         blob = ("select from " * (_MAX_SCAN // 12))[:_MAX_SCAN]
         sh._scan_signatures(blob)                          # ウォームアップ
-        t = time.perf_counter()
-        for _ in range(5):
-            sh._scan_signatures(blob)
-        assert (time.perf_counter() - t) / 5 < 0.006
+        # This guard constrains regex CPU work, not time spent descheduled by
+        # unrelated system activity during the full suite.
+        clock = getattr(time, "thread_time", time.process_time)
+        # Windows thread_time has a coarse tick (observed 15.625 ms). Three
+        # 50-call samples retain the 6 ms/call CPU limit while one transient
+        # slowdown cannot determine the result. A stable regression fails.
+        samples = []
+        for _ in range(3):
+            t = clock()
+            for _ in range(50):
+                sh._scan_signatures(blob)
+            samples.append((clock() - t) / 50)
+        assert statistics.median(samples) < 0.006, samples
 
 
 def test_blind_boolean_sqli_detected():

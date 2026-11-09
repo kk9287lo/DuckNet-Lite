@@ -9,8 +9,15 @@ test_vulnfix.py — 脆弱性修正の回帰(CSRF・トークン配布・状態�
 """
 import os
 import tempfile
+import http.client
+import http.server
+import threading
+import urllib.error
+import urllib.request
 
 from dataplane.admin import AdminDashboard, _make_handler
+import dataplane.engine.lifeform.pipeline as ND
+import dataplane.engine.lifeform.policy as FW
 from dataplane.engine.core.signed_state import (
     _hw_path, _read_file_hw, _write_file_hw, persistent_key)
 
@@ -50,14 +57,70 @@ def test_origin_allowlist_still_honoured():
 
 
 def test_token_cookie_not_issued_through_a_reverse_proxy():
-    # 前段プロキシ越しだと peer が 127.0.0.1 に潰れる。ここで配ると誰でも管理者になれる。
-    cls = _handler_cls()
-    f = cls._may_set_token_cookie
-    assert f("127.0.0.1", False, "", "T0KEN", True) is False
-    assert f("127.0.0.1", False, "", "T0KEN", False) is True     # 直接の loopback は従来どおり
-    assert f("127.0.0.1", True, "", "T0KEN", True) is True       # 認証済みなら可
-    assert f("203.0.113.5", False, "T0KEN", "T0KEN", True) is True   # 正しい ?token 提示
-    assert f("203.0.113.5", False, "wrong", "T0KEN", False) is False
+    # 前段 proxy からは接続元が loopback に見える。旧 Cookie も X-Forwarded-For も
+    # 認証に使わず、生トークン Cookie を再発行しないことを実 HTTP で確かめる。
+    with tempfile.TemporaryDirectory() as state_dir:
+        old_shield, old_firewall = ND._SHIELD, FW._FW
+        ND._SHIELD = ND.NetShield(state_dir=state_dir)
+        FW._FW = FW.AppFirewall(state_dir=state_dir)
+        admin = AdminDashboard(host="127.0.0.1", port=0, token="T0KEN",
+                               state_dir=state_dir)
+        assert admin.start()["ok"]
+
+        class ReverseProxy(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def do_GET(self):
+                upstream = http.client.HTTPConnection("127.0.0.1", admin.port, timeout=3)
+                try:
+                    headers = {k: v for k, v in self.headers.items()
+                               if k.lower() not in ("host", "connection")}
+                    headers["Host"] = "127.0.0.1:%d" % admin.port
+                    headers["X-Forwarded-For"] = "203.0.113.9"
+                    upstream.request("GET", self.path, headers=headers)
+                    response = upstream.getresponse()
+                    body = response.read()
+                    self.send_response(response.status)
+                    for name, value in response.getheaders():
+                        if name.lower() not in ("connection", "transfer-encoding"):
+                            self.send_header(name, value)
+                    self.end_headers()
+                    self.wfile.write(body)
+                finally:
+                    upstream.close()
+
+        proxy = http.server.ThreadingHTTPServer(("127.0.0.1", 0), ReverseProxy)
+        worker = threading.Thread(target=proxy.serve_forever, daemon=True)
+        worker.start()
+        base = "http://127.0.0.1:%d" % proxy.server_port
+        try:
+            for path, headers in (("/", {}), ("/?token=wrong", {}),
+                                  ("/?token=T0KEN", {}),
+                                  ("/", {"X-Token": "T0KEN"})):
+                with urllib.request.urlopen(urllib.request.Request(base + path,
+                                                                  headers=headers)) as response:
+                    cookie = response.headers.get("Set-Cookie") or ""
+                    assert response.status == 200
+                    assert "ducknet_admin=;" in cookie and "Max-Age=0" in cookie
+                    assert "T0KEN" not in cookie
+            try:
+                urllib.request.urlopen(urllib.request.Request(
+                    base + "/api/state", headers={"Cookie": "ducknet_admin=T0KEN"}))
+            except urllib.error.HTTPError as error:
+                assert error.code == 401
+                error.close()
+            else:
+                raise AssertionError("old cookie authorized through the proxy")
+            with urllib.request.urlopen(urllib.request.Request(
+                    base + "/api/state", headers={"X-Token": "T0KEN"})) as response:
+                assert response.status == 200
+        finally:
+            proxy.shutdown()
+            proxy.server_close()
+            worker.join(3)
+            admin.stop()
+            ND._SHIELD, FW._FW = old_shield, old_firewall
 
 
 def test_hw_sidecar_is_bound_to_its_state_file():

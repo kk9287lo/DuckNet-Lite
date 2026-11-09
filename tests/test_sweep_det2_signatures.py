@@ -52,7 +52,7 @@ def test_t1_body_semicolon_detections_keep_existing_true_positives():
     """文脈を要求しても、既存テストにある真陽性(test_core の ;update … set / ;bash -c、
     test_logio・test_core の rce/crlf の代表例)は本文でも引き続き当たる。"""
     with tempfile.TemporaryDirectory() as d:
-        sh = _shield(d, block_score=10000)
+        sh = _shield(d, block_score=1000)
         for b, sig in ((b"id=1;update u set p=1", "sqli-stacked"),
                        (b"1;update users set p=1", "sqli-stacked"),
                        (b"x=1;bash -c id", "rce"),

@@ -2,7 +2,7 @@
 test_sweep_bans.py — BAN 管理まわりの回帰(掃討パス: bans グループ)。
 ====================================================================================
 · #7  既存の永続BAN/長期制限が、penalize 等の自動BAN(ban_ttl_sec)で短縮されない。
-· #8  _evict が永続BANを捨てず、BAN を間引く時は期限の近いものから捨てる。
+· #8  _evict が現役BANを捨てず、容量超過時は新規IPを拒否する。
 · #25 手動BANは IP を正規化して保存し、CIDR/ゾーンID付き/不正な文字列は拒否する。
 · #45 IP 白/黒リスト・BAN/解除は表記ゆれ(大文字/非圧縮 IPv6)でも同じIPとして照合する。
 · #48 間引かれた BAN 保存は、後続イベントが無くても間隔経過後に必ずディスクへ出る。
@@ -58,8 +58,16 @@ def test_c7_restricted_long_ban_not_shortened():
 def _flood_self_bans(sh, n):
     """攻撃者が使い捨て IPv6 で即BAN級の違反を重ね、自分の BAN で状態表を埋める
     (Lite には囮URLが無いので penalize の一撃加点で BAN させる)。"""
+    accepted, rejected = [], []
     for i in range(n):
-        sh.penalize(f"2001:db8:{i:x}::1", weight=1000)
+        ip = f"2001:db8:{i:x}::1"
+        result = sh.penalize(ip, weight=1000)
+        if result.get("banned"):
+            accepted.append(ip)
+        else:
+            assert result.get("ok") is False and result.get("action") == "block", result
+            rejected.append(ip)
+    return accepted, rejected
 
 
 def test_c8_evict_keeps_permanent_ban():
@@ -72,7 +80,10 @@ def test_c8_evict_keeps_permanent_ban():
             sh = _shield(d)
             v = "198.51.100.66"
             sh.ban(v, permanent=True)
-            _flood_self_bans(sh, 30)
+            accepted, rejected = _flood_self_bans(sh, 30)
+            assert accepted and rejected
+            assert all(sh.is_banned_fast(ip) for ip in accepted)
+            assert len(sh._ips) <= P._MAX_IPS
             assert sh.is_banned_fast(v)
             assert sh.inspect(v, path="/")["action"] == "block"
             assert v in {b["ip"] for b in NetShield(state_dir=d).bans()}
@@ -80,8 +91,8 @@ def test_c8_evict_keeps_permanent_ban():
         P._MAX_IPS = old
 
 
-def test_c8_evict_prefers_soonest_expiring_ban():
-    """長期制限(restrict 7日)は、後から来た 300s の使い捨てBANより先に捨てられてはならない。"""
+def test_c8_evict_preserves_all_active_temporary_bans():
+    """長期制限と使い捨てIPの現役BANを容量圧力で解除してはならない。"""
     old = P._MAX_IPS
     P._MAX_IPS = 12
     try:
@@ -89,7 +100,9 @@ def test_c8_evict_prefers_soonest_expiring_ban():
             sh = _shield(d)
             r = "198.51.100.77"
             sh.restrict(r, ttl_sec=7 * 86400)
-            _flood_self_bans(sh, 30)
+            accepted, rejected = _flood_self_bans(sh, 30)
+            assert accepted and rejected
+            assert all(sh.is_banned_fast(ip) for ip in accepted)
             assert sh.is_banned_fast(r)
             assert sh.ban_info(r)["remain_sec"] > 6 * 86400
             assert len(sh._ips) <= P._MAX_IPS                # 表の上限は保たれる
@@ -135,6 +148,7 @@ def test_c25_admin_ban_route_rejects_cidr_and_normalizes():
     """管理画面の手動BAN(/api/shield/ban)は CIDR も ok:true で受けて一覧に載せるだけで何も
     遮断せず、空白付き/大文字の IPv6 も素通りさせていた。"""
     import json
+    import urllib.error
     import urllib.request
     import dataplane.engine.lifeform.policy as FW
     from dataplane.admin import AdminDashboard
@@ -150,12 +164,18 @@ def test_c25_admin_ban_route_rejects_cidr_and_normalizes():
                 req = urllib.request.Request(
                     url + path, data=json.dumps(body).encode(), method="POST",
                     headers={"Content-Type": "application/json", "X-Token": adm.token})
-                with urllib.request.urlopen(req, timeout=5) as r:
-                    return json.loads(r.read())
+                try:
+                    response = urllib.request.urlopen(req, timeout=5)
+                except urllib.error.HTTPError as error:
+                    response = error
+                with response:
+                    return response.status, json.loads(response.read())
 
-            r = post("/api/shield/ban", {"ip": "203.0.113.0/24"})
+            status, r = post("/api/shield/ban", {"ip": "203.0.113.0/24"})
+            assert status == 400, (status, r)
             assert r.get("ok") is False and r.get("error"), r
-            r = post("/api/shield/ban", {"ip": " 2001:DB8::1 "})
+            status, r = post("/api/shield/ban", {"ip": " 2001:DB8::1 "})
+            assert status == 200, (status, r)
             assert r.get("ok") is True, r
             assert P._SHIELD.inspect("2001:db8::1", path="/")["action"] == "block"
             assert {b["ip"] for b in P._SHIELD.bans()} == {"2001:db8::1"}

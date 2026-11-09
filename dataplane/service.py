@@ -15,6 +15,7 @@ service.py — DuckNet-Lite スタンドアロン・サービス本体(CLI/起�
 from __future__ import annotations
 
 import argparse
+import math
 import os
 import sys
 
@@ -42,14 +43,27 @@ def _force_utf8_stdio() -> None:
             except Exception:
                 pass
 
-from dataplane.engine.services.proxy import AsyncEdgeGuard
+from dataplane.engine.services.proxy import AsyncEdgeGuard, _MAX_DRAIN_GRACE_SEC
 from dataplane.engine.lifeform.policy import app_firewall
 from dataplane.engine.lifeform.pipeline import net_shield
 from .admin import AdminDashboard
 
 
+def _bounded_drain_grace(value) -> float:
+    """Reject a shutdown wait that is negative, nonfinite or effectively endless."""
+    if isinstance(value, bool):
+        raise ValueError("drain grace must be a finite duration from 0 to 300 seconds")
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("drain grace must be a finite duration from 0 to 300 seconds") from exc
+    if not math.isfinite(seconds) or not 0 <= seconds <= _MAX_DRAIN_GRACE_SEC:
+        raise ValueError("drain grace must be a finite duration from 0 to 300 seconds")
+    return seconds
+
+
 def _env_float(name: str, default: float) -> float:
-    """env から float を読む。不正値は既定へフォールバックし警告する。
+    """env から有限の停止猶予を読む。不正値は既定へフォールバックし警告する。
     素の float(os.environ[...]) だと、綴り間違い 1 つでゲートウェイが起動時に生の
     ValueError で落ちる(--help すら出せない)。防御が上がらないのが最悪なので、
     設定ミスは警告して既定で動かす。"""
@@ -57,7 +71,7 @@ def _env_float(name: str, default: float) -> float:
     if not raw:
         return float(default)
     try:
-        return float(raw)
+        return _bounded_drain_grace(raw)
     except ValueError:
         print(f" [警告] {name}={raw!r} は数値として読めません。既定 {default} を使います。",
               file=sys.stderr)
@@ -75,11 +89,17 @@ def _split_hostport(spec: str, default_port: int):
         if end == -1:
             raise SystemExit(f"アドレスの形式が不正です: {spec!r}(例 [::1]:8080)")
         host, rest = s[1:end], s[end + 1:]
+        if not host or (rest and not rest.startswith(":")):
+            raise SystemExit("アドレスの括弧・区切りの形式が不正です")
         port = rest[1:] if rest.startswith(":") else ""
+        if rest.startswith(":") and not port:
+            raise SystemExit("バックエンドのポートが空です")
     elif s.count(":") > 1:                     # 裸の IPv6(ポート指定なし)
         host, port = s, ""
     else:
-        host, _, port = s.partition(":")
+        host, sep, port = s.partition(":")
+        if sep and (not host or not port):
+            raise SystemExit("バックエンドのホストまたはポートが空です")
     if not port:
         return (host or "127.0.0.1"), int(default_port)
     try:
@@ -100,7 +120,7 @@ def state_dir_writable(path: str = "") -> bool:
     from .engine.core.atomic_io import default_state_dir
     path = path or default_state_dir()
     try:
-        os.makedirs(path, exist_ok=True)
+        os.makedirs(path, mode=0o700, exist_ok=True)
         fd, tmp = tempfile.mkstemp(prefix=".probe.", dir=path)
         os.close(fd)
         os.unlink(tmp)
@@ -109,29 +129,64 @@ def state_dir_writable(path: str = "") -> bool:
         return False
 
 
+_ENV_FILE_MAX_BYTES = 1024 * 1024
+
+
+def _env_path_exists(path: str) -> bool:
+    """Only a genuinely absent app.env is optional; stat errors are not."""
+    try:
+        os.lstat(path)  # lstat also sees a broken symlink to an intended env file.
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        raise SystemExit(f"app.env を確認できません: {path}") from exc
+    return True
+
+
 def load_env_file(path: str = "") -> int:
     """app.env(KEY=VALUE)を環境変数へ *既定値として* 取り込む。返値=取り込んだ件数。
-    既に環境にある値は上書きしない(呼び出し時の指定が常に勝つ)。壊れた行は黙って
-    飛ばす: 設定ファイルの書き間違いでゲートウェイが起動しないのが最悪なので、
-    読めるところだけ読む。= の前後の空白、字下げしたコメント、CRLF、値を囲む
+    既に環境にある値は上書きしない(呼び出し時の指定が常に勝つ)。構文上壊れた行は
+    飛ばすが、UTF-8 の破損・NUL・1 MiB 超のファイルは環境変数を一つも適用せず起動を拒否する。
+    状態保存先・署名鍵・管理トークンの読み替わりを防ぐ。= の前後の空白、字下げしたコメント、CRLF、値を囲む
     引用符に対応する(シェル側の実装はここで躓いてランチャごと落ちていた)。"""
+    configured_env = not path and bool(os.environ.get("DUCKNET_ENV_FILE", ""))
     p = path or os.environ.get("DUCKNET_ENV_FILE", "")
+    discovered = False
     if not p:
         # ランチャは配置先へ cd してから起動するので CWD を先に見る。パッケージの親
         # (ソースツリー配置)も候補にして、どちらの置き方でも拾えるようにする。
         here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         for cand in (os.path.join(os.getcwd(), "app.env"), os.path.join(here, "app.env")):
-            if os.path.isfile(cand):
+            if _env_path_exists(cand):
                 p = cand
+                discovered = True
                 break
         else:
             return 0
-    n = 0
+    # A deliberately optional, absent path stays optional. Once a file has
+    # been observed, losing it (or failing to read it) must not silently load
+    # a different state directory or signing key.
+    was_present = discovered or _env_path_exists(p)
     try:
-        with open(p, encoding="utf-8", errors="replace") as f:
-            lines = f.readlines()
-    except OSError:
+        with open(p, "rb") as f:
+            raw = f.read(_ENV_FILE_MAX_BYTES + 1)
+    except FileNotFoundError as exc:
+        if configured_env or was_present or _env_path_exists(p):
+            raise SystemExit(f"app.env を読み込めません: {p}") from exc
         return 0
+    except OSError as exc:
+        raise SystemExit(f"app.env を読み込めません: {p}") from exc
+    if len(raw) > _ENV_FILE_MAX_BYTES:
+        raise SystemExit(f"app.env が大きすぎます (上限 {_ENV_FILE_MAX_BYTES} バイト): {p}")
+    import io
+    try:
+        # StringIO(newline=None) keeps text-mode universal newline parsing.
+        lines = io.StringIO(raw.decode("utf-8", "strict"), newline=None).readlines()
+    except UnicodeDecodeError as exc:
+        raise SystemExit(f"app.env は UTF-8 として読めません: {p}") from exc
+    if any("\x00" in raw for raw in lines):
+        raise SystemExit(f"app.env に NUL バイトがあります: {p}")
+    n = 0
     for raw in lines:
         line = raw.strip().lstrip("\ufeff")
         if not line or line.startswith("#") or "=" not in line:
@@ -198,26 +253,40 @@ def _watch_stdin_stop(ev) -> bool:
     return True
 
 
-def _block_until_shutdown(*stop_fns, _event=None) -> None:
+def _block_until_shutdown(*stop_fns, _event=None, _liveness=None) -> dict:
     """SIGTERM / SIGINT で graceful 停止するまでブロックし、停止時に `stop_fns` を順に呼ぶ。
     各 stop_fn は独立に try で囲む(片方が失敗してももう片方=状態 flush 等を必ず走らせる)。
     シグナルハンドラを張れなかった環境では KeyboardInterrupt を保険として拾う。
-    `_event` はテスト専用の差し込み口(本番は None=内部 Event にシグナルを配線する)。"""
+    `_event` はテスト専用の差し込み口(本番は None=内部 Event にシグナルを配線する)。
+    `_liveness` が異常を返したら停止処理を全て実行し、非ゼロ終了を呼び出し側へ伝える。"""
     import threading
     ev = _event if _event is not None else threading.Event()
     if _event is None:
         _install_shutdown_handlers(ev)
         _watch_stdin_stop(ev)                 # トレイが起動した子だけ(env で明示)
+    failure = ""
     try:
         while not ev.wait(1.0):   # タイムアウト付き待機=シグナル処理の機会を挟む(Win も即応)
-            pass
+            if _liveness is not None and not ev.is_set():
+                try:
+                    reason = _liveness()
+                except Exception as exc:
+                    reason = f"liveness check raised {type(exc).__name__}"
+                if reason:
+                    failure = "runtime liveness failure: " + str(reason)
+                    break
     except KeyboardInterrupt:
         pass
+    errors = [failure] if failure else []
     for fn in stop_fns:
         try:
-            fn()
-        except Exception:
-            pass
+            result = fn()
+            if result is False or (isinstance(result, dict) and result.get("ok") is not True):
+                errors.append(str(result.get("error") or "cleanup did not succeed")
+                              if isinstance(result, dict) else "cleanup did not succeed")
+        except Exception as exc:
+            errors.append(f"{type(exc).__name__}: {exc}")
+    return {"ok": not errors, "errors": errors}
 
 
 def _install_sighup(reload_fn) -> bool:
@@ -234,80 +303,173 @@ def _install_sighup(reload_fn) -> bool:
 
 
 def run(backend: str = "127.0.0.1:8080", listen: int = 8443,
-        admin_port: int = 8081, host: str = "0.0.0.0",
+        admin_port: int = 8081, host: str = "127.0.0.1",
         admin_host: str = "127.0.0.1", token: str = "",
         defaults_on: bool = True, cluster: bool = False,
         health_path: str = "", drain_grace: float = 5.0,
         config_path: str = "") -> None:
     import os as _os
-    bhost, bport = _split_hostport(backend, 80)
-
-    # 製品の既定は『防御ON』(売り物なので最初から守る)。設定は永続化される。
-    if defaults_on:
-        app_firewall().enable()
-        net_shield().enable()
-
-    # 宣言的設定ブートストラップ(env DUCKNET_CONFIG / --config): 運用者の JSON を起動時に適用。
-    # k8s ConfigMap 等の immutable infra 向け(永続 state より後＝宣言ファイルが権威)。
-    _cfg_path = config_path or _os.environ.get("DUCKNET_CONFIG", "")
-    if _cfg_path:
-        _res = net_shield().apply_config_file(_cfg_path)
-        if _res.get("ok"):
-            print(f" 宣言的設定         : {_cfg_path} 適用 → {', '.join(_res.get('applied') or []) or '(変更なし)'}")
-            # 拒否されたキーは『適用一覧に無い』ことでしか分からなかった(例: 空の site_whitelist
-            # での whitelist)。理由と一緒に明示する。
-            if _res.get("rejected"):
-                _why = "; ".join(str(e) for e in (_res.get("errors") or []))
-                print(f" 宣言的設定         : [警告] 拒否 → {', '.join(_res['rejected'])}"
-                      + (f"({_why})" if _why else ""))
-        else:
-            print(f" 宣言的設定         : [警告] {_res.get('error')}")
-    # 壊れてはいないが直すべき設定(旧版が保存した whitelist+空 など)。status の warnings と
-    # イベントにしか出ず、コンソールで起動した運用者には見えなかった。
     try:
-        for _w in net_shield().config_warnings():
-            print(f" 設定               : [警告] {_w.get('message')}")
-    except Exception:
-        pass
+        drain_grace = _bounded_drain_grace(drain_grace)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+    if not isinstance(backend, str) or not backend.strip():
+        raise SystemExit("バックエンドのアドレスが空です")
+    bhost, bport = _split_hostport(backend, 80)
+    # Resolve the state namespace before singletons create keys or any socket
+    # is bound. The former generic default is also FalcoNet's default; its
+    # signed files cannot be attributed safely to either product on this host.
+    from .engine.core.atomic_io import (default_state_dir as _dsd,
+                                        LegacyStateSelectionRequired)
+    try:
+        _sd = _dsd()
+    except LegacyStateSelectionRequired as exc:
+        raise SystemExit(str(exc)) from exc
+    from .engine.core.serving_lease import ServingLease
+    try:
+        lease = ServingLease(_sd)
+        if not lease.acquire(timeout=0.0):
+            raise SystemExit("同じ状態保存先を使用する DuckNet-Lite が既に稼働中です。"
+                             "DUCKNET_STATE_DIR を専用の保存先にしてください。")
+    except BaseException as exc:
+        if "lease" in locals():
+            lease.close()
+        if isinstance(exc, OSError):
+            raise SystemExit(f"状態保存先の稼働権を取得できません: {exc}") from exc
+        raise
 
-    # guard オブジェクトは admin より先に *生成のみ*(start() はまだ呼ばない=起動順は
-    # 従来どおり admin が先)。こうすると AdminDashboard に edge_guard 参照を渡せて、
-    # ダッシュボードが接続受理/バックエンド不達などの生指標(guard.metrics)を可視化できる。
-    guard = AsyncEdgeGuard(backend_host=bhost or "127.0.0.1", backend_port=bport,
-                           listen_host=host, listen_port=listen,
-                           health_path=health_path)
+    try:
+        # 製品の既定は『防御ON』(売り物なので最初から守る)。設定は永続化される。
+        if defaults_on:
+            fw_result = app_firewall().enable()
+            if fw_result.get("ok") is not True or fw_result.get("enabled") is not True:
+                raise SystemExit("ファイアウォールの有効化・保存に失敗しました。前衛は起動しません")
+            shield_result = net_shield().enable()
+            if shield_result.get("ok") is not True or shield_result.get("enabled") is not True:
+                raise SystemExit("シールドの有効化・保存に失敗しました。前衛は起動しません")
+
+        # 宣言的設定ブートストラップ(env DUCKNET_CONFIG / --config): k8s ConfigMap
+        # 等の immutable infra 向け(永続 state より後＝宣言ファイルが権威)。
+        _cfg_path = config_path or _os.environ.get("DUCKNET_CONFIG", "")
+        if _cfg_path:
+            _res = net_shield().apply_config_file(_cfg_path)
+            if _res.get("ok") is True and not _res.get("rejected"):
+                print(f" 宣言的設定         : {_cfg_path} 適用 → {', '.join(_res.get('applied') or []) or '(変更なし)'}")
+            else:
+                raise SystemExit(f"宣言的設定を適用できません。前衛は起動しません: "
+                                 f"{_res.get('error') or '; '.join(_res.get('errors') or [])}")
+        # 壊れてはいないが直すべき設定(旧版が保存した whitelist+空 など)。status の warnings・
+        # イベントにしか出ず、コンソールで起動した運用者には見えなかった。
+        try:
+            for _w in net_shield().config_warnings():
+                print(f" 設定               : [警告] {_w.get('message')}")
+        except Exception:
+            pass
+
+        # guard は admin より先に生成し、状態所有権を起動前に渡す。
+        guard = AsyncEdgeGuard(backend_host=bhost or "127.0.0.1", backend_port=bport,
+                               listen_host=host, listen_port=listen,
+                               health_path=health_path)
+        guard._serving_lease = lease
+    except BaseException:
+        lease.close()  # listener 未作成・worker 不在。失敗した起動を保持しない。
+        raise
     # 前衛ガードを admin より *先* に起動する。--cluster は os.fork() するので、admin の
     # 待受ソケットが既に開いていると全ワーカーへ継承され、親が死んでも管理ポートが開いた
     # ままになる(実測: 親へ SIGTERM 後も管理ポート・前衛ポートとも開放されず)。
-    if cluster:
-        res = guard.serve_cluster()
-        if res.get("mode") == "single":
-            print(f" [note] {res.get('reason')}")
-        if not res.get("ok"):
-            raise SystemExit(f"前衛ガード起動失敗: {res.get('error') or '原因不明'}")
-    else:
-        info = guard.start()
-        if not info.get("ok"):
-            raise SystemExit(f"前衛ガード起動失敗: {info.get('error')}")
-    admin = AdminDashboard(host=admin_host, port=admin_port, token=token, edge_guard=guard)
     try:
+        if cluster:
+            res = guard.serve_cluster()
+            if res.get("mode") == "single":
+                print(f" [note] {res.get('reason')}")
+            if not res.get("ok"):
+                raise SystemExit(f"前衛ガード起動失敗: {res.get('error') or '原因不明'}")
+        else:
+            info = guard.start()
+            if not info.get("ok"):
+                raise SystemExit(f"前衛ガード起動失敗: {info.get('error')}")
+    except BaseException:
+        # Failed pre-bind starts have no traffic to flush. Keep the lease if
+        # a partial listener or worker still exists; its failure must not let
+        # another process mutate the same state concurrently.
+        try:
+            still_owned = (guard.is_alive() or bool(guard._workers)
+                           or guard._listen_sock is not None or guard._server is not None)
+        except Exception:
+            still_owned = True
+        if still_owned:
+            try:
+                guard.stop(grace=0.0)  # successful stop flushes then releases the lease
+            except Exception:
+                pass                # uncertain ownership: retain until process exit
+        else:
+            # A failed pre-bind start may have dirty quota/BAN memory even
+            # without a listener. The guard intentionally keeps ownership if
+            # its final flush failed; do not undo that fail-closed decision.
+            if getattr(guard, "_serving_lease", None) is lease and lease.held:
+                try:
+                    guard._finish_serving_lease()
+                except Exception:
+                    pass            # still held: process exit is the last release
+            else:
+                lease.close()
+        raise
+    try:
+        admin = AdminDashboard(host=admin_host, port=admin_port, token=token, edge_guard=guard)
         a = admin.start()
+        if not isinstance(a, dict) or a.get("ok") is not True:
+            raise RuntimeError(a.get("error", "起動が拒否されました")
+                               if isinstance(a, dict) else "起動結果が不正です")
     except Exception as e:
         # 管理ポートが塞がっている等でここが失敗すると、既に起動済みの前衛ガード
         # (--cluster では fork 済みのワーカー)が後始末されないまま親だけ死ぬ。
-        try:
-            guard.stop(grace=0.0)
-        except Exception:
-            pass
-        raise SystemExit(f"管理ダッシュボード起動失敗: {type(e).__name__}: {e}")
+        # stop 自体も一過性の例外や未完了を返し得る。失敗を握り潰して
+        # SystemExit すると、組込み実行では前衛 listener/worker が残る。
+        # 所有する実行体がまだある場合だけ、即時停止を一度再試行する。
+        cleanup_problem = ""
+        for attempt in range(2):
+            try:
+                stopped = guard.stop(grace=0.0)
+                if (isinstance(stopped, dict) and stopped.get("ok") is True
+                        and stopped.get("stopped") is True):
+                    cleanup_problem = ""
+                    break
+                cleanup_problem = "前衛の停止が完了していません"
+            except Exception as stop_exc:
+                cleanup_problem = f"前衛停止で {type(stop_exc).__name__}"
+            if attempt == 0:
+                try:
+                    still_owned = (guard.is_alive() or bool(guard._workers)
+                                   or guard._listen_sock is not None)
+                except Exception:
+                    still_owned = True  # 所有状態も読めないなら再試行する
+                if not still_owned:
+                    break
+        detail = f"管理ダッシュボード起動失敗: {type(e).__name__}: {e}"
+        if cleanup_problem:
+            detail += f"; {cleanup_problem}"
+        raise SystemExit(detail)
     print("=" * 64)
     print(" DuckNet-Lite — セキュリティゲートウェイ 起動")
     print("=" * 64)
-    print(f" 管理ダッシュボード : {a['url']}")
-    print(f" 管理トークン       : {a['token']}")
+    print(f" 管理ダッシュボード : {a['url']} （ブラウザで開き、管理トークンで認証）")
+    if token:
+        # The operator already supplied this credential. Do not duplicate it in
+        # systemd, container or redirected startup logs.
+        print(" 管理トークン       : 設定済み（DUCKNET_ADMIN_TOKEN 等の設定値で認証）")
+    else:
+        try:
+            interactive = bool(sys.stdout.isatty())
+        except Exception:
+            interactive = False
+        if interactive:
+            print(f" 管理トークン       : {a['token']}")
+        else:
+            print(" 管理トークン       : 自動生成済み。管理操作には DUCKNET_ADMIN_TOKEN を"
+                  "設定して再起動してください（自動生成値はログへ出力しません）")
     if admin_host not in ("127.0.0.1", "localhost", "::1"):
-        print(f" [警告] 管理画面を非ループバック({admin_host})で待受中。トップページは"
-              " トークンを認証なしで配布します=到達できる相手に管理権限が漏れます。")
+        print(f" [警告] 管理画面を非ループバック({admin_host})で待受中。管理トークンを"
+              " ネットワーク上へ平文で送らないようにしてください。")
         print("        ネットワークへ直接公開しないでください(SSHトンネル/リバースプロキシ/"
               "ホストの127.0.0.1へのみポート公開を推奨)。")
     # IPv6 リテラルは [] で囲って表示する(`::1:8443` は読めないし URL にもならない)
@@ -318,8 +480,6 @@ def run(backend: str = "127.0.0.1:8080", listen: int = 8443,
     # 状態ディレクトリに書けないまま起動すると、BAN も累犯記録もライセンスも
     # 再起動のたびに消える。しかも見た目は完全に正常に動くので気づけない。
     # (ハードニングした systemd ユニットや読取専用ボリュームで普通に起こる)
-    from .engine.core.atomic_io import default_state_dir as _dsd
-    _sd = _dsd()
     if not state_dir_writable(_sd):
         print(f" 状態保存           : [警告] {_sd} へ書き込めません。BAN・累犯記録・"
               "ライセンス・完全性ベースラインは再起動で全て失われます", file=sys.stderr)
@@ -331,8 +491,19 @@ def run(backend: str = "127.0.0.1:8080", listen: int = 8443,
     # SIGTERM(コンテナ/k8s の停止シグナル)/ SIGINT で graceful 停止。
     # guard は drain_grace 秒だけ進行中リクエストを捌いてから停止(取りこぼし回避)。停止時に
     # WAF 状態(BAN/累犯回数)も flush=再起動越しのエスカレーション記憶を取りこぼさない。
-    _block_until_shutdown(lambda: guard.stop(grace=drain_grace), admin.stop,
-                          net_shield().flush_state)
+    def _runtime_liveness():
+        edge_server = guard._server
+        if not guard.is_alive() or edge_server is None or not edge_server.is_serving():
+            return "edge serving thread stopped"
+        admin_thread = admin._thread
+        if admin._server is None or admin_thread is None or not admin_thread.is_alive():
+            return "admin serving thread stopped"
+        return ""
+
+    stopped = _block_until_shutdown(lambda: guard.stop(grace=drain_grace), admin.stop,
+                                    _liveness=_runtime_liveness)
+    if isinstance(stopped, dict) and stopped.get("ok") is not True:
+        raise SystemExit("停止または状態保存に失敗しました: " + "; ".join(stopped.get("errors") or []))
     print("\nDuckNet-Lite を停止しました。")
 
 
@@ -608,7 +779,8 @@ def main(argv=None) -> int:
     ap.add_argument("--backend", default="127.0.0.1:8080",
                     help="守る対象(あなたのWebサーバ) HOST:PORT")
     ap.add_argument("--listen", type=int, default=8443, help="前衛ガードの待受ポート")
-    ap.add_argument("--host", default="0.0.0.0", help="前衛ガードの待受ホスト")
+    ap.add_argument("--host", default="127.0.0.1",
+                    help="前衛ガードの待受ホスト(既定=localhost。公開にはTLS終端を前段へ)")
     ap.add_argument("--admin", type=int, default=8081, help="管理ダッシュボードのポート")
     ap.add_argument("--admin-host", default="127.0.0.1",
                     help="管理ダッシュボードの待受(既定=localhost限定)")
@@ -616,16 +788,16 @@ def main(argv=None) -> int:
                     help="管理トークン(空=自動生成)。env DUCKNET_ADMIN_TOKEN でも渡せる"
                          "(argv は他ユーザーから読めるので秘密は env 推奨)")
     ap.add_argument("--cluster", action="store_true",
-                    help="全コアで待受(Linux/macOS。Win等は単一へ降格)")
+                    help="Linux/macOSで複数ワーカー。有限クォータ設定時やWindows等は単一へ降格")
     ap.add_argument("--no-default-on", action="store_true",
                     help="起動時に防御を自動ONにしない")
     ap.add_argument("--health-path", default="", metavar="PATH",
                     help="死活監視用パス(例 /healthz)。一致リクエストは WAF/バックエンド非経由で"
                          "即200を返す。LB/オーケストレータ用。既定OFF(env DUCKNET_HEALTH_PATH 可)")
-    ap.add_argument("--drain-grace", type=float, metavar="SEC",
+    ap.add_argument("--drain-grace", type=_bounded_drain_grace, metavar="SEC",
                     default=_env_float("DUCKNET_DRAIN_GRACE", 5.0),
                     help="停止(SIGTERM/SIGINT)時に進行中リクエストを捌く最大秒数。"
-                         "0=即時停止。既定5(env DUCKNET_DRAIN_GRACE 可)")
+                         "0=即時停止、上限300。既定5(env DUCKNET_DRAIN_GRACE 可)")
     ap.add_argument("--config", default="", metavar="PATH",
                     help="起動時に適用する宣言的設定 JSON(WAFルール等)。k8s ConfigMap 等の"
                          "immutable infra 向け=永続 state より後に適用(env DUCKNET_CONFIG 可)")
@@ -653,7 +825,7 @@ def main(argv=None) -> int:
         else:                                         # 人向け: 成否・要点・次の手順
             _cli_print(_uninstall_autostart_lines, bool(res.get("ok")), res,
                        name=a.autostart_name, runkey=m == "runkey", ja=_cli_ja())
-        return 0                                      # 従来どおり(解除の成否で終了コードは変えない)
+        return 0 if res.get("ok") is True else 1
     if a.install_autostart:
         from .engine.core.autostart import install
         import sys as _sys

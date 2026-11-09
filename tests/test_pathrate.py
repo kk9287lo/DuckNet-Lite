@@ -4,7 +4,7 @@ test_pathrate.py — パス別レート制限(evolution #21)。
 グローバル(rate_per_sec)が通常ブラウジング向けに緩くても、/login 等の認証/高コスト経路への
 連射(credential stuffing 等)を *専用トークンバケツ* で構造的に絞る。既定[]=無効(挙動不変)、
 prefix リテラル照合(ReDoSなし)、バケツは *ルールprefix* でキー(攻撃者がパス末尾を変えても
-バケツ数は増えない=メモリ有界)、不正ルールの除去/上限/永続化を回帰から守る。
+バケツ数は増えない=メモリ有界)、不正な一括更新の拒否/上限/永続化を回帰から守る。
 """
 import tempfile
 
@@ -73,24 +73,34 @@ def test_per_ip_isolation():
 
 
 def test_set_path_limits_validation_and_cap():
-    # 不正項目は除去・型強制・件数上限に丸める。
+    # 置換は全件受理か全件拒否。途中までの反映や上限での切り捨てはしない。
     with tempfile.TemporaryDirectory() as tmp:
         sh = _shield(tmp)
-        res = sh.set_path_limits([
-            {"path": "/a", "rate": 1},          # OK(burst 既定=rate)
-            "not-a-dict",                       # 除去
-            {"path": "", "rate": 1},            # path 空=除去
-            {"path": "/b", "rate": -1},         # rate<=0=除去
-            {"path": "/c", "rate": "bad"},      # rate 非数=除去
-            {"path": "/d", "rate": 2, "burst": "bad"},  # burst 非数→rate(2)
-        ])["path_limits"]
-        paths = [r["path"] for r in res]
-        assert paths == ["/a", "/d"]
-        assert res[0]["burst"] == 1.0 and res[1]["burst"] == 2.0
-        # 上限丸め
-        big = sh.set_path_limits([{"path": f"/p{i}", "rate": 1}
-                                  for i in range(_PATH_LIMIT_MAX + 30)])["path_limits"]
-        assert len(big) == _PATH_LIMIT_MAX
+        assert sh.set_path_limits([{"path": "/login", "rate": 0.001, "burst": 1}])["ok"]
+        keep = list(sh.cfg["path_limits"])
+        good = {"path": "/a", "rate": 0.5}  # 省略 burst は 1 リクエスト分へ丸める
+        bad_rows = (
+            "not-a-dict", {"path": "", "rate": 1},
+            {"path": "login", "rate": 1}, {"path": "/x\n", "rate": 1},
+            {"path": "/b", "rate": -1}, {"path": "/c", "rate": "bad"},
+            {"path": "/d", "rate": 2, "burst": "bad"},
+            {"path": "/e", "rate": 2, "burst": 0},
+        )
+        for bad in bad_rows:
+            result = sh.set_path_limits([good, bad])
+            assert result["ok"] is False, bad
+            assert sh.cfg["path_limits"] == keep, bad
+
+        too_many = [{"path": f"/p{i}", "rate": 1}
+                    for i in range(_PATH_LIMIT_MAX + 1)]
+        assert sh.set_path_limits(too_many)["ok"] is False
+        assert sh.cfg["path_limits"] == keep
+        assert NetShield(state_dir=tmp).cfg["path_limits"] == keep
+
+        assert sh.set_path_limits(too_many[:-1])["ok"] is True
+        assert len(sh.cfg["path_limits"]) == _PATH_LIMIT_MAX
+        result = sh.set_path_limits([good])
+        assert result["path_limits"] == [{"path": "/a", "rate": 0.5, "burst": 1.0}]
 
 
 def test_path_limits_persist_across_reload():

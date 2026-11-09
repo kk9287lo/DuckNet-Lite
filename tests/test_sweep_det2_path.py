@@ -116,3 +116,30 @@ def test_fast_path_is_cheap_and_long_inputs_are_linear():
         assert time.perf_counter() - t < 0.5, p[:12]
     assert ".." not in _path_for_match("../" * 3000).split("/")
     assert _path_for_match("/" * 9000) == "/"
+
+
+def test_literal_route_remains_protected_before_dot_resolution():
+    """backend が解決前の経路を扱っても URL・拡張子・GraphQL 制御を外せない。"""
+    with tempfile.TemporaryDirectory() as d:
+        sh = _sh(d, blocked_urls=["/admin"], blocked_extensions=[".bak"])
+        for path in ("/admin/../public", "/admin/%2e%2e/public", "/public;x=secret.bak"):
+            assert sh._policy_block("192.0.2.30", path, True), path
+        assert not sh._policy_block("192.0.2.30", "/public/report.txt", True)
+    assert P._graphql_path("/graphql/../public", ["/graphql"])
+    assert not P._graphql_path("/graphql-docs/../public", ["/graphql"])
+
+
+def test_both_route_readings_consume_only_their_applicable_buckets():
+    """解決前後で別の制限へ当たる時は双方を消費し、同じ規則は二重消費しない。"""
+    with tempfile.TemporaryDirectory() as d:
+        sh = _sh(d, deny_score=1000, block_score=1000)
+        assert sh.set_path_limits([{"path": "/admin", "rate": 0.001, "burst": 1},
+                                   {"path": "/public", "rate": 0.001, "burst": 1}])["ok"]
+        ip = "192.0.2.31"
+        assert sh.inspect(ip, path="/admin/../public")["action"] == "allow"
+        assert set(sh._ips[ip]["path_buckets"]) == {"/admin", "/public"}
+        assert sh.inspect(ip, path="/admin/../public")["action"] == "throttle"
+        assert sh.inspect(ip, path="/other")["action"] == "allow"
+        other = "192.0.2.32"
+        assert sh.inspect(other, path="/admin;a=1")["action"] == "allow"
+        assert sh.inspect(other, path="/admin;a=1")["action"] == "throttle"

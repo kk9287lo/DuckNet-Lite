@@ -58,7 +58,11 @@ def test_custom_blocked_method():
 def test_set_blocked_methods_validation_and_persist():
     with tempfile.TemporaryDirectory() as tmp:
         sh = _shield(tmp)
+        assert sh.set_blocked_methods(["OPTIONS"])["ok"]
         res = sh.set_blocked_methods(["trace", "TRACE", "BAD-METHOD", "", 5, "CONNECT"])
-        assert res["blocked_methods"] == ["TRACE", "CONNECT"]        # 重複/非英字/空/非str を除去
+        assert res["ok"] is False and res["blocked_methods"] == ["OPTIONS"]
+        assert NetShield(state_dir=tmp).cfg["blocked_methods"] == ["OPTIONS"]
+        res = sh.set_blocked_methods(["trace", "TRACE", "CONNECT"])
+        assert res["ok"] and res["blocked_methods"] == ["TRACE", "CONNECT"]
         sh2 = NetShield(state_dir=tmp)                              # 永続化を別インスタンスで確認
         assert sh2.cfg["blocked_methods"] == ["TRACE", "CONNECT"]

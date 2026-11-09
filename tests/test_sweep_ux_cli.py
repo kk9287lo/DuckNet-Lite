@@ -6,7 +6,7 @@ test_sweep_ux_cli.py — 運用者向け CLI の結果表示(JSON の垂れ流�
 
 · 既定の出力は人が読む短い要約(成否の 1 行・要点・失敗時は「次の手順」)。
 · --json は従来とまったく同じ JSON を出す(スクリプト互換)。
-· 終了コードは従来どおり。
+· 登録・解除の終了コードは成功 0、失敗 1。
 
 テスト用の継ぎ目(autostart.install / uninstall の差し替え)だけを使い、この機に実際の
 自動起動エントリを登録しない。
@@ -75,6 +75,8 @@ def _main(argv, lang="ja"):
     """service.main を同一プロセスで実行し (終了コード, 標準出力+標準エラー, 標準出力) を返す。"""
     import dataplane.service as S
     tmp = tempfile.mkdtemp(prefix="ux-cli-")
+    with open(os.path.join(tmp, "none.env"), "w", encoding="utf-8"):
+        pass
     out, err = io.StringIO(), io.StringIO()
     try:
         with _env(DUCKNET_ENV_FILE=os.path.join(tmp, "none.env"), DUCKNET_LANG=lang,
@@ -190,8 +192,8 @@ def test_install_autostart_json_is_unchanged_and_not_registered():
     assert rc == 1 and json.loads(out)["ok"] is False
 
 
-def test_uninstall_autostart_readable_and_exit_code_unchanged():
-    """解除: 成功/失敗を平文で言う。失敗時は名前・登録方式の取り違えを案内。終了コードは常に 0。"""
+def test_uninstall_autostart_readable_and_exit_code_tracks_result():
+    """解除: 成功は 0、失敗は 1。失敗時は名前・登録方式の取り違えを平文で案内する。"""
     ok = {"ok": True, "method": "schtasks", "name": "DuckNet"}
     rc, out, _, _ = _autostart(["--uninstall-autostart"], ok, "ja", "win32", "uninstall")
     assert rc == 0, out
@@ -199,12 +201,12 @@ def test_uninstall_autostart_readable_and_exit_code_unchanged():
     assert out.splitlines()[0].startswith("自動起動を解除しました"), out
     bad = {"ok": False, "method": "schtasks", "name": "DuckNet"}
     rc, out, _, _ = _autostart(["--uninstall-autostart"], bad, "ja", "win32", "uninstall")
-    assert rc == 0, out                                     # 従来どおり 0
+    assert rc == 1, out
     _assert_readable(out)
     assert out.splitlines()[0].startswith("自動起動を解除できませんでした"), out
     assert "次の手順" in out and "--autostart-name" in out and "runkey" in out, out
     rc, out, _, _ = _autostart(["--uninstall-autostart"], bad, "en", "win32", "uninstall")
-    assert rc == 0 and "Next step" in out, out
+    assert rc == 1 and "Could not remove autostart" in out and "Next step" in out, out
     manual = {"ok": True, "action": "manual",
               "note": "systemctl disable <name> / launchctl unload <plist> で解除"}
     rc, out, _, _ = _autostart(["--uninstall-autostart"], manual, "ja", "linux", "uninstall")
@@ -212,15 +214,18 @@ def test_uninstall_autostart_readable_and_exit_code_unchanged():
     _assert_readable(out)
     assert "systemctl disable --now ducknet" in out, out
     rc, _, out, _ = _autostart(["--uninstall-autostart", "--json"], bad, "ja", "win32", "uninstall")
-    assert rc == 0 and out == json.dumps(bad, ensure_ascii=False) + "\n", out
+    assert rc == 1 and out == json.dumps(bad, ensure_ascii=False) + "\n", out
+    rc, _, out, _ = _autostart(["--uninstall-autostart", "--json"], ok, "ja", "win32", "uninstall")
+    assert rc == 0 and out == json.dumps(ok, ensure_ascii=False) + "\n", out
 
 
 def test_install_autostart_tolerates_minimal_result():
     """結果の形が想定より少なくても(テストの継ぎ目・将来の変更)表示で落ちない。"""
     rc, out, _, _ = _autostart(["--install-autostart"], {"ok": True}, "ja", "win32")
-    assert rc == 0 and out.strip() and not _is_json(out), out
+    assert rc == 0 and "登録しました" in out and not _is_json(out), out
     rc, out, _, _ = _autostart(["--uninstall-autostart"], {}, "en", "darwin", "uninstall")
-    assert rc == 0 and out.strip() and not _is_json(out), out
+    assert rc == 1 and "Could not remove autostart" in out and "Next step" in out, out
+    _assert_readable(out)
 
 
 def test_install_autostart_survives_ascii_console():
@@ -231,6 +236,8 @@ def test_install_autostart_survives_ascii_console():
     w = io.TextIOWrapper(raw, encoding="ascii", errors="strict")
     old = sys.stdout
     tmp = tempfile.mkdtemp(prefix="ux-cli-")
+    with open(os.path.join(tmp, "none.env"), "w", encoding="utf-8"):
+        pass
     res = {"ok": False, "method": "schtasks", "name": "DuckNet", "detail": "a'b<c"}
     try:
         sys.stdout = w

@@ -17,6 +17,7 @@ import threading
 
 WM_DESTROY = 0x0002
 WM_COMMAND = 0x0111
+WM_TIMER = 0x0113
 WM_RBUTTONUP = 0x0205
 WM_LBUTTONDBLCLK = 0x0203
 WM_TRAY = 0x0400 + 1            # WM_USER+1(トレイコールバック)
@@ -26,10 +27,12 @@ NIM_ADD, NIM_MODIFY, NIM_DELETE = 0x0, 0x1, 0x2
 NIF_MESSAGE, NIF_ICON, NIF_TIP = 0x1, 0x2, 0x4
 IMAGE_ICON, LR_LOADFROMFILE, LR_DEFAULTSIZE = 1, 0x10, 0x40
 TPM_RIGHTBUTTON = 0x2
-MF_STRING, MF_SEPARATOR = 0x0, 0x800
+MF_STRING, MF_SEPARATOR, MF_GRAYED = 0x0, 0x800, 0x1
 TIP_MAX = 127                   # szTip は WCHAR[128](127 文字+NUL)
 _WND_CLASS = "DuckNetTrayWnd"
 _TASKBAR_CREATED = "TaskbarCreated"   # 通知領域が作り直されたとき Explorer が全トップレベル窓へ送る
+_RETRY_TIMER = 1
+_RETRY_MS = 1000
 MSGFLT_ALLOW = 1                # ChangeWindowMessageFilterEx: 低い整合性レベルからの受信を許す
 
 
@@ -76,11 +79,18 @@ class TrayIcon:
         self.icon_path = icon_path
         self.tooltip = clip_tip(tooltip)
         self.menu_items = list(menu_items)
+        self._status_lines = ()
         self.on_action = on_action
         self._thread = None
         self._hwnd = None
         self._running = False
         self._nid = None
+        self._class_name = "%s-%d-%x" % (_WND_CLASS, os.getpid(), id(self))
+        self._ready = threading.Event()
+        self._stop_requested = threading.Event()
+        self._start_ok = False
+        self._start_error = None
+        self._retry_timer = False
         # set_status の受け渡し(tooltip/icon_path/_hwnd は _lock の下で読み書きする)と、
         # トレイのスレッドが実際に反映した値。反映はトレイのスレッドだけが行う。
         self._lock = threading.Lock()
@@ -101,7 +111,8 @@ class TrayIcon:
     def set_status(self, tooltip: str, icon_path=None) -> None:
         """ツールチップ(と、渡されればアイコン)を差し替える。どのスレッドから呼んでもよい。
         Shell_NotifyIcon やアイコンのハンドルは別スレッドから触らない: ここでは最新値を記録して
-        専用メッセージ(WM_TRAY_STATUS)を窓へ投げるだけで、窓プロシージャが NIM_MODIFY で反映する。
+        専用メッセージ(WM_TRAY_STATUS)を窓へ投げ、失敗時は所有スレッドのキューへ投げる。
+        どちらもトレイのスレッドが NIM_MODIFY で反映する。
         起動前・非 Windows では値を覚えるだけ(起動時の NIM_ADD がその最新値で出す)。"""
         tip = clip_tip(tooltip)
         with self._lock:
@@ -111,32 +122,88 @@ class TrayIcon:
             hwnd = self._hwnd
         if not hwnd or not available():
             return
+        error = "PostMessageW(WM_TRAY_STATUS) failed"
         try:
             import ctypes
             from ctypes import wintypes
-            ctypes.windll.user32.PostMessageW(wintypes.HWND(hwnd), WM_TRAY_STATUS, 0, 0)
+            if ctypes.windll.user32.PostMessageW(wintypes.HWND(hwnd), WM_TRAY_STATUS, 0, 0):
+                return
+        except Exception as e:
+            error = repr(e)
+        # SetTimer(hwnd, ...) は窓を所有するスレッドからしか呼べない。窓への
+        # PostMessage が失敗した場合は、その所有スレッドのキューへ依頼する。
+        try:
+            import ctypes
+            thread = self._thread
+            if thread is not None and thread.native_id and ctypes.windll.user32.PostThreadMessageW(
+                    thread.native_id, WM_TRAY_STATUS, 0, 0):
+                return
         except Exception:
-            pass                                       # 表示の更新失敗でアプリを止めない
+            pass
+        self._status_error = error                         # 両経路失敗を診断可能にする
+
+    def set_status_lines(self, lines) -> None:
+        """Read-only live rows are snapshotted when the menu opens."""
+        rows = tuple(clip_tip("".join(ch if ch.isprintable() else " " for ch in str(line)), 180)
+                     for line in tuple(lines)[:3])
+        with self._lock:
+            self._status_lines = rows
 
     def start(self) -> bool:
         if not available():
             return False
-        self._thread = threading.Thread(target=self._run, daemon=True,
-                                        name="tray")
-        self._thread.start()
-        return True
+        with self._lock:
+            thread = self._thread
+            if thread is None or not thread.is_alive():
+                self._ready.clear()
+                self._stop_requested.clear()
+                self._start_ok = False
+                self._start_error = None
+                self._status_error = self._readd_error = None
+                self._retry_timer = False
+                thread = threading.Thread(target=self._run, daemon=True, name="tray")
+                self._thread = thread
+                try:
+                    thread.start()
+                except Exception as e:
+                    self._start_error = repr(e)
+                    self._ready.set()
+                    return False
+        if not self._ready.wait(5.0):
+            self.stop()
+            return False
+        ok = bool(self._start_ok and not self._stop_requested.is_set() and thread.is_alive())
+        if not ok and thread.is_alive() and thread is not threading.current_thread():
+            thread.join(3.0)           # 失敗を返す前に、この試行が作った HWND/class を回収
+        return ok
 
-    def stop(self):
-        self._running = False
+    def stop(self) -> bool:
+        """停止を予約し、呼出元が別スレッドなら有界で資源回収を待つ。"""
+        self._stop_requested.set()
+        with self._lock:
+            hwnd, thread = self._hwnd, self._thread
         try:
             import ctypes
-            if self._hwnd:
-                ctypes.windll.user32.PostMessageW(self._hwnd, WM_DESTROY, 0, 0)
+            if hwnd:
+                u32 = ctypes.windll.user32
+                if not u32.PostMessageW(hwnd, WM_DESTROY, 0, 0) and thread is not None:
+                    u32.PostThreadMessageW(thread.native_id, 0x0012, 0, 0)  # WM_QUIT
         except Exception:
             pass
+        if (thread is not None and thread is not threading.current_thread()
+                and self._ready.is_set() and thread.is_alive()):
+            thread.join(3.0)
+        return thread is None or not thread.is_alive()
+
+    def is_alive(self) -> bool:
+        """launcher が ready 後の予期せぬ message loop 終了を検知する。"""
+        thread = self._thread
+        return bool(thread is not None and thread.is_alive())
 
     # ── 内部: 別スレッドの Win32 メッセージループ ──
     def _run(self):
+        u32 = shell = hinst = hwnd = hicon = nid = None
+        registered = False
         try:
             import ctypes
             from ctypes import wintypes
@@ -161,9 +228,18 @@ class TrayIcon:
             u32.LoadImageW.argtypes = [HINSTANCE, LPCWSTR, UINT, INT, INT, UINT]
             u32.PostMessageW.restype = BOOL
             u32.PostMessageW.argtypes = [HWND, UINT, WP, LP]
+            u32.PostThreadMessageW.restype = BOOL
+            u32.PostThreadMessageW.argtypes = [DWORD, UINT, WP, LP]
+            u32.GetMessageW.restype = BOOL
+            u32.GetMessageW.argtypes = [ctypes.POINTER(wintypes.MSG), HWND, UINT, UINT]
+            u32.TranslateMessage.restype = BOOL
+            u32.TranslateMessage.argtypes = [ctypes.POINTER(wintypes.MSG)]
             u32.DispatchMessageW.restype = LRESULT
+            u32.DispatchMessageW.argtypes = [ctypes.POINTER(wintypes.MSG)]
+            u32.PostQuitMessage.restype = None
             u32.PostQuitMessage.argtypes = [INT]
             u32.CreatePopupMenu.restype = HMENU
+            u32.CreatePopupMenu.argtypes = []
             u32.AppendMenuW.restype = BOOL
             u32.AppendMenuW.argtypes = [HMENU, UINT, ctypes.c_size_t, LPCWSTR]
             u32.TrackPopupMenu.restype = BOOL
@@ -182,12 +258,17 @@ class TrayIcon:
             u32.UnregisterClassW.argtypes = [LPCWSTR, HINSTANCE]
             u32.RegisterWindowMessageW.restype = UINT
             u32.RegisterWindowMessageW.argtypes = [LPCWSTR]
+            u32.SetTimer.restype = ctypes.c_size_t
+            u32.SetTimer.argtypes = [HWND, ctypes.c_size_t, UINT, LPVOID]
+            u32.KillTimer.restype = BOOL
+            u32.KillTimer.argtypes = [HWND, ctypes.c_size_t]
             shell.Shell_NotifyIconW.restype = BOOL
 
             WNDPROC = ctypes.WINFUNCTYPE(LRESULT, HWND, UINT, WP, LP)
 
             def wndproc(hwnd, msg, wp, lp):
                 if msg == WM_DESTROY:
+                    self._stop_requested.set()
                     u32.PostQuitMessage(0)
                     return 0
                 r = self._on_message(hwnd, msg, wp, lp)
@@ -206,14 +287,22 @@ class TrayIcon:
             wc = WNDCLASS()
             wc.lpfnWndProc = self._wndproc
             wc.hInstance = hinst
-            wc.lpszClassName = _WND_CLASS
-            u32.RegisterClassW(ctypes.byref(wc))
+            wc.lpszClassName = self._class_name
+            u32.RegisterClassW.restype = ctypes.c_ushort
+            # WNDCLASS はインスタンスごとの WNDPROC 型を含む。並列 start で別の
+            # POINTER(WNDCLASS) を共有 DLL 関数へ設定すると相互に型が衝突する。
+            u32.RegisterClassW.argtypes = [ctypes.c_void_p]
+            if not u32.RegisterClassW(ctypes.byref(wc)):
+                raise OSError("RegisterClassW failed")
+            registered = True
             # Explorer の再起動を知る登録メッセージ(このスレッドで登録。失敗は 0=扱わない)。
             # 窓を作る前に登録し、作った直後から届いても取りこぼさない。
             self._wm_taskbar = u32.RegisterWindowMessageW(_TASKBAR_CREATED) or 0
             # 窓はメッセージ専用(HWND_MESSAGE)にしない: TaskbarCreated はトップレベル窓への一斉送信
-            hwnd = u32.CreateWindowExW(0, _WND_CLASS, "DuckNet", 0,
+            hwnd = u32.CreateWindowExW(0, self._class_name, "DuckNet", 0,
                                        0, 0, 0, 0, 0, 0, hinst, 0)
+            if not hwnd:
+                raise OSError("CreateWindowExW failed")
             if hwnd and self._wm_taskbar:
                 # 管理者として動いていると、UIPI が通常権限の Explorer からの TaskbarCreated を
                 # 落とす。このメッセージだけはこの窓に届くようにする(無い OS・失敗は無視)。
@@ -228,12 +317,12 @@ class TrayIcon:
             # 大きく見える。トレイ内の実寸は OS のトレイセルサイズに従う。
             sz = u32.GetSystemMetrics(11) or 32          # SM_CXICON
             self._api, self._icon_size = (u32, shell), sz
-            # 窓を公開するのと同時に、出す値(起動前の set_status の最新値を含む)を取る。
-            # これより後の set_status はメッセージで届き、ループが回り始めてから反映される。
+            # 出す値(起動前の set_status の最新値を含む)を取る。
             with self._lock:
-                self._hwnd = hwnd
                 tip, icon = self.tooltip, self.icon_path
             hicon = u32.LoadImageW(0, icon, IMAGE_ICON, sz, sz, LR_LOADFROMFILE)
+            if not hicon:
+                raise OSError("LoadImageW failed: %s" % icon)
 
             class GUID(ctypes.Structure):
                 _fields_ = [("Data1", wintypes.DWORD), ("Data2", wintypes.WORD),
@@ -260,35 +349,99 @@ class TrayIcon:
             nid.uCallbackMessage = WM_TRAY
             nid.hIcon = hicon
             nid.szTip = tip
+            shell.Shell_NotifyIconW.argtypes = [DWORD, ctypes.c_void_p]
+            self._nid, self._u32 = nid, u32
+            # HWND を公開する直前に停止要求を確認。公開後の stop は必ず窓へ
+            # WM_DESTROY を送れるので、初期化中の stop を上書きしない。
+            with self._lock:
+                if self._stop_requested.is_set():
+                    return
+                self._hwnd = hwnd
+                pending_status = self.tooltip != tip or self.icon_path != icon
             self._added = bool(shell.Shell_NotifyIconW(NIM_ADD, ctypes.byref(nid)))
             self._applied_tip = tip
             self._applied_icon = icon if hicon else None   # 読めなかったら次の更新で再試行
-            self._nid, self._u32 = nid, u32
-            self._running = True
+            if not self._added:
+                self._readd_error = "Shell_NotifyIconW(NIM_ADD) failed"
+                self._schedule_retry()
+            elif pending_status:
+                self._apply_status()       # 公開前の set_status はメッセージを投げていない
+            self._running = not self._stop_requested.is_set()
+            self._start_ok = self._running
+            self._ready.set()
 
             msg = wintypes.MSG()
-            while self._running and u32.GetMessageW(ctypes.byref(msg), 0, 0, 0) > 0:
+            while not self._stop_requested.is_set():
+                result = u32.GetMessageW(ctypes.byref(msg), 0, 0, 0)
+                if result <= 0:
+                    if result < 0:
+                        self._start_error = "GetMessageW failed"
+                    break
+                if not msg.hWnd and msg.message == WM_TRAY_STATUS:
+                    self._apply_status()
+                    continue
                 u32.TranslateMessage(ctypes.byref(msg))
                 u32.DispatchMessageW(ctypes.byref(msg))
-            try:
-                shell.Shell_NotifyIconW(NIM_DELETE, ctypes.byref(nid))
-            except Exception:
-                pass
-            # 後始末: 窓ハンドルは使い回され得るので、以後の set_status が他の窓へ WM_APP を
-            # 投げないよう先に外す。窓とクラスも片付ける(残すと、同じプロセスで次に作る
-            # トレイが解放済みの窓プロシージャを持つ古いクラスを掴む)。
+        except Exception as e:
+            self._start_error = repr(e)
+        finally:
+            # 例外時も窓・クラス・アイコンを所有スレッドで回収する。
             with self._lock:
                 self._hwnd = None
-            self._nid, self._added = None, False
+            self._running = self._start_ok = False
+            self._ready.set()
             try:
-                if nid.hIcon:
-                    u32.DestroyIcon(nid.hIcon)
-                u32.DestroyWindow(hwnd)
-                u32.UnregisterClassW(_WND_CLASS, hinst)
+                if u32 is not None and hwnd:
+                    self._clear_retry(hwnd)
+                if shell is not None and nid is not None:
+                    shell.Shell_NotifyIconW(NIM_DELETE, ctypes.byref(nid))
             except Exception:
                 pass
+            self._nid, self._added, self._api = None, False, None
+            if u32 is not None:
+                try:
+                    icon_handle = nid.hIcon if nid is not None else hicon
+                    if icon_handle:
+                        u32.DestroyIcon(icon_handle)
+                except Exception:
+                    pass
+                try:
+                    if hwnd:
+                        u32.DestroyWindow(hwnd)
+                except Exception:
+                    pass
+                if registered:
+                    try:
+                        if u32.UnregisterClassW(self._class_name, hinst):
+                            self._wndproc = None
+                    except Exception:
+                        pass
+
+    def _schedule_retry(self):
+        """一つの窓タイマーだけで、Shell の一時失敗を所有スレッドから再試行する。"""
+        if self._retry_timer or not self._hwnd or self._api is None:
+            return
+        try:
+            if self._api[0].SetTimer(self._hwnd, _RETRY_TIMER, _RETRY_MS, None):
+                self._retry_timer = True
+                return
+            error = "SetTimer failed: tray retry unavailable"
+        except Exception as exc:
+            error = "Tray retry unavailable: " + repr(exc)
+        # This runs on the owner thread. Without a retry, a missing/stale icon
+        # would otherwise remain a successful, live tray indefinitely.
+        self._start_error = error
+        self._stop_requested.set()
+
+    def _clear_retry(self, hwnd=None):
+        if not self._retry_timer:
+            return
+        self._retry_timer = False
+        try:
+            if self._api is not None:
+                self._api[0].KillTimer(hwnd or self._hwnd, _RETRY_TIMER)
         except Exception:
-            pass                                       # トレイ失敗はアプリを止めない
+            pass
 
     def _apply_status(self):
         """set_status で記録された最新値をトレイへ反映する(NIM_MODIFY)。**トレイのスレッドの
@@ -315,11 +468,18 @@ class TrayIcon:
                     err = "LoadImageW failed: %s" % icon
             if flags:
                 old_icon = nid.hIcon
-                nid.uFlags = flags
-                nid.szTip = tip
-                if new_icon:
-                    nid.hIcon = new_icon
-                if shell.Shell_NotifyIconW(NIM_MODIFY, ctypes.byref(nid)):
+                try:
+                    nid.uFlags = flags
+                    nid.szTip = tip
+                    if new_icon:
+                        nid.hIcon = new_icon
+                    notified = bool(shell.Shell_NotifyIconW(NIM_MODIFY, ctypes.byref(nid)))
+                except Exception:
+                    if new_icon:
+                        nid.hIcon = old_icon
+                        u32.DestroyIcon(new_icon)
+                    raise
+                if notified:
                     self._applied_tip = tip
                     if new_icon:
                         self._applied_icon = icon
@@ -331,8 +491,13 @@ class TrayIcon:
                         u32.DestroyIcon(new_icon)
                     err = "Shell_NotifyIconW(NIM_MODIFY) failed"
             self._status_error = err
+            if err:
+                self._schedule_retry()
+            elif not self._readd_error:
+                self._clear_retry()
         except Exception as e:
             self._status_error = repr(e)
+            self._schedule_retry()
 
     def _on_message(self, hwnd, msg, wp, lp):
         """窓プロシージャの本体(トレイのスレッドで呼ばれる。WM_DESTROY だけは _run の窓
@@ -343,6 +508,12 @@ class TrayIcon:
         if msg == WM_TRAY_STATUS:
             self._apply_status()                       # set_status の反映(このスレッドで)
             return 0
+        if msg == WM_TIMER and wp == _RETRY_TIMER:
+            if not self._added or self._readd_error:
+                self._readd()
+            else:
+                self._apply_status()
+            return 0
         if msg == WM_TRAY and lp in (WM_RBUTTONUP, WM_LBUTTONDBLCLK):
             if lp == WM_LBUTTONDBLCLK:
                 self._dispatch(1)                      # 既定アクション(=最初の項目)
@@ -350,7 +521,8 @@ class TrayIcon:
                 self._popup(hwnd)
             return 0
         if msg == WM_COMMAND:
-            self._dispatch(wp & 0xFFFF)
+            if not (wp >> 16) and not lp:
+                self._dispatch(wp & 0xFFFF)
             return 0
         return None
 
@@ -393,6 +565,7 @@ class TrayIcon:
                     u32.DestroyIcon(new_icon)
             if done is None:
                 self._readd_error = "Shell_NotifyIconW(NIM_ADD) failed"
+                self._schedule_retry()
                 return
             self._added = True                         # 以後の set_status は NIM_MODIFY で届く
             self._applied_tip = tip
@@ -403,28 +576,59 @@ class TrayIcon:
             self._status_error = err                   # 表示は最新の値になった(前の失敗は解消)
             self._readd_op, self._readd_error = done, err
             self._readd_count += 1                     # 最後に数える(テストはこれを待つ)
+            if err:
+                self._schedule_retry()
+            else:
+                self._clear_retry()
         except Exception as e:
             self._readd_error = repr(e)
+            self._schedule_retry()
 
     def _popup(self, hwnd):
+        if self._stop_requested.is_set():
+            return
         import ctypes
         u32 = ctypes.windll.user32
-        menu = u32.CreatePopupMenu()
-        for i, item in enumerate(self.menu_items, start=1):
-            if item is None:
-                u32.AppendMenuW(menu, MF_SEPARATOR, 0, None)
-            else:
-                u32.AppendMenuW(menu, MF_STRING, i, item[0])
-        pt = ctypes.wintypes.POINT() if hasattr(ctypes, "wintypes") else None
-        from ctypes import wintypes
-        pt = wintypes.POINT()
-        u32.GetCursorPos(ctypes.byref(pt))
-        u32.SetForegroundWindow(hwnd)                  # メニューが即閉じないように
-        u32.TrackPopupMenu(menu, TPM_RIGHTBUTTON, pt.x, pt.y, 0, hwnd, None)
-        u32.PostMessageW(hwnd, 0, 0, 0)
-        u32.DestroyMenu(menu)
+        try:
+            menu = u32.CreatePopupMenu()
+        except Exception:
+            return
+        if not menu:
+            return
+        try:
+            with self._lock:
+                status_lines = self._status_lines
+            for i, item in enumerate(self.menu_items, start=1):
+                if item is None:
+                    appended = u32.AppendMenuW(menu, MF_SEPARATOR, 0, None)
+                else:
+                    appended = u32.AppendMenuW(menu, MF_STRING, i, item[0])
+                if not appended:
+                    return
+            if status_lines:
+                if not u32.AppendMenuW(menu, MF_SEPARATOR, 0, None):
+                    return
+                for line in status_lines:
+                    if not u32.AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, line):
+                        return
+            from ctypes import wintypes
+            pt = wintypes.POINT()
+            if not u32.GetCursorPos(ctypes.byref(pt)):
+                return
+            u32.SetForegroundWindow(hwnd)              # メニューが即閉じないように
+            u32.TrackPopupMenu(menu, TPM_RIGHTBUTTON, pt.x, pt.y, 0, hwnd, None)
+            u32.PostMessageW(hwnd, 0, 0, 0)
+        except Exception:
+            pass                                        # Win32 callback へ例外を出さない
+        finally:
+            try:
+                u32.DestroyMenu(menu)
+            except Exception:
+                pass
 
     def _dispatch(self, cmd_id):
+        if self._stop_requested.is_set():
+            return
         idx = cmd_id - 1
         if 0 <= idx < len(self.menu_items) and self.menu_items[idx]:
             try:

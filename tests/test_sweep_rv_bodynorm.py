@@ -108,7 +108,7 @@ def test_fullwidth_letters_and_angle_brackets_still_fold_in_body():
     """#8 の検知は落とさない: 全角の ＜＞(test_d8)と全角英字の UNION SELECT(test_core)は、
     生 UTF-8 でもエスケープでも本文で検知される。"""
     with tempfile.TemporaryDirectory() as d:
-        sh = _shield(d, block_score=10000)
+        sh = _shield(d, block_score=1000)
         for s, sig in ((FULLWIDTH_XSS, "xss"), ("1 ＵＮＩＯＮ ＳＥＬＥＣＴ a from b", "sqli")):
             for body, ct in _carriers(s):
                 assert sh.inspect_body("192.0.2.71", body, content_type=ct).get("signature") == sig, \
@@ -120,7 +120,7 @@ def test_encoded_line_break_statement_in_body_value_is_detected():
     """旧版は本文でも sqli-stacked として数えていた fixture。urlencoded の値・後ろの窓・JSON の値の
     どれに置いても、型の有無を問わず数える。"""
     with tempfile.TemporaryDirectory() as d:
-        sh = _shield(d, block_score=10000)
+        sh = _shield(d, block_score=1000)
         padded = b"pad=" + b"A" * (P._MAX_SCAN + 100) + b"&" + _STACKED_NL
         js = json.dumps({"q": _STACKED_NL.decode("ascii")}).encode("ascii")
         for b in (_STACKED_NL, b"title=Hello&" + _STACKED_NL + b"&stars=5", padded, js):

@@ -36,6 +36,17 @@ def test_violation_detection():
                                     "app.example.com", []) == ""
 
 
+def test_request_host_does_not_implicitly_allow_untrusted_subdomains():
+    lines = ["Location: https://evil.app.example.com/phish"]
+    assert _redirect_violation_host("HTTP/1.1 302 Found", lines,
+                                    "app.example.com", []) == "evil.app.example.com"
+    assert _redirect_violation_host("HTTP/1.1 302 Found",
+                                    ["Location: https://app.example.com/safe"],
+                                    "app.example.com", []) == ""
+    assert _redirect_violation_host("HTTP/1.1 302 Found", lines,
+                                    "app.example.com", ["app.example.com"]) == ""
+
+
 def _with_cfg(**cfg):
     from dataplane.engine.lifeform.pipeline import net_shield
     sh = net_shield()

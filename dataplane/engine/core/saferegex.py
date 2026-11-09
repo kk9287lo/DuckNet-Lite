@@ -287,7 +287,8 @@ def json_too_deep(text: str, max_depth: int) -> bool:
     return False
 
 
-def safe_json_loads(text, *, max_len: int = 2_000_000, max_depth: int = 200, default=None):
+def safe_json_loads(text, *, max_len: int = 2_000_000, max_depth: int = 200, default=None,
+                    reject_duplicates: bool = False, reject_nonfinite: bool = False):
     """再帰爆弾/巨大入力に耐える json.loads。深すぎ/大きすぎはパースせず default。例外も握る。
     標準 re と同様に標準 json も *深さ制限が甘い*(深い入れ子で RecursionError を誘発)ため、
     パース前に長さと深さで足切りして CPU/スタックの浪費を防ぐ。"""
@@ -300,8 +301,25 @@ def safe_json_loads(text, *, max_len: int = 2_000_000, max_depth: int = 200, def
         return default
     if json_too_deep(text, max_depth):
         return default                              # 再帰爆弾=パースしない
+    def unique_object(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("duplicate JSON member")
+            result[key] = value
+        return result
+    def invalid_constant(_value):
+        raise ValueError("non-finite JSON number")
+    def finite_float(value):
+        import math
+        number = float(value)
+        if not math.isfinite(number):
+            raise ValueError("non-finite JSON number")
+        return number
     try:
-        return _json.loads(text)
+        return _json.loads(text, object_pairs_hook=unique_object if reject_duplicates else None,
+                           parse_constant=invalid_constant if reject_nonfinite else None,
+                           parse_float=finite_float if reject_nonfinite else None)
     except Exception:
         return default
 
@@ -312,6 +330,12 @@ def safe_json_loads(text, *, max_len: int = 2_000_000, max_depth: int = 200, def
 # 2 バイト目に ASCII の値を含む符号化(Shift_JIS・GBK・Big5 等)では、検査が UTF-8/latin-1 で読んだ字面と
 # バックエンドが見る字面が食い違う。呼び出し側が宣言どおりの読み方も照合できるよう、その読み方を返す。
 _CHARSET_RE = re.compile(r'(?i)(?:^|[;\s])charset[ \t]*=[ \t]*(?:"([^"]*)"|([^;\s"]*))')
+
+
+def ambiguous_charset(content_type: str) -> bool:
+    """A single Content-Type with repeated charset parameters has no stable reading."""
+    ct = content_type or ""
+    return len(ct) > 16384 or sum(1 for _ in _CHARSET_RE.finditer(ct)) > 1
 # UTF-8/ASCII は呼び出し側が既に読んでいる(同じ字面)ので返さない。
 _DECL_SKIP = frozenset(("utf-8", "utf-8-sig", "ascii"))
 # 本文の符号化ではない Python 固有の codec と、入力長に対して線形でない codec(punycode)は使わない。
@@ -324,7 +348,7 @@ _CP1047_FROM_037 = str.maketrans("¬Ý^[]¨", "^[¬Ý¨]")
 
 @functools.lru_cache(maxsize=256)
 def _codec_name(label: str) -> str:
-    """正規化した charset ラベル → Python の codec 名(使えない/使わないものは "")。
+    """正規化した charset ラベル → Python の codec 名(使えない/危険なものは "")。
     codecs.lookup に未知の名前を渡すと encodings の表に 1 件ずつ溜まり続ける(要求ごとに違う名前を
     送られると上限無しに太る)ので、別名表か encodings の実在モジュールで確かめてから引く。"""
     import codecs
@@ -349,15 +373,28 @@ def _codec_name(label: str) -> str:
                                                   # (空の bytes は codec を確かめずに '' を返す)
         except Exception:
             return ""
-        return "" if name in _DECL_SKIP or name in _DECL_DENY else name
+        return "" if name in _DECL_DENY else name
     return ""
+
+
+def unsupported_charset(content_type: str) -> bool:
+    """True if a declared charset cannot be decoded by the bounded body scanner."""
+    ct = content_type or ""
+    if len(ct) > 16384:
+        return True
+    for m in _CHARSET_RE.finditer(ct):
+        raw = (m.group(1) if m.group(1) is not None else m.group(2))[:64].lower()
+        label = re.sub(r"[^0-9a-z]+", "_", raw).strip("_")
+        if not label or not _codec_name(label):
+            return True
+    return False
 
 
 def declared_charsets(content_type: str) -> list:
     """Content-Type の charset 引数を Python の codec 名で返す。UTF-8/ASCII・未知・使わない codec は除く。
     重複(1 本の中の重複も、重複ヘッダをカンマで連結したものも)は、最初と最後の 2 つ(実装によって
     最初を採るものと最後を採るものがある)。"""
-    ct = (content_type or "")[:1024]
+    ct = (content_type or "")[:16384]
     if "charset" not in ct.lower():
         return []
     found = []
@@ -365,7 +402,7 @@ def declared_charsets(content_type: str) -> list:
         raw = (m.group(1) if m.group(1) is not None else m.group(2))[:64].lower()
         label = re.sub(r"[^0-9a-z]+", "_", raw).strip("_")
         name = _codec_name(label) if label else ""
-        if name:
+        if name and name not in _DECL_SKIP:
             found.append(name)
     if not found:
         return []

@@ -1,9 +1,9 @@
 """
 test_config_bootstrap.py — 宣言的設定ブートストラップ(evolution #27)。
 ====================================================================================
-運用者が宣言した JSON(ファイル/ConfigMap)を起動時に既存の検証済みセッター経由で適用する。
-スカラ/bool は set_config(型一致)、構造/段階キー(path_limits/blocked_methods/paranoia)は専用
-バリデータ、未知キーは無視。ファイル読込・不正/欠損の安全な失敗・永続化を回帰から守る。
+運用者が宣言した JSON(ファイル/ConfigMap)を全件検証し、一度の保存で起動時に適用する。
+構造/段階キー(path_limits/blocked_methods/paranoia)は専用バリデータを共有し、未知キーは拒否。
+ファイル読込・不正/欠損の安全な失敗・永続化を回帰から守る。
 """
 import json
 import os
@@ -26,21 +26,35 @@ def test_apply_config_scalar_and_bool():
 def test_apply_config_routes_structured_keys_through_validators():
     with tempfile.TemporaryDirectory() as tmp:
         sh = NetShield(state_dir=tmp)
-        sh.apply_config({
+        previous_methods = list(sh.cfg["blocked_methods"])
+        previous_paranoia = sh.cfg["paranoia"]
+        result = sh.apply_config({
             "path_limits": [{"path": "/login", "rate": 0.5, "burst": 5},
-                            {"path": "", "rate": 1}],          # 空 path は検証で除去
+                            {"path": "", "rate": 1}],          # 不正を混ぜた置換は全件拒否
             "blocked_methods": ["trace", "TRACE", "connect"],  # 大文字化+重複除去
             "paranoia": 3})
+        assert "path_limits" in result["rejected"]
+        assert result["ok"] is False and result["applied"] == []
+        assert sh.cfg["path_limits"] == []
+        assert sh.cfg["blocked_methods"] == previous_methods
+        assert sh.cfg["paranoia"] == previous_paranoia
+        assert sh.apply_config({"path_limits": [{"path": "/login", "rate": 0.5,
+                                                  "burst": 5}],
+                                "blocked_methods": ["trace", "TRACE", "connect"],
+                                "paranoia": 3})["ok"]
         assert [r["path"] for r in sh.cfg["path_limits"]] == ["/login"]
         assert sh.cfg["blocked_methods"] == ["TRACE", "CONNECT"]
         assert sh.cfg["paranoia"] == 3 and sh.cfg["optional_sigs"].get("ssrf_internal")
 
 
-def test_apply_config_ignores_unknown_keys():
+def test_apply_config_rejects_unknown_keys_atomically():
     with tempfile.TemporaryDirectory() as tmp:
         sh = NetShield(state_dir=tmp)
+        before = dict(sh.cfg)
         res = sh.apply_config({"enabled": True, "totally_unknown_key": 123})
-        assert "totally_unknown_key" not in res["applied"]
+        assert res["ok"] is False and res["applied"] == []
+        assert "totally_unknown_key" in res["rejected"]
+        assert sh.cfg == before
         assert "totally_unknown_key" not in sh.cfg
 
 

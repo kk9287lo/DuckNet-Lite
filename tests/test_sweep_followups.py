@@ -12,6 +12,7 @@ import sys
 import tempfile
 import time
 from unittest import SkipTest
+from unittest.mock import patch
 
 import dataplane.engine.lifeform.pipeline as ND
 import dataplane.engine.lifeform.policy as FW
@@ -70,6 +71,290 @@ def test_f3_firewall_matches_ipv4_mapped_source():
         assert r["action"] == "deny", r
         assert fw.evaluate("::ffff:127.0.0.1")["zone"] == "loopback"
         assert fw.evaluate("192.0.2.5")["action"] == "deny"       # 純 IPv4 は従来どおり
+
+
+def test_acl_signed_reload_and_legacy_migration():
+    # 初回の無署名 ACL は従来の意味で読み、直ちに署名形式へ移す。
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "acl.json")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"enabled": True, "policy": {"public": "allow"},
+                       "rules": [{"net": "8.8.8.8/32", "action": "deny"}]}, f)
+        fw = FW.AppFirewall(state_dir=tmp)
+        assert fw.is_enabled() and fw.evaluate("8.8.8.8")["action"] == "deny"
+        assert fw.evaluate("1.1.1.1")["action"] == "allow"
+        with open(path, encoding="utf-8") as f:
+            assert json.load(f)["_sv"] == 3
+        restored = FW.AppFirewall(state_dir=tmp)
+        assert restored.is_enabled() and restored.evaluate("8.8.8.8")["action"] == "deny"
+        assert restored.evaluate("1.1.1.1")["action"] == "allow"
+
+
+def test_acl_legacy_malformed_structure_uses_safe_policy():
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "acl.json")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"enabled": True, "policy": ["public", "allow"],
+                       "rules": [{"net": "1.1.1.1/32", "action": "unknown"}]}, f)
+        fw = FW.AppFirewall(state_dir=tmp)
+        assert fw.is_enabled() and fw.evaluate("1.1.1.1")["action"] == "deny"
+        assert fw.rules == []
+
+
+def test_acl_tamper_and_deletion_after_signed_save_fail_closed():
+    # ACL だけを書き換え/消せる攻撃者が FW を OFF にしても、再起動後に外部を許可しない。
+    with tempfile.TemporaryDirectory() as tmp:
+        fw = FW.AppFirewall(state_dir=tmp)
+        assert fw.is_enabled() is True                  # 状態欠落は安全側で起動
+        fw.enable()
+        fw.set_policy("public", "allow")
+        fw.add_rule("8.8.8.8/32", "deny")
+        assert FW.AppFirewall(state_dir=tmp).evaluate("1.1.1.1")["action"] == "allow"
+        path = fw.path
+        with open(path, encoding="utf-8") as f:
+            signed = json.load(f)
+        signed["_payload"]["enabled"] = False
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(signed, f)
+        tampered = FW.AppFirewall(state_dir=tmp)
+        assert tampered.is_enabled() and tampered.evaluate("1.1.1.1")["action"] == "deny"
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"enabled": False, "policy": {"public": "allow"}}, f)
+        unsigned = FW.AppFirewall(state_dir=tmp)
+        assert unsigned.is_enabled() and unsigned.evaluate("1.1.1.1")["action"] == "deny"
+        os.unlink(path)
+        deleted = FW.AppFirewall(state_dir=tmp)
+        assert deleted.is_enabled() and deleted.evaluate("1.1.1.1")["action"] == "deny"
+
+
+def test_acl_failed_save_rejects_and_restores_previous_policy():
+    # 永続化失敗を成功と返すと、再起動後に有効化・deny ルールが消える。
+    with tempfile.TemporaryDirectory() as tmp:
+        fw = FW.AppFirewall(state_dir=tmp)
+        assert fw.disable()["ok"]
+        with patch.object(FW, "write_signed_json", return_value=False):
+            assert fw.enable()["ok"] is False and not fw.is_enabled()
+        assert fw.enable()["ok"] and fw.is_enabled()
+        assert fw.add_rule("8.8.8.8/32", "deny")["ok"]
+        before_rules = list(fw.rules)
+        before_policy = dict(fw.policy)
+        with patch.object(FW, "write_signed_json", side_effect=OSError("disk full")):
+            assert fw.disable()["ok"] is False and fw.is_enabled()
+            assert fw.set_policy("public", "allow")["ok"] is False
+            assert fw.add_rule("1.1.1.1/32", "allow")["ok"] is False
+            assert fw.remove_rule("8.8.8.8/32")["ok"] is False
+        assert fw.policy == before_policy and fw.rules == before_rules
+        restored = FW.AppFirewall(state_dir=tmp)
+        assert restored.is_enabled() and restored.policy == before_policy
+        assert restored.rules == before_rules
+        assert restored.evaluate("8.8.8.8")["action"] == "deny"
+
+
+def test_acl_remember_failure_keeps_pending_request():
+    with tempfile.TemporaryDirectory() as tmp:
+        fw = FW.AppFirewall(state_dir=tmp)
+        fw.enable()
+        fw.set_policy("public", "prompt")
+        pid = fw.evaluate("1.1.1.1")["pending_id"]
+        with patch.object(FW, "write_signed_json", return_value=False):
+            result = fw.approve(pid, remember=True)
+        assert result["ok"] is False
+        assert [p["id"] for p in fw.pending()] == [pid]
+        assert fw.rules == []
+        assert fw.approve(pid, remember=True)["ok"] is True
+        assert fw.pending() == []
+        assert FW.AppFirewall(state_dir=tmp).evaluate("1.1.1.1")["action"] == "allow"
+
+
+def test_acl_rule_input_rejects_non_string_and_oversize_without_state_change():
+    """A bool is a valid ipaddress integer, but it is not a durable CIDR rule."""
+    with tempfile.TemporaryDirectory() as tmp:
+        fw = FW.AppFirewall(state_dir=tmp)
+        assert fw.add_rule("1.1.1.1/32", "deny", note="operator")["ok"]
+        before = list(fw.rules)
+        with open(fw.path, "rb") as f:
+            saved = f.read()
+        for net, note in ((True, "bad"), (1, "bad"),
+                          ("2.2.2.2/32", True),
+                          ("2.2.2.2/32", "x" * (FW._NOTE_MAX_CHARS + 1)),
+                          (" " * (FW._NET_MAX_CHARS + 1), "bad")):
+            result = fw.add_rule(net, "allow", note=note)
+            assert result["ok"] is False, (net, note, result)
+            assert fw.rules == before
+            with open(fw.path, "rb") as f:
+                assert f.read() == saved
+        restored = FW.AppFirewall(state_dir=tmp)
+        assert restored.rules == before
+        assert restored.evaluate("1.1.1.1")["action"] == "deny"
+
+
+def test_acl_load_only_explicit_boolean_false_disables_even_for_signed_state():
+    for signed in (False, True):
+        for enabled in (None, [], 0, "false"):
+            with tempfile.TemporaryDirectory() as tmp:
+                payload = {"policy": {"public": "allow"}, "rules": []}
+                if enabled is not None:
+                    payload["enabled"] = enabled
+                path = os.path.join(tmp, "acl.json")
+                if signed:
+                    fresh = FW.AppFirewall(state_dir=tmp)
+                    assert FW.write_signed_json(path, payload, fresh._state_key)
+                else:
+                    with open(path, "w", encoding="utf-8") as f:
+                        json.dump(payload, f)
+                fw = FW.AppFirewall(state_dir=tmp)
+                assert fw.is_enabled() and fw.evaluate("1.1.1.1")["action"] == "deny"
+                assert fw.status()["load_warning"]
+        # 正規の旧版/署名済み明示 OFF は既存意味を変えない。
+        with tempfile.TemporaryDirectory() as tmp:
+            payload = {"enabled": False, "policy": {"public": "allow"}, "rules": []}
+            path = os.path.join(tmp, "acl.json")
+            if signed:
+                fresh = FW.AppFirewall(state_dir=tmp)
+                assert FW.write_signed_json(path, payload, fresh._state_key)
+            else:
+                with open(path, "w", encoding="utf-8") as f:
+                    json.dump(payload, f)
+            fw = FW.AppFirewall(state_dir=tmp)
+            assert not fw.is_enabled() and fw.status()["load_warning"] == ""
+            assert FW.AppFirewall(state_dir=tmp).is_enabled() is False
+
+
+def test_acl_load_rejects_entire_oversized_or_malformed_rule_set():
+    valid = {"net": "1.1.1.1/32", "action": "deny", "note": "operator"}
+    cases = ([valid] * (FW._RULES_MAX + 1),
+             [valid, {"net": True, "action": "deny"}],
+             [valid, {"net": "2.2.2.2/32", "action": "allow",
+                      "note": "x" * (FW._NOTE_MAX_CHARS + 1)}])
+    for signed in (False, True):
+        for rules in cases:
+            with tempfile.TemporaryDirectory() as tmp:
+                payload = {"enabled": True, "policy": {"public": "allow"}, "rules": rules}
+                path = os.path.join(tmp, "acl.json")
+                if signed:
+                    fresh = FW.AppFirewall(state_dir=tmp)
+                    assert FW.write_signed_json(path, payload, fresh._state_key)
+                else:
+                    with open(path, "w", encoding="utf-8") as f:
+                        json.dump(payload, f)
+                fw = FW.AppFirewall(state_dir=tmp)
+                assert fw.is_enabled() and fw.rules == []
+                assert all(action == "deny" for action in fw.policy.values())
+                assert fw.evaluate("1.1.1.1")["action"] == "deny"
+                assert fw.evaluate("127.0.0.1")["action"] == "deny"
+                assert "ルール" in fw.status()["load_warning"]
+
+
+def test_acl_rule_limit_replacement_and_compiled_cache_cleanup():
+    with tempfile.TemporaryDirectory() as tmp, patch.object(FW, "_RULES_MAX", 2):
+        fw = FW.AppFirewall(state_dir=tmp)
+        assert fw.add_rule("1.1.1.1/32", "deny")["ok"]
+        assert fw.add_rule("2.2.2.2/32", "deny")["ok"]
+        assert fw.evaluate("1.1.1.1")["action"] == "deny"
+        assert fw._nets
+        before = list(fw.rules)
+        with open(fw.path, "rb") as f:
+            saved = f.read()
+        assert fw.add_rule("3.3.3.3/32", "allow")["ok"] is False
+        assert fw.rules == before
+        with open(fw.path, "rb") as f:
+            assert f.read() == saved
+        assert fw.add_rule("1.1.1.1/32", "allow")["ok"] is True
+        assert len(fw.rules) == 2
+        assert fw.remove_rule("1.1.1.1/32")["ok"]
+        assert "1.1.1.1/32" not in fw._nets
+        assert fw.add_rule("3.3.3.3/32", "deny")["ok"]
+        assert FW.AppFirewall(state_dir=tmp).evaluate("3.3.3.3")["action"] == "deny"
+
+
+def test_acl_pending_resolution_requires_bool_remember_and_string_id():
+    with tempfile.TemporaryDirectory() as tmp:
+        fw = FW.AppFirewall(state_dir=tmp)
+        assert fw.set_policy("public", "prompt")["ok"]
+        pid = fw.evaluate("1.1.1.1")["pending_id"]
+        assert pid
+        assert fw.approve(pid, remember="false")["ok"] is False
+        assert fw.deny_pending(pid, remember=1)["ok"] is False
+        assert fw.approve([], remember=False)["ok"] is False
+        assert [p["id"] for p in fw.pending()] == [pid]
+        assert fw.rules == []
+        assert fw.approve(pid, remember=False)["ok"] is True
+        assert fw.rules == []
+        pid2 = fw.evaluate("2.2.2.2")["pending_id"]
+        assert fw.approve(pid2, remember=True)["ok"] is True
+        assert FW.AppFirewall(state_dir=tmp).evaluate("2.2.2.2")["action"] == "allow"
+
+
+def test_acl_global_block_is_one_durable_change():
+    with tempfile.TemporaryDirectory() as tmp:
+        fw = FW.AppFirewall(state_dir=tmp)
+        assert fw.is_enabled()
+        assert fw.set_global_block(True)["ok"]
+        assert fw.is_enabled() and fw.evaluate("1.1.1.1")["action"] == "deny"
+        assert fw.set_global_block(False)["ok"]
+        assert fw.is_enabled() and fw.evaluate("1.1.1.1")["action"] == "allow"
+        restored = FW.AppFirewall(state_dir=tmp)
+        assert restored.is_enabled() and restored.evaluate("1.1.1.1")["action"] == "allow"
+
+
+def test_acl_global_block_failed_save_restores_both_fields():
+    with tempfile.TemporaryDirectory() as tmp:
+        fw = FW.AppFirewall(state_dir=tmp)
+        assert fw.disable()["ok"]
+        with patch.object(FW, "write_signed_json", return_value=False):
+            assert fw.set_global_block(False)["ok"] is False
+        assert not fw.is_enabled() and fw.policy["public"] == "deny"
+        assert fw.set_global_block(True)["ok"]
+        with patch.object(FW, "write_signed_json", return_value=False):
+            assert fw.set_global_block(False)["ok"] is False
+        assert fw.is_enabled() and fw.evaluate("1.1.1.1")["action"] == "deny"
+        restored = FW.AppFirewall(state_dir=tmp)
+        assert restored.is_enabled() and restored.evaluate("1.1.1.1")["action"] == "deny"
+
+
+def test_acl_large_log_reads_only_bounded_tail_and_skips_bad_lines():
+    import builtins
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "acl_log.jsonl")
+        with open(path, "wb") as f:
+            f.seek(FW._LOG_READ_MAX + 1024)
+            f.write(b"oversized-prefix\n")
+            for i in range(2005):
+                f.write(json.dumps({"action": "deny", "id": i}).encode() + b"\n")
+            f.write(b"not-json\n")
+            f.write(b'{"action":[]}\n')
+
+        actual_open = builtins.open
+
+        class BoundedReader:
+            def __init__(self, inner):
+                self.inner = inner
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return self.inner.__exit__(*args)
+
+            def __getattr__(self, name):
+                return getattr(self.inner, name)
+
+            def read(self, size=-1):
+                assert 0 <= size <= FW._LOG_READ_MAX, size
+                return self.inner.read(size)
+
+            def readlines(self, *args):
+                raise AssertionError("ACL log must not be fully read")
+
+        def bounded_open(name, *args, **kwargs):
+            inner = actual_open(name, *args, **kwargs)
+            return BoundedReader(inner) if os.fspath(name) == path else inner
+
+        with patch.object(FW, "open", bounded_open, create=True):
+            fw = FW.AppFirewall(state_dir=tmp)
+        logs = fw.log(2000)
+        assert len(logs) == 1998 and logs[0]["id"] == 7 and logs[-1]["id"] == 2004
+        assert fw.stats()["by_action"] == {"deny": 1998}
 
 
 # ── gossip: IPv6 の待受/ピアが ':::1:7946' と表示されていた ──
@@ -135,16 +420,35 @@ def _banner(state_dir, extra_args=()):
 
 
 def test_f5_banner_reports_rejected_declarative_keys():
-    """宣言的設定(--config)で拒否されたキー(例: 空の site_whitelist での whitelist)は、
-    『適用 → …』の一覧に *無い* ことでしか分からなかった。拒否を [警告] で出す。"""
+    """Invalid declarations reject the whole batch before opening either listener."""
     with tempfile.TemporaryDirectory() as d:
         cfg = os.path.join(d, "cfg.json")
         with open(cfg, "w", encoding="utf-8") as f:
             json.dump({"site_mode": "whitelist", "rate_per_sec": 25}, f)
-        seen = _banner(os.path.join(d, "state"), ["--config", cfg])
-    lines = [ln for ln in seen.splitlines() if "宣言的設定" in ln]
-    assert any("rate_per_sec" in ln for ln in lines), lines            # 他のキーは適用される
-    assert any("[警告]" in ln and "site_mode" in ln for ln in lines), lines
+        state = os.path.join(d, "state")
+        baseline = dict(ND.NetShield(state_dir=state).cfg)
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        ports = [_free_port(), _free_port()]
+        env = dict(os.environ, DUCKNET_STATE_DIR=state, DUCKNET_OFFLINE="1", PYTHONPATH=root)
+        cmd = [sys.executable, "-m", "dataplane", "--host", "127.0.0.1", "--listen", str(ports[0]),
+               "--admin", str(ports[1]), "--backend", "127.0.0.1:9", "--config", cfg]
+        result = subprocess.run(cmd, cwd=root, env=env, stdin=subprocess.DEVNULL,
+                                capture_output=True, timeout=15)
+        seen = (result.stdout + result.stderr).decode("utf-8", "replace")
+        assert result.returncode != 0 and "宣言的設定を適用できません" in seen, seen
+        assert "管理トークン" not in seen
+        for port in ports:
+            with socket.socket() as probe:
+                probe.settimeout(0.2)
+                assert probe.connect_ex(("127.0.0.1", port)) != 0
+        restored = ND.NetShield(state_dir=state).cfg
+        assert restored["rate_per_sec"] == baseline["rate_per_sec"]
+        assert restored["site_mode"] == baseline["site_mode"]
+        # A valid declaration still starts normally and reports its applied key.
+        with open(cfg, "w", encoding="utf-8") as f:
+            json.dump({"rate_per_sec": 25}, f)
+        seen = _banner(state, ["--config", cfg])
+        assert any("宣言的設定" in line and "rate_per_sec" in line for line in seen.splitlines()), seen
 
 
 def test_f6_banner_warns_about_saved_empty_site_whitelist():
@@ -181,9 +485,9 @@ def test_f7_dashboard_renders_config_warnings_escaped():
 # ── 管理 API: 早期拒否(415/403/401/421)が本文を読まずに閉じ、拒否理由が届かなかった ──
 def test_f8_admin_early_reject_still_delivers_the_response():
     """本文を読まないまま応答して接続を閉じると、未読データのせいで TCP RST になり(Windows は
-    受信済みの応答まで捨てる)、正規のクライアントが 415/403/401 の理由を受け取れなかった
-    (負荷時に test_c26 が ConnectionAbortedError で落ちたのはこれ)。宣言された本文を上限内で
-    読み捨ててから応答する。"""
+    受信済みの応答まで捨てる)、正規のクライアントが 403/401 の理由を受け取れなかった
+    (負荷時に test_c26 が ConnectionAbortedError で落ちたのはこれ)。送信済みの本文は
+    短い総期限内で読み捨て、宣言だけの本文を待ち続けない。"""
     import dataplane.admin as A
     with tempfile.TemporaryDirectory() as d:
         ofw, osh = FW._FW, ND._SHIELD
@@ -194,8 +498,8 @@ def test_f8_admin_early_reject_still_delivers_the_response():
         try:
             body = b"x" * (512 * 1024)                 # 上限(1 MiB)内の大きめの本文
             cases = [
-                ("415", {"Cookie": "%s=%s" % (A._COOKIE_NAME, adm.token),
-                         "Content-Type": "text/plain"}),
+                ("403", {"X-Token": adm.token, "Content-Type": "text/plain",
+                         "Origin": "http://127.0.0.1:9999"}),
                 ("401", {"Content-Type": "application/json"}),
             ]
             for want, hdrs in cases:

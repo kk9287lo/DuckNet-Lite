@@ -13,6 +13,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest import SkipTest
 
 from dataplane.engine.services.proxy import AsyncEdgeGuard
+from guard_support import stateless_fork_policy
 
 
 def _guard(backend_port: int = 9, port: int = 0) -> AsyncEdgeGuard:
@@ -104,7 +105,8 @@ def test_c54_drain_stops_accepting_new_connections():
     finally:
         be.release.set()
         ta.join(5.0)
-        ts.join(10.0)
+        if ts.ident is not None:                  # 前提失敗で未起動なら二次例外にしない
+            ts.join(10.0)
         be.close()
         g.stop()
     assert b"200" in out.get("a", b""), out          # 進行中のリクエストは捌き切る
@@ -136,6 +138,7 @@ def _free_port() -> int:
     return port
 
 
+@stateless_fork_policy()
 def test_c56_cluster_workers_drain_instead_of_dying_on_stop():
     """#56: --cluster のワーカーは SIGTERM で即死(SIG_DFL)していた。親が自分の drain を
     している間もワーカーは新規受理を続け、その後 SIGTERM で進行中のリクエストごと切られた。

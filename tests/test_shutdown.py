@@ -156,7 +156,7 @@ def test_drain_respects_deadline():
 def test_handle_brackets_active_counter():
     # _handle ラッパが本体の前後で進行中数を増減(全 return 経路で必ずデクリメント)。
     g = AsyncEdgeGuard(); seen = []
-    async def fake_conn(reader, writer):
+    async def fake_conn(reader, writer, acl_jobs=None):
         seen.append(g._active)
     g._handle_conn = fake_conn
     asyncio.run(g._handle(None, None))

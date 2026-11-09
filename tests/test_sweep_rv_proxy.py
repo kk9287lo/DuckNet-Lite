@@ -24,6 +24,7 @@ import dataplane.engine.lifeform.pipeline as ND
 import dataplane.engine.lifeform.policy as FW
 from dataplane.engine.services.proxy import (AsyncEdgeGuard, _redirect_violation_host,
                                              _wants_html)
+from guard_support import stop_guard_owned
 
 
 # ── 共通ヘルパ ──────────────────────────────────────────────────────────────
@@ -47,7 +48,7 @@ _OK = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok"
 
 
 class _Backend:
-    """接続ごとに EOF(ガードの半クローズ)か 2 秒無通信まで読んで記録し、固定応答を返す。"""
+    """検査済み HTTP head と宣言済み CL 本文を読み切ってから固定応答を返す。"""
 
     def __init__(self):
         self.got = []
@@ -72,16 +73,29 @@ class _Backend:
 
     def _one(self, c):
         c.settimeout(2.0)
-        data = b""
+        data = bytearray()
         try:
-            while len(data) < 262144:
+            while b"\r\n\r\n" not in data and len(data) < 262144:
                 ch = c.recv(65536)
                 if not ch:
                     break
-                data += ch
+                data.extend(ch)
+            head, sep, rest = bytes(data).partition(b"\r\n\r\n")
+            if sep:
+                lengths = [line.split(b":", 1)[1].strip()
+                           for line in head.split(b"\r\n")[1:]
+                           if line.lower().startswith(b"content-length:")]
+                count = int(lengths[0]) if lengths else 0
+                body = bytearray(rest[:count])
+                while len(body) < count:
+                    ch = c.recv(min(65536, count - len(body)))
+                    if not ch:
+                        break
+                    body.extend(ch)
+                data = bytearray(head + sep + body)
         except OSError:
             pass
-        self.got.append(data)
+        self.got.append(bytes(data))
         try:
             c.sendall(_OK)
         except OSError:
@@ -107,7 +121,7 @@ def _guard(backend, **kw):
     try:
         yield g
     finally:
-        g.stop()
+        stop_guard_owned(g)
 
 
 def _read_all(c) -> bytes:
@@ -242,8 +256,8 @@ def _scan(buf, reader, writer=None, ctx=None, guard_kw=None, **cfg):
 
 
 def test_r10_interim_100_only_when_the_client_is_waiting_for_it():
-    """100 を返すのは HTTP/1.1 以上で Expect: 100-continue があり、本文がまだ届いていないときだけ。
-    HTTP/1.0 の Expect は無視する決まり。本文を読まない(走査が全部無効)なら backend に任せる。"""
+    """100 を返すのは HTTP/1.1 以上で Expect: 100-continue があり、本文が未完了のときだけ。
+    HTTP/1.0 の Expect は無視する。走査が本文を読まない場合は上位の転送器が 100 を返す。"""
     w, ctx = _W(), {}
     (extra, blocked), _ = _scan(_EXPECT_HEAD, _R(_EXPECT_BODY), w, ctx)
     assert w.buf == b"HTTP/1.1 100 Continue\r\n\r\n" and ctx.get("continued"), (w.buf, ctx)
@@ -347,6 +361,9 @@ def test_r33_java_client_gets_rate_limit_json_end_to_end():
     req = _req(b"Accept: " + _JAVA_ACCEPT.encode() + b"\r\n", path=b"/api/items",
                ua=b"Java/17.0.2")
     with _shield() as sh:
+        # _drive の模擬 peer は public IP。既定 ON の ACL をこの IP だけ通し、
+        # 429 の本文形式まで到達させる。
+        assert FW._FW.add_rule("198.51.100.71/32", "allow")["ok"]
         sh.set_path_limits([{"path": "/api/items", "rate": 0.001, "burst": 1}])
         _drive(req)
         status, hdrs, body = _split(_drive(req))
@@ -386,6 +403,7 @@ def test_r34_audit_mode_records_duplicate_headers_and_forwards():
 def test_r34_enforce_mode_still_rejects_duplicate_headers():
     """enforce(既定)では従来どおり 400 で拒否し backend へ流さない。"""
     with _shield():
+        assert FW._FW.add_rule("198.51.100.71/32", "allow")["ok"]
         status, _, body = _split(_drive(_DUP))
     assert status.startswith("HTTP/1.1 400"), status
     assert body == b'{"error":"conflicting header values"}', body

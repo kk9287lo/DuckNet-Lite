@@ -4,6 +4,8 @@
 #   docker compose up -d                        # ゲートウェイ(前衛 + 管理画面)
 #
 # 全コンテナとも非rootで動くため、<1024 はホスト側でのみ公開しコンテナ内は高位ポート。
+# 前衛 8443 は TLS 終端を行わない平文 HTTP。公開 HTTPS は同じホストの TLS 終端
+# プロキシから loopback へ転送する(または非公開の専用ネットワークを使う)。
 # =============================================================================
 services:
   # 前衛ゲートウェイ(HTTP の L7 DDoS/WAF) + 管理ダッシュボード
@@ -11,12 +13,28 @@ services:
     build: .
     image: ducknet-lite:1.3.0
     restart: unless-stopped
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=64m
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     environment:
       - DUCKNET_OFFLINE=1
     ports:
-      - "8443:8443"            # 前衛(公開。ここに来た通信を防御してバックエンドへ)
+      - "127.0.0.1:8443:8443"  # 前衛(平文 HTTP。公開 TLS 終端プロキシからのみ到達)
       - "127.0.0.1:8081:8081"  # 管理画面はホストの 127.0.0.1 のみへ公開(トークン保護)
-      # ↑ トップページはトークンを認証なしで配る設計。ネットワークに晒さないこと。
+      # ↑ ホスト外部アドレスへは公開しない。同一Dockerネットワークのコンテナからは
+      #    host.docker.internal やコンテナIP経由で到達し得るため、管理トークンを必須とする。
       # リモートから見る場合は SSH トンネル: ssh -L 8081:127.0.0.1:8081 <host>
+    volumes:
+      - ducknet-state:/data     # ACL・BAN・署名鍵をコンテナ再作成後も保持
     command: ["--backend", "host.docker.internal:8080", "--listen", "8443",
-              "--admin", "8081", "--admin-host", "0.0.0.0"]
+              "--host", "0.0.0.0",
+              "--admin", "8081", "--admin-host", "0.0.0.0", "--health-path", "/healthz"]
+
+volumes:
+  ducknet-state:

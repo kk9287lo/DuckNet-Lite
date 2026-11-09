@@ -39,7 +39,8 @@ def _force_utf8_stdio() -> None:
 _force_utf8_stdio()
 
 def _isolate_state_dir() -> str:
-    """テストが **利用者の本物の状態ディレクトリ**(~/.cache/dataplane)に一切触れないよう、
+    """テストが **利用者の本物の状態ディレクトリ**(旧共用 ~/.cache/dataplane、
+    現専用 ~/.cache/ducknet-lite の双方)に一切触れないよう、
     使い捨ての一時ディレクトリへ向ける。製品コードを import する *前* に行うこと。
 
     以前はこれが無く、テストを回すたびに実際の DuckNet の BAN リスト・管理監査ログ・
@@ -66,9 +67,191 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.dirname(_HERE)
 sys.path.insert(0, _ROOT)   # dataplane / dataplane.engine を import 可能に
 sys.path.insert(0, _HERE)   # test_*.py を import 可能に
-os.environ.setdefault("DUCKNET_OFFLINE", "1")
+os.environ["DUCKNET_OFFLINE"] = "1"
 
 MODULES = [
+    "test_gui_auth_modal", # masked unlock, retry and instance-bound signed HTTP
+    "test_gui_auth_transport", # bounded responses, cancellation and session ownership
+    "test_gui_operations", # ACL/policy/events and cluster-aware mutations
+    "test_gui_editor_visualization", # structured drafts, safe tables and chart windows
+    "test_gui_tray_workflow", # verified gateway, consented clipboard and status menu
+    "test_gui_settings_schema", # every supported setting has typed bilingual dashboard metadata
+    "test_gui_settings_editor", # advanced settings preserve drafts and commit atomically
+    "test_security_admin_quiesce_preflight_round25", # invalid admin payload cannot stop healthy fork workers
+    "test_security_explicit_env_file_round25", # explicit missing env file must not select default state
+    "test_security_present_corrupt_tmp_round25", # corrupt main cannot recover stale signed tmp
+    "test_security_response_status_commit_round25", # invalid backend head cannot score client
+    "test_security_monitor_redact_round25", # log-safe URL must not echo nested or malformed secrets
+    "test_security_posix_eacces_round24", # unreadable legacy state and BANs cannot look pristine
+    "test_security_env_read_round24", # unreadable or oversized app.env must not select fallback state
+    "test_security_early_backend_reject_round24", # early origin 413 must not be hidden by body replay
+    "test_security_env_utf8_round24", # malformed app.env cannot redirect signed state home
+    "test_security_body_probe_capacity_round24", # quota pressure scan is bounded across fork workers
+    "test_security_admin_post_status_round24", # failed admin POST must not claim HTTP success
+    "test_security_body_reclaim_round23", # killed fork worker cannot strand the live body budget
+    "test_security_backend_halfclose_round23", # complete HTTP request must not look aborted to buffering backends
+    "test_security_admin_nonce_round22", # full nonce cache cannot amplify each valid rejected MAC
+    "test_security_body_atomic_round22", # malformed late request body cannot reach backend
+    "test_security_admin_fragment_round21", # direct dashboard bootstrap drops legacy fragment token
+    "test_security_state_lifecycle_round21", # explicit empty external state key cannot silently fall back
+    "test_security_egress_dlp_round21", # high-confidence secret cannot hide inside an alnum wrapper
+    "test_security_ingress_stream_round21", # failed header inspection cannot become a clean view
+    "test_security_gui_url_fragment_round21", # tray browser drops legacy fragment credentials
+    "test_security_state_namespace_round20", # ambiguous FalcoNet legacy state requires an explicit DuckNet home
+    "test_security_windows_commit_lock_round20", # external signed commits cannot race a Windows backend write
+    "test_security_ban_commit_barrier_round20", # BAN publication must obey the backend write barrier
+    "test_security_traffic_commit_round20", # stale quota accounting cannot overwrite a newer signed window
+    "test_security_usage_commit_round20", # stale telemetry cannot overwrite a newer signed usage snapshot
+    "test_security_serving_lease_round20", # two servers cannot own one quota state at once
+    "test_security_single_owner_round20", # a second listener must not share finite quota state
+    "test_security_response_commit_round20", # signed policy ack cannot overtake client response bytes
+    "test_security_noop_cluster_round20", # same-value admin requests must not needlessly stop fork workers
+    "test_security_external_single_round20", # cluster-origin single owner observes external signed policy
+    "test_security_body_response_barrier_round19", # incomplete uploads cannot release early backend responses
+    "test_security_config_preflight_round19", # invalid cross-field config cannot quiesce workers
+    "test_security_docker_context_round18", # no unrelated local backups reach build context or image
+    "test_security_admin_rule_schema_round18", # typos cannot silently replace a live ACL rule
+    "test_security_legacy_purpose_round18", # legacy signatures cannot be transplanted across state purposes
+    "test_security_proxied_metric_round18", # backend write, not TCP connect, confirms proxied status
+    "test_security_path_bucket_budget_round16", # aggregate path buckets cannot grow without limit
+    "test_security_numeric_config_round16", # malformed numeric settings cannot poison scoring or deadlines
+    "test_security_numeric_bounds_round16", # extreme Range/body settings cannot disable guards
+    "test_security_cadence_config_round16", # invalid timing cannot disable cadence detection
+    "test_security_cluster_telemetry_round16", # dashboard marks fork-local counters as parent-only
+    "test_security_cluster_state_fallback_round16", # unshared worker state cannot claim global enforcement
+    "test_security_subnet_capacity_round16", # hot subnet history survives table and per-subnet churn
+    "test_security_cluster_parent_death_round16", # orphan fork workers stop before admitting or forwarding
+    "test_security_edge_lua_lock_round16", # expired worker lock cannot strand or corrupt Lua ban generations
+    "test_security_window_budget_round16", # aggregate timestamp windows fail closed at capacity
+    "test_security_active_ip_eviction_round16", # active rate/score history survives IP churn
+    "test_security_ip_state_capacity_round16", # full IP table preserves every live BAN and fails new admissions safely
+    "test_security_credential_capacity_round16", # active credential window survives key churn
+    "test_security_conn_rate_capacity_round16", # active connection-rate window survives IP churn
+    "test_security_dlp_early_timeout_round16", # early wakeup cannot hide HTML DLP timeout audit
+    "test_security_sec_headers_bool_round16", # direct header toggle rejects non-booleans before client wire changes
+    "test_security_penalize_weight_round16", # invalid direct penalty cannot poison score comparisons
+    "test_security_score_config_round16", # negative signed scoring cannot cancel threat signals
+    "test_security_score_halflife_round16", # invalid decay cannot erase repeated attack scores
+    "test_security_ban_args_round16", # direct BAN API rejects coercions before durable mutation
+    "test_security_shared_cluster_round16", # worker rate and BAN decisions must share one enforcement state
+    "test_security_suspend_gap_round16", # nonfinite sleep gap must not make a finite BAN permanent
+    "test_security_gui_stale_round16", # failed refresh makes stale controls inert until verified recovery
+    "test_security_admin_disabled_integrity_round16", # disabled Shield still reports signed corruption
+    "test_security_cluster_forward_barrier_round16", # signed policy commits cannot overtake backend request writes
+    "test_security_edge_export_cluster_round16", # cluster export refuses incomplete parent-only BAN snapshot
+    "test_security_unban_atomic_round16", # failed durable unban cannot release live BAN
+    "test_security_cluster_direct_setter_round15", # fork workers must see direct parent policy updates
+    "test_security_acl_first_save_round15", # marker-only first save must not strand fork workers
+    "test_security_cluster_reload_round15", # verified reload preserves ACL work and catches signed tamper
+    "test_security_cfg_recovery_round15", # partial signed config cannot restore shield OFF after memory tamper
+    "test_security_admin_integrity_status_round15", # signed defense failure cannot paint a healthy dashboard
+    "test_security_health_signed_state_round14", # signed-state fail-closed cannot advertise healthy
+    "test_security_compose_plaintext_round14", # bundled plain-HTTP edge binds host loopback
+    "test_security_cluster_round14", # cluster quota and admin changes cannot bypass forked workers
+    "test_security_quota_config_round14", # invalid quota caps cannot silently disable enforcement
+    "test_security_redirect_failclosed_round14", # redirect policy errors cannot release unsafe head
+    "test_security_forwarding_failclosed_round14", # configured request defenses fail closed before backend
+    "test_security_drain_grace_round14", # invalid grace cannot turn shutdown into an unbounded wait
+    "test_security_admin_audit_unavailable_round14", # audit read/corrupt tail cannot paint healthy empty history
+    "test_security_health_readiness_round14", # unavailable mandatory defense cannot advertise healthy
+    "test_security_health_framing_round14", # health 200 follows strict HTTP syntax rejection
+    "test_security_admin_list_outage_round13", # failed list sources must not display empty healthy panels
+    "test_security_response_quota_round13", # in-flight byte/time quotas bound real response wires
+    "test_security_override_cgi_round13", # CGI aliases of method/path overrides cannot skip edge policy
+    "test_security_audit_torn_tail_round13", # failed JSONL rollback cannot make a later append look successful
+    "test_security_edge_export_tamper_round13", # untrusted signed sources cannot erase edge bans
+    "test_security_admin_gui_status_round13", # partial status failure never paints healthy/off GUI
+    "test_security_untrusted_ban_result_round12", # failed BAN save cannot report success
+    "test_security_custom_state_tamper_round12", # signed config/rules loss cannot reopen backend
+    "test_security_header_underscore_round12", # CGI/WSGI aliases cannot revive protected request fields
+    "test_security_edit_list_input_round12", # direct list edits validate one item and persist atomically
+    "test_security_unknown_config_round12", # unknown keys reject the whole config patch
+    "test_security_unmarked_wide_dlp_round12", # detect wide credentials throughout the response stream
+    "test_security_response_obs_value_round12", # reject downstream header whitespace ambiguity
+    "test_security_corrupt_highwater_round12", # invalid signed history cannot downgrade saved state
+    "test_security_ban_tamper_failclosed_round12", # untrusted signed BAN state denies backend admission
+    "test_security_quota_tamper_failclosed_round12", # untrusted quota history cannot reset limits
+    "test_security_windows_extension_alias_round11", # Win32 file aliases in all path policies
+    "test_security_multidecode_path_round11", # protect each 0..5 decode stage and delimiter view
+    "test_security_scan_cpu_round11", # preserve signatures/Unicode while bounding scan CPU
+    "test_security_encoded_delimiter_path_round11", # decode-first query/fragment route views
+    "test_security_state_lock_deadline_round11", # bound signed-state lock acquisition
+    "test_security_partial_response_dlp_round11", # reject unscannable partial egress representations
+    "test_security_ipv6_site_policy_round10", # site policy checks bracketed IPv6 Host
+    "test_security_response_filename_dlp_round10", # DLP scans decoded response filenames
+    "test_security_log_rotation_cap_round10", # blocked rotation cannot exceed audit log cap
+    "test_security_service_start_cleanup_round9", # admin startup failure reaps the edge listener
+    "test_security_response_head_percent_dlp_round9", # inspect percent-decoded URL response metadata
+    "test_admin_readiness_slot_round8", # wait until startup probe releases its handler slot
+    "test_security_script_style_dlp_round8", # fail closed on executable JS/CSS DLP media
+    "test_security_admin_stop_audit_wait_round8", # bound stop while audit append is stalled
+    "test_security_html_entity_dlp_round8", # inspect browser-decoded HTML entities before response release
+    "test_security_admin_audit_failure_round8", # expose audit-write failure after applied admin changes
+    "test_security_windows_path_alias_round8", # include Win32 trailing-dot/space/ADS private-path readings
+    "test_security_credential_obs_space_round7", # count backend-equivalent API keys identically
+    "test_security_route_override_obs_round7", # reject route-override obs-text whitespace ambiguity
+    "test_security_quota_capacity_round7", # retain active quota and block before the next backend response
+    "test_security_egress_sfx_zip_round7", # block SFX and disguised archive responses before client bytes
+    "test_security_admin_reject_drain_round7", # bound unauthenticated reject body waits
+    "test_security_request_target_ctl_round7", # reject request-line CTL before backend interpretation
+    "test_security_usage_eviction_round7", # preserve tracked usage history at capacity
+    "test_security_append_lock_cache_round4", # reclaim per-path append locks after writes
+    "test_security_path_lock_cache_round4", # reclaim per-path state locks after operations
+    "test_admin_generation_head_round5", # bound admin heads and reject stale handlers after stop
+    "test_admin_pending_heads_round4", # reserve admin handler capacity from slow unauthenticated headers
+    "test_security_audit_compressed_eof_round4", # report malformed complete coding in audit mode
+    "test_security_deflate_graphql_round4", # complete compressed GraphQL representation
+    "test_security_deflate_dual_view_round4", # reject divergent zlib/raw deflate interpretations
+    "test_security_gzip_members_round4", # bound empty gzip member CPU work in all decode paths
+    "test_admin_readiness_delay_round3", # delayed live admin HTTP readiness
+    "test_security_response_trailer_round3", # response-control fields stay out of trailers
+    "test_acl_signed_history_round3",    # ACL unsigned replacement after signed history
+    "test_security_response_connection_round3", # protected response fields survive downstream hops
+    "test_security_declarative_file_round3", # strict all-or-nothing config file authority
+    "test_gui_url_scrub_round3",            # legacy token aliases leave browser history
+    "test_security_request_length_round3", # bounded request Content-Length before backend
+    "test_security_xff_hops_round2",       # trusted-proxy rightmost identity and wire BAN
+    "test_security_encoded_upload_round2", # encoded upload completeness in enforce/audit
+    "test_security_response_interim_round2", # bounded 1xx chain and exact response bytes
+    "test_security_admin_state_round", # strict management request framing
+    "test_security_ingress_round",     # protected Connection option semantics
+    "test_security_egress_round",      # cache and redirect response boundaries
+    "test_security_launcher_round",    # startup address and browser target validation
+    "test_falco_admin_boundaries",   # unique credentials, origins and total body deadline
+    "test_falco_protocol_alignment", # singleton request fields and origin response boundaries
+    "test_falco_graphql_views",      # query aliases and envelope-owned batch accounting
+    "test_graphql_persisted_query",  # uninspectable cached operations and wire behavior
+    "test_seams_admin",            # absent versus explicit-null management fields
+    "test_seams_service",          # startup address syntax cannot discard suffixes
+    "test_seams_state",            # persisted inner schemas and strict normalization
+    "test_seams_storage",          # log generation preservation on rename failures
+    "test_seams_transport",        # finite responses complete at their HTTP boundary
+    "test_boundary_corpus_protocol", # bounded grammar mutations and exact wire controls
+    "test_boundary_corpus_state",    # atomic configuration and legacy state boundaries
+    "test_boundary_corpus_admin",    # strict JSON and all-or-nothing management inputs
+    "test_egress_privacy_transport", # decoded/raw response equivalence and opaque formats
+    "test_egress_privacy_core",      # current secret formats and atomic accounting bounds
+    "test_egress_privacy_admin",     # error, audit and diagnostic data minimization
+    "test_egress_privacy_service",   # credential output ownership at startup
+    "test_gui_dashboard_edges", # bulk targets, input controls and asynchronous UI results
+    "test_gui_native_edges",    # native failure recovery, message and child ownership
+    "test_gui_tray",           # Win32 readiness, stop ownership and resource cleanup
+    "test_gui_launcher",       # URL, child, status and callback lifecycle
+    "test_gui_dashboard",      # modal, async render and operation result boundaries
+    "test_edge_proxy",         # deadlines, admission and bounded logging ownership
+    "test_edge_proxy_worker_phase", # separate child startup and worker failure deadlines
+    "test_edge_pipeline",      # configuration budgets and concurrent accounting
+    "test_edge_policy",        # coherent export and ACL hot path
+    "test_edge_storage",       # nonwaiting diagnostics and serialized audit writes
+    "test_privacy_ingress",     # 非公開経路/機密artifact/uploadと記録用URL
+    "test_privacy_response",    # DLP応答境界と私有応答のキャッシュ禁止
+    "test_privacy_admin",       # 管理情報をキャッシュへ残さない
+    "test_privacy_deployment",  # 適用例・実通信・信頼proxy境界の接続確認
+    "test_atomic_storage",      # 鍵・署名状態・失敗時の公開/耐久性
+    "test_atomic_pipeline",     # 設定・BAN・解除の一括commitと結果
+    "test_atomic_admin",        # 管理API/ACLのロック・成功応答
+    "test_atomic_runtime",      # 待受/子プロセスの所有・失敗時回収
+    "test_atomic_edge",         # 前衛生成物の準備・復元と部分失敗
     "test_core",                # 管理ダッシュボード制御API
     "test_logio",               # 追記ログのローテーション(肥大防止)
     "test_banner",              # 動的デセプション(偽Serverバナーで指紋攪乱)
@@ -87,6 +270,7 @@ MODULES = [
     "test_keepalive",           # keep-alive 越しの検査回避を封じる(Connection: close 強制)
     "test_realip",              # 信頼proxy背後の実クライアントIP解決(XFF・既定は信頼しない)
     "test_signed_state",        # 自己防衛: 可変状態ファイルの HMAC 署名による改竄耐性
+    "test_posix_runtime",       # Linux: 実SIGTERMのflush/子回収と別UID出力権限
     "test_autostart",           # 自己防衛: 起動時自動起動の登録(透明・公認の場所のみ)
     "test_respscore",           # 応答アウェア脅威スコア(4xx連射=列挙/ブルートフォース検知)
     "test_bodyscan",            # 要求ボディ検査(POST/JSON 本文の SQLi/XSS/RCE/SSTI=head死角)
@@ -111,6 +295,11 @@ MODULES = [
     "test_connlimit_global",    # グローバル同時接続上限(FD/ソケット枯渇のロードシェッド)
     "test_saferegex",           # ReDoS 耐性(lint/入力上限/線形リテラル照合)・組込sig安全性
     "test_smuggling",           # HTTP リクエストスマグリング/デシンク拒否(CL.TE/裸LF/obs-fold等)
+    "test_framing_boundaries",   # TE/ヘッダ構文/chunk 拡張と trailer の前衛・上流境界
+    "test_request_body_scan_budget",  # 復号後の走査上限・multipart境界・binary宣言の検査回避
+    "test_proxy_boundaries_batch",     # 本文前の backend 接続・Host・DLP chunk 枠の境界
+    "test_admin_bootstrap",      # Cookie漏えい防止・管理ヘッダ認証・同一応答のトレイ状態証明
+    "test_admin_browser_mac",    # browser要求/応答MAC、再送・再起動・時刻ずれ・Windows bind排他
     "test_scanwindow",          # 走査面のバイパス封じ(パディング/NFKC展開/窓予算)と資源境界
     "test_vulnfix",             # 脆弱性修正の回帰(CSRF/トークン配布/署名束縛)
     "test_complexity",          # 二次コスト(O(N^2))の再発防止(間引きの低水位・走査量削減の非回帰)
@@ -172,7 +361,39 @@ MODULES = [
 ]
 
 
+_NATIVE_SECRET_VIOLATIONS = []
+
+
+def _isolate_native_secrets() -> None:
+    """Automated tests must explicitly supply fake consent/clipboard APIs."""
+    from dataplane.gui import __main__ as gui
+
+    _NATIVE_SECRET_VIOLATIONS.clear()
+
+    def blocked(boundary):
+        def refuse(*_args, **_kwargs):
+            _NATIVE_SECRET_VIOLATIONS.append(boundary)
+            raise AssertionError("real " + boundary + " is forbidden in automated tests")
+        return refuse
+
+    gui._confirm_token_copy = blocked("token-copy consent")
+    gui._clipboard_api = blocked("clipboard access")
+
+
+def _assert_native_secrets_untouched(before: int) -> None:
+    if len(_NATIVE_SECRET_VIOLATIONS) != before:
+        raise AssertionError("test attempted native secret UI: " + repr(_NATIVE_SECRET_VIOLATIONS[before:]))
+
+
 def main() -> int:
+    # 明示順序を保ちつつ、新設した試験を登録せず「全試験成功」と表示する漏れを防ぐ。
+    discovered = {p[:-3] for p in os.listdir(os.path.dirname(__file__))
+                  if p.startswith("test_") and p.endswith(".py")}
+    if discovered != set(MODULES):
+        print("FAIL test manifest mismatch: unregistered=" + repr(sorted(discovered - set(MODULES)))
+              + " missing=" + repr(sorted(set(MODULES) - discovered)))
+        return 1
+    _isolate_native_secrets()
     total = passed = 0
     skipped = []
     for name in MODULES:
@@ -181,13 +402,18 @@ def main() -> int:
                if k.startswith("test_") and callable(v)]
         for fn in fns:
             total += 1
+            native_before = len(_NATIVE_SECRET_VIOLATIONS)
             try:
                 fn()
+                _assert_native_secrets_untouched(native_before)
                 passed += 1
                 print(f"PASS {name}.{fn.__name__}")
             except SkipTest as e:   # 環境を満たせないテスト(Tk 無しのサーバ等)
-                skipped.append(f"{name}.{fn.__name__}")
-                print(f"SKIP {name}.{fn.__name__} -> {e}")
+                if len(_NATIVE_SECRET_VIOLATIONS) != native_before:
+                    print(f"FAIL {name}.{fn.__name__} -> attempted native secret UI before skipping")
+                else:
+                    skipped.append(f"{name}.{fn.__name__}")
+                    print(f"SKIP {name}.{fn.__name__} -> {e}")
             except Exception as e:  # noqa: BLE001 (テストランナー)
                 print(f"FAIL {name}.{fn.__name__} -> {e!r}")
                 traceback.print_exc()

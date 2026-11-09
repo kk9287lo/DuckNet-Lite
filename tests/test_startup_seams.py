@@ -20,10 +20,12 @@ import tempfile
 import threading
 import time
 from unittest import SkipTest   # OS 機能が無い環境は黙って通さず明示 SKIP
+from unittest import mock
 
 from dataplane import service
 from dataplane.engine.lifeform.pipeline import NetShield
 from dataplane.engine.services.proxy import AsyncEdgeGuard
+from guard_support import stateless_fork_policy
 
 
 def _shield(d, **cfg):
@@ -103,6 +105,7 @@ def test_start_still_reports_ok_on_a_free_port():
         g.stop(grace=0.0)
 
 
+@stateless_fork_policy()
 def test_cluster_forks_workers_and_stop_reaps_every_one():
     """--cluster の実プロセス回帰。旧実装では stop() が子を一切止めず、親だけ死んで
     ワーカーが待受ポートを握ったまま残った(実測 13 個残存)。fork して立ち上げ、
@@ -153,6 +156,7 @@ def test_cluster_forks_workers_and_stop_reaps_every_one():
         raise AssertionError(f"停止後もポート {port} で待受けが続いている(ワーカー残存)")
 
 
+@stateless_fork_policy()
 def test_cluster_restart_rebinds_instead_of_reusing_a_closed_listener():
     """--cluster で上げた親は、停止時に閉じた listener を持ち越してはいけない。
     持ち越すと次の start() が **閉じたソケット** を asyncio へ渡し、以後どうやっても
@@ -421,13 +425,36 @@ def test_blocked_methods_wrong_type_does_not_erase_the_setting():
         r = sh.set_blocked_methods("TRACE, CONNECT")               # 文字列は受理して分解
         assert r.get("ok") is True and sh.cfg["blocked_methods"] == ["TRACE", "CONNECT"]
         r = sh.set_blocked_methods(["GET", "b@d"])                 # 不正要素は黙って捨てない
-        assert r.get("rejected") == ["B@D"]
+        assert r.get("ok") is False and r.get("rejected") == ["B@D"]
+        assert sh.cfg["blocked_methods"] == ["TRACE", "CONNECT"]
 
 
 def test_unscannable_content_encoding_is_rejected_by_default():
     with tempfile.TemporaryDirectory() as d:
         sh = _shield(d)
         assert sh.cfg.get("body_reject_unscannable_encoding") is True
+
+
+def test_default_on_save_failure_never_starts_the_frontend():
+    """A failed firewall or shield save cannot be reported as protected startup."""
+    class Defense:
+        def __init__(self, ok):
+            self.ok = ok
+
+        def enable(self):
+            return {"ok": self.ok, "enabled": self.ok}
+
+    for firewall_ok, shield_ok in ((False, True), (True, False)):
+        with mock.patch.object(service, "app_firewall", return_value=Defense(firewall_ok)), \
+                mock.patch.object(service, "net_shield", return_value=Defense(shield_ok)), \
+                mock.patch.object(service, "AsyncEdgeGuard",
+                                  side_effect=AssertionError("frontend started despite save failure")):
+            try:
+                service.run(backend="127.0.0.1:9", defaults_on=True)
+            except SystemExit as error:
+                assert "保存に失敗" in str(error)
+            else:
+                raise AssertionError("save failure was accepted")
 
 
 # ── 停止時の取りこぼし ──

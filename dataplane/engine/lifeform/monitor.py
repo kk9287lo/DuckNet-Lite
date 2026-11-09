@@ -51,6 +51,29 @@ _QUERY_NAME_SEP_RE = re.compile(r"[\s\x00-\x1f\u115f\u1160\u3164\uffa0\u200b-\u2
 _SENSITIVE_QUERY_NORM = {s.replace("_", "") for s in _SENSITIVE_QUERY}
 
 _REDACTED = "[REDACTED]"
+_INVALID_LOG_URL = "[REDACTED INVALID URL]"
+_MAX_LOG_URL_CHARS = 16384
+
+
+def _log_url_parts(url: str):
+    """Reject ambiguous or oversized URLs before any raw text reaches logs."""
+    if not isinstance(url, str) or len(url) > _MAX_LOG_URL_CHARS:
+        raise ValueError("invalid log URL")
+    if any(not ch.isprintable() for ch in url):
+        raise ValueError("log URL contains control or separator characters")
+    parts = urlsplit(url)
+    if not parts.scheme or not parts.netloc or not parts.hostname:
+        raise ValueError("log URL needs scheme and host")
+    if "%" in parts.netloc or "\\" in parts.netloc:
+        # Encoded '@' or ':' can become userinfo in another URL parser.
+        raise ValueError("log URL has ambiguous authority")
+    return parts
+
+
+def _ambiguous_query_component(value: str) -> bool:
+    """Unknown nested decoding must not expose a value under a benign key."""
+    return any(ch in "%;&=?#" or ord(ch) < 0x20 or ord(ch) > 0x7e
+               for ch in value)
 
 
 def _norm_query_name(name: str) -> str:
@@ -139,7 +162,7 @@ def check_url(url: str, *, allow_schemes=("http", "https"),
               allow_unique_local: bool = False, resolve: bool = True) -> dict:
     """URLをSSRF観点で検査。スキーム制限+ホストの解決先レンジ判定。{ok, allowed, reason}。"""
     try:
-        parts = urlsplit(url)
+        parts = _log_url_parts(url)
     except Exception as e:
         return {"ok": False, "allowed": False, "reason": f"URL解析不能: {e}"}
     scheme = (parts.scheme or "").lower()
@@ -162,7 +185,7 @@ def check_url(url: str, *, allow_schemes=("http", "https"),
 def strip_userinfo(url: str) -> str:
     """URL から user:pass@ を除去する(資格情報の漏えい防止)。"""
     try:
-        parts = urlsplit(url)
+        parts = _log_url_parts(url)
         if not parts.username and not parts.password:
             return url
         # '@' より後ろ(host[:port])をそのまま残す。hostname から組み直すと IPv6 の角括弧が
@@ -170,22 +193,27 @@ def strip_userinfo(url: str) -> str:
         host = parts.netloc.rpartition("@")[2]
         return urlunsplit((parts.scheme, host, parts.path, parts.query, parts.fragment))
     except Exception:
-        return url
+        return _INVALID_LOG_URL
 
 
 def redact_url(url: str) -> str:
     """機微なクエリ値([REDACTED])・URL資格情報を秘匿する(ログ用)。"""
     try:
-        parts = urlsplit(strip_userinfo(url))
+        parts = _log_url_parts(strip_userinfo(url))
         if not parts.query:
-            return urlunsplit(parts)
+            return urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))
         out = []
         for k, v in parse_qsl(parts.query, keep_blank_values=True):
-            out.append((k, _REDACTED if _norm_query_name(k) in _SENSITIVE_QUERY_NORM else v))
+            # A benign outer key can contain a nested URL or another parser's
+            # separator. Keep only unambiguous values in logs.
+            secret = (_norm_query_name(k) in _SENSITIVE_QUERY_NORM
+                      or _ambiguous_query_component(k)
+                      or _ambiguous_query_component(v))
+            out.append((k, _REDACTED if secret else v))
         return urlunsplit((parts.scheme, parts.netloc, parts.path,
-                           urlencode(out, doseq=True, safe="[]"), parts.fragment))
+                           urlencode(out, doseq=True, safe="[]"), ""))
     except Exception:
-        return url
+        return _INVALID_LOG_URL
 
 
 def safe_url(url: str) -> str:

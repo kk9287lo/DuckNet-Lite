@@ -27,9 +27,10 @@ rem 1) Optional settings file (KEY=VALUE / # starts a comment)
 rem    Values are trimmed and one pair of matching surrounding quotes (" or ') is
 rem    dropped, the same rule as dataplane.service.load_env_file. A value set here wins
 rem    over the product's own parsing, so quotes used to leak into paths and tokens.
-if not defined DUCKNET_ENV_FILE set "DUCKNET_ENV_FILE=%SELF%app.env"
-if exist "%DUCKNET_ENV_FILE%" (
-  for /f "usebackq eol=# tokens=1* delims==" %%A in ("%DUCKNET_ENV_FILE%") do (
+set "_DN_ENV_FILE=%SELF%app.env"
+if defined DUCKNET_ENV_FILE set "_DN_ENV_FILE=%DUCKNET_ENV_FILE%"
+if exist "%_DN_ENV_FILE%" (
+  for /f "usebackq eol=# tokens=1* delims==" %%A in ("%_DN_ENV_FILE%") do (
     rem Never overwrite a value already in the environment (a value given by the caller always wins)
     if not "%%A"=="" if not defined %%A (
       set "%%A=%%B"
@@ -49,6 +50,7 @@ if exist "%DUCKNET_ENV_FILE%" (
     )
   )
 )
+set "_DN_ENV_FILE="
 set "_DN_DQ="
 
 rem 2) Choose Python: explicit -> local venv -> py -3 -> python

@@ -63,8 +63,7 @@ def test_d14_method_hits_fold_unknown_methods_into_other():
 
 # ── #15: 時限BANで埋まった表での _evict ─────────────────────────────────
 def test_d15_evict_keeps_low_water_mark_when_table_is_mostly_bans():
-    """非BANが 1 割未満だと _evict がそれだけ消して終わり、新規 IP ごとに全件走査し、
-    直前に来た正規クライアントの状態まで次の新規 IP 1 件で消えていた。"""
+    """現役 BAN を残し、空きが低水位未満なら新規IPを拒否して全表再走査を間引く。"""
     old = P._MAX_IPS
     P._MAX_IPS = 100
     try:
@@ -86,17 +85,21 @@ def test_d15_evict_keeps_low_water_mark_when_table_is_mostly_bans():
                 calls[0] += 1
                 return orig()
             sh._evict = counted
-            sh._state("192.0.2.1")
-            sh._state("192.0.2.10")["hits"] = 7     # 正規クライアントの状態(目印)
+            sh._state("192.0.2.1")["hits"] = 7     # 唯一の安全な空きへ入ったクライアント
             for i in range(7):
-                sh._state("192.0.2.%d" % (20 + i))
+                try:
+                    sh._state("192.0.2.%d" % (20 + i))
+                except P._IPStateCapacity:
+                    pass
+                else:
+                    raise AssertionError("full active table admitted an untracked IP")
             assert calls[0] == 1, calls             # 1 回の走査を多数の新規 IP で償却
-            assert sh._ips.get("192.0.2.10", {}).get("hits") == 7
+            assert sh._ips.get("192.0.2.1", {}).get("hits") == 7
             assert sh.is_banned_fast(perm)           # 運用者の永続BANは決して捨てない
             assert len(sh._ips) <= P._MAX_IPS
             kept = [s["ban_until"] for k, s in sh._ips.items()
                     if k.startswith("2001:db8:1::")]
-            assert kept and min(kept) >= now + 300 + (98 - len(kept)), kept
+            assert len(kept) == 98 and min(kept) >= now + 300, kept
     finally:
         P._MAX_IPS = old
 

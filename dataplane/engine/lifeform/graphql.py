@@ -23,6 +23,7 @@ GraphQL は1エンドポイント(例 /graphql)に任意の問い合わせを PO
 from __future__ import annotations
 
 import codecs
+import hashlib
 import re
 
 # 選択セット内で意味を持つ字句(名前/数値/... /構造記号/文字列・コメントの開始)。空白・カンマ等は
@@ -46,6 +47,80 @@ _IGNORED = re.compile(r'(?:[\s,\ufeff]|#[^\n\r]*)*')
 _NAME = re.compile(r'[_A-Za-z][_0-9A-Za-z]*')
 _NAME_CHAR = re.compile(r'[_0-9A-Za-z]')
 _CAP = 1 << 30                                    # 実効の数の頭打ち(整数を大きくしない)
+_MAX_ENVELOPE_QUERIES = 512                       # 別名の読み方も含めた独立の走査予算
+
+
+class _EnvelopeQueries(list):
+    """List-compatible readings with the original JSON operation count.
+
+    Query/QUERY may select different strings on different receivers, but are
+    alternative readings of one operation. Public callers can still use a list;
+    mutating it discards the count proof and restores the ordinary list budget.
+    """
+    __slots__ = ("_batch_count", "_original")
+
+    def __init__(self, values, batch_count):
+        super().__init__(values)
+        self._batch_count = batch_count
+        self._original = tuple(self)
+
+
+def _envelope_queries(document) -> tuple:
+    objects = document if isinstance(document, list) else [document]
+    values = []
+    for item in objects:
+        if not isinstance(item, dict):
+            continue
+        item_values = []
+        uninspectable_query = False
+        persisted_hashes = []
+        for name, value in item.items():
+            # Struct-based JSON receivers can match every case alias. Exact
+            # duplicates were already rejected by the strict JSON decoder.
+            lower = name.lower()
+            if lower == "extensions" and isinstance(value, dict):
+                persisted_hashes.extend(_persisted_hashes(value))
+            if lower == "query":
+                if isinstance(value, str) and value.strip():
+                    if len(values) >= _MAX_ENVELOPE_QUERIES:
+                        return [], "query-readings-too-large"
+                    values.append(value)
+                    item_values.append(value)
+                else:
+                    uninspectable_query = True
+        # APQ/persisted-query backends can execute a cached document using only
+        # the hash. The edge cannot enforce depth, complexity or introspection
+        # limits against a document absent from this request.
+        if persisted_hashes and (not item_values or uninspectable_query or
+                                 not _hashes_match_queries(persisted_hashes, item_values)):
+            return [], "persisted-query-uninspectable"
+    return _EnvelopeQueries(values, len(objects)), ""
+
+
+def _persisted_hashes(extensions: dict) -> list:
+    """All case-alias hash readings a JSON receiver may select."""
+    hashes = []
+    for name, value in extensions.items():
+        if name.lower() != "persistedquery":
+            continue
+        if not isinstance(value, dict):
+            hashes.append(None)
+            continue
+        found = [item for key, item in value.items() if key.lower() == "sha256hash"]
+        hashes.extend(found or [None])
+    return hashes
+
+
+def _hashes_match_queries(hashes: list, queries: list) -> bool:
+    """Every receiver view must bind the same visible document bytes."""
+    try:
+        digests = {hashlib.sha256(query.encode("utf-8")).hexdigest()
+                   for query in queries}
+    except UnicodeError:
+        return False
+    return len(digests) == 1 and all(
+        type(value) is str and re.fullmatch(r"[0-9a-fA-F]{64}", value)
+        and value.lower() in digests for value in hashes)
 
 
 def _skip_string(q: str, i: int, n: int) -> int:
@@ -274,9 +349,14 @@ def _readings(body, charsets: str = "") -> list:
     b = bytes(body)
     enc = _json_encoding(b)
     if enc in ("utf-8", "utf-8-sig"):
-        # 構造の字句は ASCII だけ。UTF-8 の多バイト文字は ASCII のバイトを含まないので、latin-1 で読んでも
-        # 字句は同じ(不正なバイト列でも読み切れる)。UTF-8 BOM(.NET 等が付ける)は飛ばす。
-        first = (b[3:] if enc == "utf-8-sig" else b).decode("latin1")
+        # Valid UTF-8 must retain the actual query text so a persisted-query
+        # digest binds to the same bytes the backend receives. For invalid
+        # UTF-8, latin-1 still preserves ASCII structural tokens for scanning.
+        raw = b[3:] if enc == "utf-8-sig" else b
+        try:
+            first = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            first = raw.decode("latin1")
     else:
         first = b.decode(enc, "replace").lstrip("\N{ZERO WIDTH NO-BREAK SPACE}")
     out = [first]
@@ -290,8 +370,9 @@ def _readings(body, charsets: str = "") -> list:
 
 def parse_body(body, content_type: str = "") -> tuple:
     """要求本文から GraphQL 文書群を取り出す。返り値 (queries, err)。
-    application/x-www-form-urlencoded(と 'query=' で始まる本文)は query 欄、JSON は query(配列は
-    バッチ)、それ以外の本文は生の文書(application/graphql)として読む。err="malformed" は JSON の
+    application/x-www-form-urlencoded(と 'query=' で始まる本文)は query 欄、JSON は query とその
+    大小文字別名(配列はバッチ)、それ以外の本文は生の文書(application/graphql)として読む。
+    別名の読み方はすべて検査するが、バッチ件数は元の操作数で数える。err="malformed" は JSON の
     封筒に見えるのに読めない本文(深すぎる入れ子を含む)=生文書として数えると封筒全体が深さ 1 に
     見えて上限を素通りするので、呼び出し側がフェイルクローズする。
     bytes の本文は JSON の仕様どおりに符号化を判定して読む(UTF-16/32 の JSON も読める)。宣言された
@@ -314,22 +395,23 @@ def _parse_text(text: str, content_type: str = "") -> tuple:
         return [], ""
     ct = (content_type or "").split(";", 1)[0].strip().lower()
     if ct == "application/x-www-form-urlencoded":
+        if form_persisted_uninspectable(text):
+            return [], "persisted-query-uninspectable"
         return form_queries(text), ""
     # 再帰爆弾([[[[…]]]] 等)は深さで *パース前* に弾く(json の深さ制限の甘さ=自己DoS回避)。
     # JSON の値で始まらない本文は JSON として読めないので、1 文字ずつの深さ検査を省く。
     from ..core import saferegex
-    d = (saferegex.safe_json_loads(text, default=None) if _JSON_START.match(text)
+    d = (saferegex.safe_json_loads(text, default=None, reject_duplicates=True) if _JSON_START.match(text)
          else None)
     if d is not None:                              # 妥当な JSON=GraphQL over JSON として解釈
-        if isinstance(d, list):
-            return [str(o.get("query", "")) for o in d
-                    if isinstance(o, dict) and o.get("query")], ""
-        if isinstance(d, dict):
-            return ([str(d["query"])] if d.get("query") else []), ""
+        if isinstance(d, (list, dict)):
+            return _envelope_queries(d)
         return [], ""                              # JSON だが dict/list でない=非GraphQL
     if _JSONISH.match(text):
         return [], "malformed"                     # JSON の封筒なのに読めない(切断/破損/深すぎ)
     if _FORMISH.match(text):                       # Content-Type 無しの query=… 等(生文書は name= で始まらない)
+        if form_persisted_uninspectable(text):
+            return [], "persisted-query-uninspectable"
         return form_queries(text), ""
     head = text[:12].lower()                      # JSON でない=application/graphql 生クエリ判定
     if text[:1] == "{" or head.startswith(("query", "mutation", "subscription", "fragment")):
@@ -338,13 +420,44 @@ def _parse_text(text: str, content_type: str = "") -> tuple:
 
 
 def form_queries(qs: str) -> list:
-    """クエリ文字列/urlencoded 本文の query 欄(複数あれば全部)。GET /graphql?query=… 用。"""
+    """クエリ文字列/urlencoded 本文の query 欄と大小文字別名をすべて読む。"""
     from urllib.parse import parse_qs
     try:
-        vals = parse_qs(qs, keep_blank_values=True).get("query") or []
+        fields = parse_qs(qs, keep_blank_values=True)
     except Exception:
         return []
-    return [v for v in vals if v.strip()]
+    return [value for name, vals in fields.items() if name.lower() == "query"
+            for value in vals if value.strip()]
+
+
+def form_persisted_uninspectable(qs: str) -> bool:
+    """Whether a URL/form operation may execute a cached, unseen document."""
+    from urllib.parse import parse_qs
+    from ..core import saferegex
+    try:
+        fields = parse_qs(qs, keep_blank_values=True)
+    except Exception:
+        return False
+    persisted_hashes = []
+    queries = []
+    opaque = False
+    for name, values in fields.items():
+        lower = name.lower()
+        if lower == "query":
+            queries.extend(values)
+        elif lower == "extensions":
+            for value in values:
+                extension = saferegex.safe_json_loads(value, default=None,
+                                                       reject_duplicates=True)
+                if not isinstance(extension, dict):
+                    opaque = True  # duplicate/malformed extension has no unique receiver view
+                else:
+                    persisted_hashes.extend(_persisted_hashes(extension))
+    if opaque:
+        return True
+    return bool(persisted_hashes) and (
+        not queries or any(not value.strip() for value in queries)
+        or not _hashes_match_queries(persisted_hashes, queries))
 
 
 def max_depth(q: str) -> int:
@@ -374,8 +487,10 @@ def check(queries, *, max_depth_limit: int = 12, max_complexity: int = 1000,
     フラグメントを展開した実効の大きい方で見る。フラグメントの循環は fragment-cycle で拒否する。"""
     if not queries:
         return {"allowed": True, "reason": "not-graphql"}
-    if len(queries) > max_batch:
-        return {"allowed": False, "reason": f"batch-too-large:{len(queries)}"}
+    batch_count = (queries._batch_count if isinstance(queries, _EnvelopeQueries)
+                   and tuple(queries) == queries._original else len(queries))
+    if batch_count > max_batch:
+        return {"allowed": False, "reason": f"batch-too-large:{batch_count}"}
     for q in queries:
         a = analyze(q)
         if a["cycle"]:

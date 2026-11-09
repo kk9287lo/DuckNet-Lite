@@ -4,13 +4,19 @@ test_bodyscan.py — 要求ボディ検査(head-only の死角を塞ぐ・evolut
 POST/JSON/GraphQL 本文に潜む SQLi/XSS/RCE/SSTI を、本文先頭を有界に走査して捉える。
 head と同じ署名エンジン・正規化。block_score 超で BAN。バイト透過プロキシでの end-to-end も。
 """
+import os
 import socket
 import threading
 import time
 import tempfile
+from unittest.mock import patch
 
+import dataplane.engine.lifeform.pipeline as pipeline
+import dataplane.engine.lifeform.policy as policy
 from dataplane.engine.lifeform.pipeline import NetShield
+from dataplane.engine.lifeform.policy import AppFirewall
 from dataplane.engine.services.proxy import AsyncEdgeGuard
+from guard_support import stop_guard_owned
 
 
 def _shield(d, **cfg):
@@ -80,11 +86,14 @@ def test_disabled_allows():
 
 
 def test_bounded_scan_only_prefix():
-    # cap を超えた位置の悪性ペイロードは走査されない(全バッファしない有界性)。
+    # 直接呼出しも cap 超を「先頭にヒット無し」として許可しない。
     with tempfile.TemporaryDirectory() as d:
         sh = _shield(d, body_scan_max_bytes=16, block_score=20)
         body = b"A" * 40 + b"' or 1=1-- -"            # 悪性部は先頭16Bの外
+        assert sh.inspect_body("y", body)["action"] == "block"
+        sh.cfg["mode"] = "audit"
         assert sh.inspect_body("y", body)["action"] == "allow"
+        assert any(e.get("rule") == "body_scan_limit" for e in sh.events(20))
 
 
 def test_empty_body_allows():
@@ -151,52 +160,49 @@ def _post(guard, body: bytes):
 
 
 def test_proxy_blocks_malicious_body_end_to_end():
-    from dataplane.engine.lifeform.pipeline import net_shield
-    sh = net_shield()
-    saved = {k: sh.cfg.get(k) for k in ("body_scan_enabled", "block_score", "enabled")}
-    sh.cfg["enabled"] = True
-    sh.cfg["body_scan_enabled"] = True
-    sh.cfg["block_score"] = 20                         # 単発本文ヒットで block
-    try:
-        got, bport = _capture_backend()
-        guard = AsyncEdgeGuard(backend_host="127.0.0.1", backend_port=bport, listen_port=0)
-        guard.start()
-        try:
-            _post(guard, b"username=admin' or 1=1-- -&password=x")   # 悪性本文
-            for _ in range(50):
-                if got:
-                    break
-                time.sleep(0.02)
-            # 悪性本文は上流へ到達しない(backend は受信しないか接続即切断)
-            assert not got or b"or 1=1" not in got[0]
-        finally:
-            guard.stop()
-    finally:
-        sh.cfg.update(saved)
-        with sh._lock:                                 # 共有シングルトンの 127.0.0.1 状態を掃除
-            sh._ips.pop("127.0.0.1", None)
+    with tempfile.TemporaryDirectory(prefix="bodyscan-malicious-",
+                                     dir=os.environ["DUCKNET_STATE_DIR"]) as state:
+        sh = NetShield(state_dir=state)
+        fw = AppFirewall(state_dir=state)
+        assert sh.set_config(enabled=True, body_scan_enabled=True,
+                             block_score=20)["ok"]   # 単発本文ヒットで block
+        assert fw.disable()["ok"]
+        with patch.object(pipeline, "_SHIELD", sh), patch.object(policy, "_FW", fw):
+            got, bport = _capture_backend()
+            guard = AsyncEdgeGuard(backend_host="127.0.0.1", backend_port=bport,
+                                   listen_port=0)
+            assert guard.start().get("ok") is True
+            try:
+                _post(guard, b"username=admin' or 1=1-- -&password=x")   # 悪性本文
+                for _ in range(50):
+                    if got:
+                        break
+                    time.sleep(0.02)
+                # 悪性本文は上流へ到達せず、当該 IP の BAN も隔離状態に残る。
+                assert not got or b"or 1=1" not in got[0]
+                assert sh.is_banned_fast("127.0.0.1")
+            finally:
+                stop_guard_owned(guard)
 
 
 def test_proxy_forwards_clean_body_intact():
-    from dataplane.engine.lifeform.pipeline import net_shield
-    sh = net_shield()
-    saved = {k: sh.cfg.get(k) for k in ("body_scan_enabled", "enabled")}
-    sh.cfg["enabled"] = True
-    sh.cfg["body_scan_enabled"] = True
-    try:
-        got, bport = _capture_backend()
-        guard = AsyncEdgeGuard(backend_host="127.0.0.1", backend_port=bport, listen_port=0)
-        guard.start()
-        try:
-            _post(guard, b"username=alice&password=hunter2&csrf=abc")   # 正常本文
-            for _ in range(50):
-                if got:
-                    break
-                time.sleep(0.02)
-            assert got and b"username=alice" in got[0] and b"hunter2" in got[0]
-        finally:
-            guard.stop()
-    finally:
-        sh.cfg.update(saved)
-        with sh._lock:
-            sh._ips.pop("127.0.0.1", None)
+    with tempfile.TemporaryDirectory(prefix="bodyscan-clean-",
+                                     dir=os.environ["DUCKNET_STATE_DIR"]) as state:
+        sh = NetShield(state_dir=state)
+        fw = AppFirewall(state_dir=state)
+        assert sh.set_config(enabled=True, body_scan_enabled=True)["ok"]
+        assert fw.disable()["ok"]
+        with patch.object(pipeline, "_SHIELD", sh), patch.object(policy, "_FW", fw):
+            got, bport = _capture_backend()
+            guard = AsyncEdgeGuard(backend_host="127.0.0.1", backend_port=bport,
+                                   listen_port=0)
+            assert guard.start().get("ok") is True
+            try:
+                _post(guard, b"username=alice&password=hunter2&csrf=abc")   # 正常本文
+                for _ in range(50):
+                    if got:
+                        break
+                    time.sleep(0.02)
+                assert got and b"username=alice" in got[0] and b"hunter2" in got[0]
+            finally:
+                stop_guard_owned(guard)

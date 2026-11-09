@@ -46,14 +46,15 @@ def test_c4_non_ascii_signature_reads_as_tampered():
 
 
 def test_c4_poisoned_hw_sidecar_and_infinite_numbers_do_not_raise():
-    """サイドカー .hw に非 ASCII の _sig や Infinity の _ver を置くと、読込だけでなく
-    *以後のすべての保存* が例外で失敗していた(BAN/設定が永続化されなくなる)。
-    本体の _sv / _ver に Infinity を置いた場合も int() の OverflowError が漏れていた。"""
+    """破損した .hw は例外を漏らさず改竄として拒否し、保存で証拠を洗い替えない。
+    本体の _sv / _ver に Infinity を置いた場合も例外を漏らさない。"""
     from dataplane.engine.core import signed_state as ss
     key = b"k" * 32
     with tempfile.TemporaryDirectory() as d:
         p = os.path.join(d, "blocklist.json")
         assert ss.write_signed_json(p, {"bans": {}}, key)
+        with open(p + ".hw", "rb") as f:
+            valid_hw = f.read()
         for hw_text in ('{"_ver": 1, "_sig": "\\u00e9"}',
                         '{"_ver": Infinity, "_sig": "ab"}',
                         '{"_ver": -Infinity, "_sig": "\\u00e9"}'):
@@ -61,8 +62,14 @@ def test_c4_poisoned_hw_sidecar_and_infinite_numbers_do_not_raise():
                 f.write(hw_text)
             ss._MEM_HW.clear()
             st, _ = ss.read_signed_json(p, key, {})                 # 修正前: TypeError/OverflowError
-            assert st in ("ok", "tampered"), (hw_text, st)
-            assert ss.write_signed_json(p, {"bans": {"192.0.2.9": 1}}, key) is True, hw_text
+            assert st == "tampered", (hw_text, st)
+            with open(p + ".hw", "rb") as f:
+                before_hw = f.read()
+            assert ss.write_signed_json(p, {"bans": {"192.0.2.9": 1}}, key) is False, hw_text
+            with open(p + ".hw", "rb") as f:
+                assert f.read() == before_hw
+        with open(p + ".hw", "wb") as f:
+            f.write(valid_hw)                 # 以後は正署名の高水位へ戻した上で本体の不正を試す
         for body in ('{"_sv": Infinity, "_sig": "ab", "_payload": {}}',
                      '{"_sv": 3, "_ver": Infinity, "_purpose": "blocklist.json", '
                      '"_sig": "ab", "_payload": {}}'):
@@ -71,11 +78,20 @@ def test_c4_poisoned_hw_sidecar_and_infinite_numbers_do_not_raise():
             ss._MEM_HW.clear()
             st, val = ss.read_signed_json(p, key, {"d": 1})
             assert st == "tampered" and val == {"d": 1}, (body, st)
-        # 初回保存(_MEM_HW 無し)で既存ファイルの _ver が Infinity でも保存は成功する
+        # A present corrupt main cannot be overwritten as healthy merely
+        # because its _ver is not a finite number, even with a valid .hw.
         with open(p, "w", encoding="utf-8") as f:
             f.write('{"_ver": Infinity}')
         ss._MEM_HW.clear()
-        assert ss.write_signed_json(p, {"bans": {}}, key) is True
+        with open(p, "rb") as f:
+            corrupt_main = f.read()
+        with open(p + ".hw", "rb") as f:
+            trusted_hw = f.read()
+        assert ss.write_signed_json(p, {"bans": {}}, key) is False
+        with open(p, "rb") as f:
+            assert f.read() == corrupt_main
+        with open(p + ".hw", "rb") as f:
+            assert f.read() == trusted_hw
 
 
 def test_c4_netshield_starts_with_non_ascii_signature():
@@ -113,7 +129,12 @@ def test_c5_key_write_failure_does_not_poison_statekey():
             sd = os.path.join(d, "state")
             os.write = _enospc
             try:
-                ss.persistent_key(sd)                                # 書込失敗(一時鍵で続行)
+                try:
+                    ss.persistent_key(sd)
+                except OSError:
+                    pass                        # 永続鍵が無いなら起動を止める
+                else:
+                    raise AssertionError("鍵保存失敗を一時鍵で続行した")
             finally:
                 os.write = real_write
             kp = os.path.join(sd, ".statekey")
@@ -182,6 +203,40 @@ def test_c31_tail_jsonl_keeps_lines_with_unicode_line_separators():
             assert aio.append_jsonl(lp, r)
         assert [r["i"] for r in aio.tail_jsonl(lp, 10)] == [4, 3, 2, 1, 0]
         assert [r["i"] for r in aio.tail_jsonl(lp, 2)] == [4, 3]
+
+
+# ── 状態 JSON のサイズ確認後にファイルが成長する競合 ──────────────────────────
+def test_state_read_stays_bounded_if_file_grows_after_size_check():
+    """サイズ確認後の追記でも巨大な JSON を解析せず、正常な .tmp へ回復する。"""
+    from unittest.mock import patch
+    from dataplane.engine.core import atomic_io as aio
+    with tempfile.TemporaryDirectory() as d:
+        p = os.path.join(d, "state.json")
+        with open(p, "wb") as f:
+            f.write(b'{"v":1}')
+        with open(p + ".tmp", "wb") as f:
+            f.write(b'{"v":2}')
+        original_size = os.path.getsize
+        grown = False
+
+        def grow_after_check(path):
+            nonlocal grown
+            size = original_size(path)
+            if path == p and not grown:
+                grown = True
+                with open(p, "ab") as f:
+                    f.write(b" " * 65)       # JSON としては有効なまま上限を超える
+            return size
+
+        with patch.object(aio, "_MAX_READ_BYTES", 64), \
+                patch.object(aio.os.path, "getsize", side_effect=grow_after_check):
+            assert aio.safe_read_json(p, "missing") == {"v": 2}
+        assert grown
+        exact = os.path.join(d, "exact.json")
+        with open(exact, "wb") as f:
+            f.write(b'{"v":3}' + b" " * (64 - len(b'{"v":3}')))
+        with patch.object(aio, "_MAX_READ_BYTES", 64):
+            assert aio.safe_read_json(exact, "missing") == {"v": 3}
 
 
 # ── #32: Windows の共有違反で書込/読込が黙って失敗する ─────────────────────────────

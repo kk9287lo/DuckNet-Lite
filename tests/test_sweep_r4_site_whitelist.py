@@ -60,7 +60,7 @@ def _post(url, token, body: dict):
         with urllib.request.urlopen(r, timeout=5) as resp:
             return resp.status, _brief(json.loads(resp.read().decode("utf-8")))
     except urllib.error.HTTPError as e:
-        return e.code, {}
+        return e.code, _brief(json.loads(e.read().decode("utf-8")))
 
 
 def _get(url, token):
@@ -150,28 +150,42 @@ def test_r4_site_whitelist_edit_list_cannot_empty_in_whitelist_mode():
 
 def test_r4_site_whitelist_bootstrap_rejects_empty_whitelist():
     """宣言的設定に site_mode=whitelist だけ書く(リスト無し)と applied に入り、全 Host 許可で
-    起動していた。他のキーは従来どおり適用し、site 系だけを拒否キーとして報告する。"""
+    起動していた。不正な宣言は他のキーも含め全拒否し、以前の設定と保存状態を保つ。"""
     with tempfile.TemporaryDirectory() as d:
         p = os.path.join(d, "decl.json")
         with open(p, "w", encoding="utf-8") as f:
             json.dump({"site_mode": "whitelist", "rate_per_sec": 30}, f)
         sh = _shield(d)
+        with open(sh.path, "rb") as f:
+            before = f.read()
         res = sh.apply_config_file(p)
-        assert res.get("ok") is True, res
-        assert "site_mode" not in res["applied"] and "rate_per_sec" in res["applied"], res
+        assert res.get("ok") is False and res["applied"] == [], res
         assert "site_mode" in (res.get("rejected") or []), res
-        assert sh.cfg["site_mode"] == "off" and sh.cfg["rate_per_sec"] == 30.0
-        # whitelist 運用中に空リストを宣言しても同じ(他キーは適用)
+        assert res.get("error"), res
+        assert sh.cfg["site_mode"] == "off" and sh.cfg["rate_per_sec"] == 20.0
+        with open(sh.path, "rb") as f:
+            assert f.read() == before
+        restored = NetShield(state_dir=d)
+        assert restored.cfg["site_mode"] == "off" and restored.cfg["rate_per_sec"] == 20.0
+        # whitelist 運用中に空リストを宣言しても、無関係な burst を部分適用しない。
         assert sh.set_config(site_mode="whitelist", site_whitelist=["good.example"])["ok"]
+        before_burst = sh.cfg["burst"]
+        with open(sh.path, "rb") as f:
+            before = f.read()
         res = sh.apply_config({"site_whitelist": [], "burst": 50})
+        assert res.get("ok") is False and res["applied"] == [], res
         assert "site_whitelist" in (res.get("rejected") or []), res
-        assert "burst" in res["applied"] and "site_whitelist" not in res["applied"], res
-        assert sh.cfg["site_whitelist"] == ["good.example"] and sh.cfg["burst"] == 50
+        assert sh.cfg["site_whitelist"] == ["good.example"] and sh.cfg["burst"] == before_burst
+        with open(sh.path, "rb") as f:
+            assert f.read() == before
         # 非空リストとの同時宣言は受理
         sh2 = _shield(tempfile.mkdtemp(dir=d))
         res = sh2.apply_config({"site_mode": "whitelist", "site_whitelist": ["a.example"]})
+        assert res.get("ok") is True, res
         assert set(res["applied"]) >= {"site_mode", "site_whitelist"}, res
         assert not res.get("rejected"), res
+        assert _act(sh2, "192.0.2.24", "a.example") == "allow"
+        assert _act(sh2, "192.0.2.25", "other.example") == "block"
 
 
 def test_r4_site_whitelist_saved_empty_whitelist_keeps_allow_and_warns():
@@ -213,7 +227,7 @@ def test_r4_site_whitelist_admin_api_rejects_and_state_shows_warning():
             assert codes == [_WARN], st["shield"].get("warnings")
             for body in ({"site_whitelist": []}, {"site_mode": "whitelist"}):
                 code, r = _post(a.url + "/api/shield/config", a.token, body)
-                assert code == 200 and r.get("ok") is False and r.get("error"), (body, r)
+                assert code == 400 and r.get("ok") is False and r.get("error"), (body, r)
             code, r = _post(a.url + "/api/shield/config", a.token,
                             {"site_whitelist": ["good.example"]})
             assert code == 200 and r.get("ok") is True, r

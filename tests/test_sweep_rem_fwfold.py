@@ -14,7 +14,6 @@ import json
 import os
 import tempfile
 import unicodedata
-from unittest import SkipTest
 from urllib.parse import quote
 
 import dataplane.engine.lifeform.pipeline as P
@@ -200,13 +199,9 @@ def test_options_md_changelog_and_defenses_md_list_the_setting():
 
 
 def test_gui_schema_lists_the_setting():
-    """GUI の設定スキーマ(Full)は検査の詳細設定に bool として載せ、既定は False。"""
-    try:
-        from dataplane.gui import schema
-    except ImportError as e:
-        raise SkipTest(f"GUI スキーマは Full のみ: {e!r}")
-    f = [x for x in schema.FIELDS if x[0] == _KEY]
-    assert len(f) == 1 and f[0][1] == "bool" and f[0][2] == "advanced", f
-    assert _KEY in schema.DESC
-    assert schema.defaults()[_KEY] is False
-    assert schema.coerce(_KEY, "true") is True and schema.coerce(_KEY, "off") is False
+    """The Lite dashboard exposes the existing fullwidth-punctuation switch."""
+    from dataplane.gui.settings import settings_schema
+    fields = [field for field in settings_schema()["fields"] if field["key"] == _KEY]
+    assert len(fields) == 1 and fields[0]["type"] == "boolean", fields
+    assert fields[0]["group"] == "score" and fields[0]["default"] is False
+    assert "NFKC" in fields[0]["description"]

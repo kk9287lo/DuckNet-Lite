@@ -6,6 +6,7 @@ test_dataplane.py — 製品(DuckNet-Lite)の管理ダッシュボード + 単�
 偽シングルトンで実stateを汚さない([[feedback-verification-coverage-honesty]])。
 """
 import json
+import urllib.error
 import urllib.request
 
 import dataplane.engine.lifeform.policy as FW
@@ -48,6 +49,7 @@ def test_dashboard_brand_honors_cover_env():
             _, html = _req(url + "/")
             assert b"System Health Monitor" in html
             assert b"DuckNet" not in html          # 製品名が露見しない
+            assert b"NetShield" not in html        # 防御モジュール名も表示へ固定しない
         finally:
             os.environ.pop("DUCKNET_COVER", None)
             adm.stop()
@@ -83,18 +85,25 @@ def test_dashboard_state_and_token():
                 assert tk in html, tk
             # トークンは HTML/JS に埋め込まれない(XSS で抜かれない)
             assert token.encode() not in html
-            r = urllib.request.urlopen(url + "/")
+            r = urllib.request.urlopen(url + "/?token=" + token)
             # セキュリティヘッダ(深層防御)
             assert r.headers.get("X-Frame-Options") == "DENY"
             assert r.headers.get("X-Content-Type-Options") == "nosniff"
             assert "connect-src 'self'" in (r.headers.get("Content-Security-Policy") or "")
-            # トークンは HttpOnly + SameSite=Strict Cookie で配られる
+            # 旧版 Cookie は失効し、管理トークンは Cookie で配られない
             sc = r.headers.get("Set-Cookie") or ""
-            assert "ducknet_admin=" in sc and "HttpOnly" in sc and "SameSite=Strict" in sc
-            # Cookie 認証でも通る(X-Token ヘッダ無し)
+            assert "ducknet_admin=;" in sc and "Max-Age=0" in sc
+            assert token not in sc
+            # 旧 Cookie は認証に使われない
             req = urllib.request.Request(url + "/api/state",
                                          headers={"Cookie": f"ducknet_admin={token}"})
-            assert urllib.request.urlopen(req, timeout=5).status == 200
+            try:
+                urllib.request.urlopen(req, timeout=5)
+            except urllib.error.HTTPError as error:
+                assert error.code == 401
+                error.close()
+            else:
+                raise AssertionError("old admin cookie authorized API access")
         finally:
             adm.stop()
             FW._FW, ND._SHIELD = ofw, osh
@@ -211,7 +220,9 @@ def test_dashboard_dlp_wiring():
             # トグル+アクションを設定 → 反映される
             code, body = _req(url + "/api/shield/config", token=token,
                               body={"dlp_enabled": True, "dlp_action": "block"})
-            assert code == 200 and json.loads(body)["ok"] is True
+            result = json.loads(body)
+            assert code == 200 and result["ok"] is True, \
+                (code, result.get("error"), result.get("rejected"))
             st = json.loads(_req(url + "/api/state", token=token)[1])
             assert st["shield"]["cfg"]["dlp_enabled"] is True
             assert st["shield"]["cfg"]["dlp_action"] == "block"
@@ -278,11 +289,18 @@ def test_dashboard_path_limits_wiring():
             # 既定は空
             cfg = json.loads(_req(url + "/api/state", token=token)[1])["shield"]["cfg"]
             assert cfg["path_limits"] == []
-            # 追加(不正項目混在=検証で除去・burst 既定=rate)
+            # 不正項目が混じる置換は全体を拒否し、元の空設定を保つ。
             code, body = _req(url + "/api/shield/path_limits", token=token,
                               body={"rules": [{"path": "/login", "rate": 0.5, "burst": 5},
-                                              {"path": "", "rate": 1},          # 除去
-                                              {"path": "/api/", "rate": 2}]})    # burst 既定=2
+                                              {"path": "", "rate": 1},
+                                              {"path": "/api/", "rate": 2}]})
+            assert code == 400 and json.loads(body)["ok"] is False
+            pl = json.loads(_req(url + "/api/state", token=token)[1])["shield"]["cfg"]["path_limits"]
+            assert pl == []
+            # 有効な一括更新なら burst 省略を rate で補い、全件を適用する。
+            code, body = _req(url + "/api/shield/path_limits", token=token,
+                              body={"rules": [{"path": "/login", "rate": 0.5, "burst": 5},
+                                              {"path": "/api/", "rate": 2}]})
             assert code == 200 and json.loads(body)["ok"] is True
             pl = json.loads(_req(url + "/api/state", token=token)[1])["shield"]["cfg"]["path_limits"]
             assert [r["path"] for r in pl] == ["/login", "/api/"]
@@ -376,6 +394,7 @@ def test_dashboard_admin_audit_wiring():
         adm, url, token = _admin_with_temp(tmp)
         adm._state_dir = tmp     # 監査ログの置き場も隔離(他テストと混線させない)
         try:
+            assert ND._SHIELD.disable()["ok"] is True  # revert の基準を明示する
             _, html = _req(url + "/")
             assert b'id="auditlog"' in html and "変更履歴".encode() in html
             # 初期状態は空
@@ -389,11 +408,9 @@ def test_dashboard_admin_audit_wiring():
             e = d["entries"][0]
             assert e["endpoint"] == "/api/shield/toggle"
             assert e["revert"] == {"endpoint": "/api/shield/toggle", "body": {"on": False}}
-            # paranoia 変更: set_paranoia() は paranoia_status() を返すため "ok" キーを持たない
-            # ―― それでも監査フックが記録できることを回帰的に確認する(素朴な r.get("ok") 判定
-            # だけだとここが記録されない)。
+            # A committed paranoia update must explicitly report success and be audited.
             code, body = _req(url + "/api/shield/paranoia", token=token, body={"level": 3})
-            assert code == 200 and json.loads(body)["paranoia"] == 3
+            assert code == 200 and json.loads(body)["ok"] is True and json.loads(body)["paranoia"] == 3
             d = json.loads(_req(url + "/api/admin_audit", token=token)[1])
             assert len(d["entries"]) == 2
             assert d["entries"][0]["endpoint"] == "/api/shield/paranoia"   # 新しい順
@@ -434,7 +451,7 @@ def test_dashboard_sig_test_wiring():
             # ReDoS パターンは validate_pattern で弾かれ、コンパイル/マッチは試みられない
             r = json.loads(_req(url + "/api/shield/sig_test", token=token,
                                 body={"pattern": r"(a+)+$", "sample": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa!"})[1])
-            assert r["ok"] is True and r["matches"] is False and r["error"]
+            assert r["ok"] is False and r["matches"] is False and r["error"]
             # 状態は一切変更されない: カスタムシグネチャ一覧に残らない
             sig = json.loads(_req(url + "/api/shield/signatures", token=token)[1])
             assert sig["custom"] == []
@@ -446,27 +463,20 @@ def test_dashboard_sig_test_wiring():
             FW._FW, ND._SHIELD = ofw, osh
 
 
-def test_admin_token_cookie_not_handed_to_unauth_remote():
-    # 脆弱性修正(#37): `/` は無条件で admin トークン Cookie を配っていた=非localhost公開時に
-    # 誰でも GET / でトークンを取得し全制御APIを乗っ取れた。配布を localhost/認証済みに限定。
+def test_admin_legacy_cookie_is_expired_and_not_accepted():
+    # 旧版の生トークン Cookie は別ポートへ流れるため、発行・受理せず失効させる。
     import tempfile
     import urllib.request
-    from dataplane.admin import _make_handler
     with tempfile.TemporaryDirectory() as tmp:
         ofw, osh = FW._FW, ND._SHIELD
         adm, url, token = _admin_with_temp(tmp)
         try:
-            ok = _make_handler(adm)._may_set_token_cookie
-            assert ok("127.0.0.1", False, "", token) is True          # localhost=配布
-            assert ok("::1", False, "", token) is True
-            assert ok("203.0.113.5", False, "", token) is False       # 無認証リモート=配らない(修正点)
-            assert ok("203.0.113.5", True, "", token) is True         # 認証済みリモート=配布
-            assert ok("203.0.113.5", False, token, token) is True     # ?token 正=ブートストラップ可
-            assert ok("203.0.113.5", False, "wrong", token) is False  # ?token 誤=配らない
-            # 回帰: localhost からの GET / は従来どおり Cookie を受け取れる(管理UXは不変)
             r = urllib.request.urlopen(url + "/", timeout=5)
             cookies = [v for (k, v) in r.getheaders() if k.lower() == "set-cookie"]
-            assert any("ducknet_admin=" in c for c in cookies)
+            assert cookies and all("ducknet_admin=;" in c and "Max-Age=0" in c
+                                   and token not in c for c in cookies)
+            assert _req(url + "/api/state")[0] == 401
+            assert _req(url + "/api/state", token=token)[0] == 200
         finally:
             adm.stop()
             FW._FW, ND._SHIELD = ofw, osh
@@ -1010,6 +1020,7 @@ def test_http_smuggling_framing_is_rejected():
         "TE.TE": H + b"Transfer-Encoding: chunked\r\nTransfer-Encoding: x\r\n\r\n",
         "TE-not-last-chunked": H + b"Transfer-Encoding: chunked, gzip\r\n\r\n",
         "TE-identity": H + b"Transfer-Encoding: identity\r\n\r\n",
+        "TE-encoded-then-chunked": H + b"Transfer-Encoding: gzip, chunked\r\n\r\n",
         "name-space-CL": H + b"Content-Length : 5\r\n\r\n",
         # 深掘り(行構造・ヘッダ整合性)
         "bare-CR": H + b"Content-Length: 5\rTransfer-Encoding: chunked\r\n\r\n",
@@ -1030,7 +1041,6 @@ def test_http_smuggling_framing_is_rejected():
         "single-CL": b"GET /index.html HTTP/1.1\r\nHost: x\r\nContent-Length: 10\r\n\r\n",
         "no-body-GET": b"GET / HTTP/1.1\r\nHost: x\r\n\r\n",
         "plain-chunked": H + b"Transfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
-        "te-coding-then-chunked": H + b"Transfer-Encoding: gzip, chunked\r\n\r\n0\r\n\r\n",
         "CL-ows": H + b"Content-Length:  10 \r\n\r\n",   # 値前後のOWSは正常
         "options-star": b"OPTIONS * HTTP/1.1\r\nHost: x\r\n\r\n",
         "query-target": b"GET /a?b=c&d=e HTTP/1.0\r\nHost: x\r\n\r\n",
@@ -1125,6 +1135,7 @@ def test_backend_unreachable_returns_502_and_metric():
     # metrics["backend_unreachable"] を増分することを回帰から守る(このLite版は
     # txnlog を持たないため、上流(DuckNet本体)のテストと違いそちらの検証は無し)。
     import asyncio
+    import tempfile
     from dataplane.engine.services.proxy import AsyncEdgeGuard
 
     class _R:
@@ -1139,12 +1150,20 @@ def test_backend_unreachable_returns_502_and_metric():
         def get_extra_info(self, k, default=None):
             return ("203.0.113.77", 5555) if k == "peername" else default
 
-    g = AsyncEdgeGuard(backend_host="127.0.0.1", backend_port=1)  # 届かないport
-    w = _W()
-    asyncio.run(g._handle(_R(b"GET /x HTTP/1.1\r\nHost: h\r\n\r\n"), w))
-    assert b"502 Bad Gateway" in w.buf.split(b"\r\n", 1)[0]
-    assert w.closed
-    assert g.metrics["backend_unreachable"] == 1
+    old_fw, old_shield = FW._FW, ND._SHIELD
+    with tempfile.TemporaryDirectory() as tmp:
+        try:
+            FW._FW = FW.AppFirewall(state_dir=tmp)
+            assert FW._FW.add_rule("203.0.113.77/32", "allow")["ok"]
+            ND._SHIELD = ND.NetShield(state_dir=tmp)
+            g = AsyncEdgeGuard(backend_host="127.0.0.1", backend_port=1)  # 届かないport
+            w = _W()
+            asyncio.run(g._handle(_R(b"GET /x HTTP/1.1\r\nHost: h\r\n\r\n"), w))
+            assert b"502 Bad Gateway" in w.buf.split(b"\r\n", 1)[0]
+            assert w.closed
+            assert g.metrics["backend_unreachable"] == 1
+        finally:
+            FW._FW, ND._SHIELD = old_fw, old_shield
 
 
 def test_dashboard_get_broken_source_degrades_one_key_not_whole_state():
@@ -1164,7 +1183,7 @@ def test_dashboard_get_broken_source_degrades_one_key_not_whole_state():
                 code, body = _req(url + "/api/state", token=token)
                 assert code == 200                          # 全体は落ちない
                 st = json.loads(body)
-                assert st["top"] == []                       # 壊れたキーだけ空へdegrade
+                assert st["top"] == {"error": "source unavailable"}  # 空の正常結果と区別
                 assert "shield_metrics" in st and "error" not in st["shield_metrics"]
                 assert "firewall" in st and "error" not in st["firewall"]
             finally:
@@ -1190,7 +1209,8 @@ def test_dashboard_get_route_exception_returns_clean_error_not_broken_connection
             code, body = _req(url + "/api/deception", token=token)
             assert code == 500
             r = json.loads(body)
-            assert r["ok"] is False and "boom-deception" in r["error"]
+            assert r["ok"] is False and r["error"] == "internal error"
+            assert b"boom-deception" not in body
             # 壊れていない他のルートは引き続き正常(ダッシュボード全体は道連れにならない)
             code2, _ = _req(url + "/api/state", token=token)
             assert code2 == 200

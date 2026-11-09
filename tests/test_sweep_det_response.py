@@ -18,6 +18,7 @@ import contextlib
 import gzip
 import os
 import tempfile
+from unittest import mock
 
 import dataplane.engine.lifeform.pipeline as ND
 import dataplane.engine.lifeform.policy as FW
@@ -37,6 +38,11 @@ def _shield(**cfg):
         sh = NetShield(state_dir=d)
         sh.cfg["enabled"] = True
         sh.cfg.update(cfg)
+        # Some tests intentionally inject invalid internal settings to check
+        # fail-closed response behavior. Record this fixture snapshot as its
+        # memory-integrity baseline before any background guard can inspect
+        # the temporary process singleton and restore DLP OFF midstream.
+        sh._refresh_cfg_mac()
         ND._SHIELD = sh
         FW._FW = FW.AppFirewall(state_dir=d)
         try:
@@ -232,16 +238,131 @@ def test_d27_audit_mode_never_holds_back_bytes():
         assert got[0] == b"line one\n", (harden, got)
 
 
-def test_d27_block_mode_streams_sse_and_flushes_idle_tail():
-    # block: SSE は保留しない。その他の応答も backend が黙ったら保留分を短時間で放出する。
+def test_d27_block_mode_holds_unjudged_tail_until_eof():
+    # block: a paced secret must not be delivered before enough bytes arrive to judge it.
+    # Small clean SSE events may be delayed until EOF under strict containment.
     got = _stream(_SSE_HEAD, [_EV1, _EV2], 0.3, dlp_enabled=True, dlp_action="block")
-    assert got[0] == _EV1 and got[1] == _EV1 + _EV2, got
+    assert got == [b"", b"", _EV1 + _EV2], got
     head = b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\n"
     got = _stream(head, [b"line one\n", b"line two\n"], 1.0, dlp_enabled=True,
                   dlp_action="block")
-    assert got[0] == b"line one\n", got
-    assert got[1] == b"line one\nline two\n", got
+    assert got[0] == b"", got
+    assert got[1] == b"", got
     assert got[2] == b"line one\nline two\n", got
+
+
+def test_dlp_block_paced_secret_never_reaches_client():
+    head = b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n"
+    got = _stream(head, [b"key=" + _LEAK[:10], _LEAK[10:]], 0.3,
+                  dlp_enabled=True, dlp_action="block")
+    assert all(_LEAK not in part and _LEAK[:10] not in part for part in got), got
+    # Audit still streams every event and retains its documented observe-only behavior.
+    got = _stream(head, [b"key=" + _LEAK[:10], _LEAK[10:]], 0.3,
+                  dlp_enabled=True, dlp_action="audit")
+    assert got[1] == b"key=" + _LEAK, got
+
+
+def test_paced_block_stream_survives_periodic_integrity_check():
+    head = b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n"
+    checked = []
+    original_sleep = asyncio.sleep
+
+    async def check_during_gap(seconds, *args, **kwargs):
+        if seconds == 0.3 and not checked:
+            checked.append(ND.net_shield().verify_cfg_integrity())
+        return await original_sleep(seconds, *args, **kwargs)
+
+    with mock.patch.object(asyncio, "sleep", check_during_gap):
+        got = _stream(head, [b"key=" + _LEAK[:10], _LEAK[10:]], 0.3,
+                      dlp_enabled=True, dlp_action="block")
+    assert checked == [{"ok": True, "tampered": False}], checked
+    assert all(_LEAK not in part and _LEAK[:10] not in part for part in got), got
+
+
+def test_dlp_block_scan_budget_exhaustion_fails_closed():
+    body = b"A" * 65 + _LEAK
+    resp = _resp(body)
+    split = len(resp) - len(body) + 65
+    out, sh = _pipe([resp[:split], resp[split:]], dlp_enabled=True,
+                    dlp_action="block", dlp_max_scan_bytes=64)
+    assert _LEAK not in out and body[:65] not in out, out
+    assert sh.metrics().get("dlp_unscannable", 0) == 1
+    out, sh = _pipe([resp[:split], resp[split:]], dlp_enabled=True,
+                    dlp_action="audit", dlp_max_scan_bytes=64)
+    assert out == resp
+    assert sh.metrics().get("dlp_unscannable", 0) == 1
+    exact = _resp(b"A" * 64)
+    out, sh = _pipe([exact], dlp_enabled=True, dlp_action="block",
+                    dlp_max_scan_bytes=64)
+    assert out == exact
+    assert sh.metrics().get("dlp_unscannable", 0) == 0
+
+
+def test_dlp_block_rejects_uninspectable_protocol_upgrade():
+    resp = (b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n"
+            b"Connection: Upgrade\r\n\r\nopaque frames")
+    out, sh = _pipe([resp], dlp_enabled=True, dlp_action="block")
+    assert out == b""
+    assert sh.metrics().get("dlp_unscannable", 0) == 1
+    out, sh = _pipe([resp], dlp_enabled=True, dlp_action="audit")
+    assert out == resp
+    assert sh.metrics().get("dlp_unscannable", 0) == 1
+
+
+def test_dlp_block_scans_interim_response_heads():
+    benign = b"HTTP/1.1 103 Early Hints\r\nLink: </style.css>; rel=preload\r\n\r\n"
+    final = _resp(b"ok")
+    out, sh = _pipe([benign[:20], benign[20:] + final], dlp_enabled=True,
+                    dlp_action="block", dlp_max_scan_bytes=2)
+    assert out == benign + final
+    assert sh.metrics().get("dlp_leak", 0) == 0
+    bad = b"HTTP/1.1 103 Early Hints\r\nX-Debug-Key: " + _LEAK + b"\r\n\r\n"
+    out, sh = _pipe([bad[:20], bad[20:] + final], dlp_enabled=True,
+                    dlp_action="block", dlp_max_scan_bytes=2)
+    assert out == b""
+    assert sh.metrics().get("dlp_leak", 0) == 1
+
+
+def test_dlp_block_rejects_ambiguous_response_transfer_encoding():
+    body = b"4\r\nDATA\r\n0\r\n\r\n"
+    for fields in (b"Transfer-Encoding: chunked, chunked\r\n",
+                   b"Transfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\n",
+                   b"Transfer-Encoding: identity, chunked\r\n"):
+        head = b"HTTP/1.1 200 OK\r\n" + fields + b"\r\n"
+        out, sh = _pipe([head + body], dlp_enabled=True, dlp_action="block")
+        assert out == b"", (fields, out)  # framing 不定なら head 公開前に遮断
+        assert sh.metrics().get("dlp_unscannable", 0) == 1
+        out, sh = _pipe([head + body], dlp_enabled=True, dlp_action="audit")
+        assert out == b""  # Audit cannot make ambiguous HTTP framing parseable.
+        assert sh.metrics().get("dlp_unscannable", 0) == 1
+    valid = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n" + body
+    out, sh = _pipe([valid], dlp_enabled=True, dlp_action="block")
+    assert out == valid
+    assert sh.metrics().get("dlp_unscannable", 0) == 0
+
+
+def test_response_shield_initialization_failure_closes_without_forwarding():
+    resp = _resp(b"ordinary response")
+
+    def run():
+        guard, sink = AsyncEdgeGuard(), _Sink()
+        asyncio.run(guard._pipe(_Reads([resp]), sink, scan=True, ip="192.0.2.80"))
+        return bytes(sink.buf), guard.metrics
+
+    with mock.patch.object(ND, "net_shield", side_effect=RuntimeError("state unavailable")):
+        out, metrics = run()
+    assert out == b""
+    assert metrics.get("defense_unavailable", 0) == 1
+    # A deliberately disabled shield is available and keeps the pass-through contract.
+    with _shield(enabled=False, dlp_enabled=True):
+        out, metrics = run()
+    assert out == resp
+    assert metrics.get("defense_unavailable", 0) == 0
+    # Even a corrupted scan budget cannot silently turn active DLP off.
+    with _shield(dlp_enabled=True, dlp_max_scan_bytes=0):
+        out, metrics = run()
+    assert out == b""
+    assert metrics.get("defense_unavailable", 0) == 1
 
 
 def test_d27_block_mode_still_withholds_boundary_spanning_secret():

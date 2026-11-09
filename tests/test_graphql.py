@@ -22,6 +22,18 @@ def test_extract_queries_forms():
     assert extract_queries(b"username=alice") == []                 # 通常フォーム
 
 
+def test_duplicate_json_members_cannot_select_an_unchecked_query():
+    from dataplane.engine.lifeform.graphql import parse_body
+    attack = b'{"query":"{ __schema { types { name } } }","query":"{ safe }"}'
+    # 標準 JSON パーサでも先勝ち設定なら、WAF の旧来の後勝ちと解釈が割れる。
+    first = json.loads(attack, object_pairs_hook=lambda pairs: dict(reversed(pairs)))
+    assert "__schema" in first["query"]
+    assert parse_body(attack)[1] == "malformed"
+    assert parse_body(b'{"query":"{ safe }","qu\\u0065ry":"{ safe }"}')[1] == "malformed"
+    benign = b'{"query":"{ safe }","variables":{"a":"same","b":"same"}}'
+    assert parse_body(benign) == (["{ safe }"], "")
+
+
 def test_max_depth_ignores_strings():
     assert max_depth("{ a { b { c } } }") == 3
     assert max_depth('{ a(arg: "x { y } z") { b } }') == 2          # 文字列内の{}は無視

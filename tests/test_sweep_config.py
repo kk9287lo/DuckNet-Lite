@@ -171,12 +171,15 @@ def test_c28_admin_config_nan_keeps_dashboard_json_valid():
     with tempfile.TemporaryDirectory() as d:
         a = _Admin(d)
         try:
+            _, before = _get(a.url + "/api/state", a.token)
+            before_cfg = _strict_json(before)["shield"]["cfg"]
             code, body = _post_raw(a.url + "/api/shield/config", a.token,
                                    b'{"rate_per_sec": NaN}')
-            assert code == 200
+            assert code == 400
             assert _strict_json(body).get("ok") is False
             _, st = _get(a.url + "/api/state", a.token)
-            assert _strict_json(st)["shield"]["cfg"]["rate_per_sec"] == 20.0
+            cfg = _strict_json(st)["shield"]["cfg"]
+            assert cfg == before_cfg and cfg["rate_per_sec"] == 20.0
         finally:
             a.close()
 
@@ -202,7 +205,7 @@ def test_c27_admin_sig_add_nan_weight_rejected():
             body = json.dumps({"name": "probe-sig", "pattern": "zzqq[0-9]",
                                "weight": "nan"}).encode()
             code, r = _post_raw(a.url + "/api/shield/sig_add", a.token, body)
-            assert code == 200 and _strict_json(r).get("ok") is False
+            assert code == 400 and _strict_json(r).get("ok") is False
             _, s = _get(a.url + "/api/shield/signatures", a.token)
             assert _strict_json(s)["custom"] == []
         finally:
@@ -244,17 +247,37 @@ def test_c47_set_path_limits_non_list_keeps_rules():
         assert sh.cfg["path_limits"] == []
 
 
+def test_c47_path_limits_partial_replacement_rejected_at_every_entry():
+    """1 件でも不正なら dedicated/config/宣言的設定とも既存の認証パス制限を保つ。"""
+    with tempfile.TemporaryDirectory() as d:
+        sh = _shield(d)
+        assert sh.set_path_limits([{"path": "/login", "rate": 0.001, "burst": 1}])["ok"]
+        keep = list(sh.cfg["path_limits"])
+        rows = [{"path": "/api", "rate": 1}, {"path": "/broken", "rate": None}]
+        assert sh.set_path_limits(rows)["ok"] is False
+        assert sh.cfg["path_limits"] == keep
+        r = sh.set_config(path_limits=rows)
+        assert r["rejected"] == ["path_limits"] and not r["changed"]
+        assert sh.cfg["path_limits"] == keep
+        r = sh.apply_config({"path_limits": rows})
+        assert "path_limits" in r["rejected"] and "path_limits" not in r["applied"]
+        assert sh.cfg["path_limits"] == keep
+        assert NetShield(state_dir=d).cfg["path_limits"] == keep
+
+
 def test_c47_apply_config_does_not_report_rejected_keys_as_applied():
     """拒否された blocked_methods / path_limits も applied に入り、反映済みと誤報していた。"""
     with tempfile.TemporaryDirectory() as d:
         sh = _shield(d)
         sh.set_path_limits([{"path": "/login", "rate": 0.001, "burst": 1}])
         sh.set_blocked_methods(["TRACE"])
+        before_enabled = sh.cfg["enabled"]
         r = sh.apply_config({"path_limits": {"path": "/login", "rate": 0.001},
                              "blocked_methods": 123, "enabled": True})
         assert "path_limits" not in r["applied"]
         assert "blocked_methods" not in r["applied"]
-        assert "enabled" in r["applied"]
+        assert r["ok"] is False and r["applied"] == []
+        assert sh.cfg["enabled"] is before_enabled
         assert [x["path"] for x in sh.cfg["path_limits"]] == ["/login"]
         assert sh.cfg["blocked_methods"] == ["TRACE"]
 

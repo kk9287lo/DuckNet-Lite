@@ -14,7 +14,7 @@ import tempfile
 import dataplane.engine.lifeform.pipeline as P
 from dataplane.engine.lifeform.pipeline import NetShield, _normalize_full
 from test_sweep_det2_signatures import _PROSE_BODIES
-from test_sweep_det_normalize import BROWSER_MULTIPART
+from test_sweep_det_normalize import BENIGN_BROWSER_MULTIPART
 
 # test_sweep_det2_signatures / test_core / test_logio にある crlf の fixture(フォーム値の形)
 _CRLF_FIXTURES = (b"next=%0d%0aSet-Cookie:%20sid=evil", b"u=%0d%0aLocation:%20http://e",
@@ -51,7 +51,7 @@ def _multipart(name: bytes, value: bytes, extra_head: bytes = b"") -> bytes:
 def test_crlf_fixture_in_form_body_value_is_detected():
     """既存の crlf fixture を urlencoded 本文の値に置くと crlf として数える(型の有無を問わない)。"""
     with tempfile.TemporaryDirectory() as d:
-        sh = _shield(d, block_score=10000)
+        sh = _shield(d, block_score=1000)
         for f in _CRLF_FIXTURES:
             for b in (f, b"title=Hello&" + f + b"&stars=5"):
                 for kw in ({"content_type": _FORM}, {}):
@@ -63,7 +63,7 @@ def test_crlf_fixture_detected_past_first_window_and_in_other_value_carriers():
     """先頭を無害な詰め物で埋めて後ろの窓へ押し出しても、JSON の値や multipart のフォーム値に
     同じ(符号化された)値を入れても crlf として数える。"""
     with tempfile.TemporaryDirectory() as d:
-        sh = _shield(d, block_score=10000)
+        sh = _shield(d, block_score=1000)
         for f in _CRLF_FIXTURES:
             name, value = f.split(b"=", 1)
             padded = b"pad=" + b"A" * (P._MAX_SCAN + 100) + b"&" + f
@@ -75,12 +75,12 @@ def test_crlf_fixture_detected_past_first_window_and_in_other_value_carriers():
 
 # ── 誤検知を戻さない ─────────────────────────────────────────────────────
 def test_benign_bodies_with_line_breaks_still_score_zero():
-    """普通のブラウザ multipart、YAML/CSV/地の文、テキストエリアの改行(urlencoded の %0D%0A でも
+    """通常 multipart の枠、YAML/CSV/地の文、テキストエリアの改行(urlencoded の %0D%0A でも
     multipart の生の CRLF でも)は 0 点のまま。"""
     textarea = _multipart(b"review", b"Great store.\r\nCat food arrived fast")
     with tempfile.TemporaryDirectory() as d:
         sh = _shield(d)
-        for b in (BROWSER_MULTIPART, textarea) + _PROSE_BODIES + _LINE_BREAK_BODIES:
+        for b in (BENIGN_BROWSER_MULTIPART, textarea) + _PROSE_BODIES + _LINE_BREAK_BODIES:
             for kw in ({}, {"content_type": _FORM}):
                 r = sh.inspect_body("192.0.2.52", b, **kw)
                 assert r["action"] == "allow", (b[:80], kw, r)

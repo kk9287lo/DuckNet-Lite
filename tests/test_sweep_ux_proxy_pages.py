@@ -86,12 +86,11 @@ def _shield(enabled=True, **cfg):
     osh, ofw = ND._SHIELD, FW._FW
     with tempfile.TemporaryDirectory() as d:
         sh = ND.NetShield(state_dir=d)
-        sh.cfg["enabled"] = bool(enabled)
-        sh.cfg["auto_under_attack"] = False
-        sh.cfg.update(cfg)
-        ND._SHIELD = sh
         FW._FW = FW.AppFirewall(state_dir=d)
         try:
+            assert FW._FW.add_rule("198.51.100.61/32", "allow")["ok"]
+            assert sh.set_config(enabled=bool(enabled), **cfg)["ok"]
+            ND._SHIELD = sh
             yield sh
         finally:
             ND._SHIELD, FW._FW = osh, ofw
@@ -112,7 +111,22 @@ def _listening():
 def _drive(req: bytes, ip="198.51.100.61", port=1, **guard_kw) -> bytes:
     g = AsyncEdgeGuard(backend_host="127.0.0.1", backend_port=port, **guard_kw)
     w = _W(ip)
-    asyncio.run(g._handle(_R(req), w))
+    # Directly driving _handle skips start(), which normally owns the signed
+    # state directory before request-body staging can use it. Keep this test
+    # seam under the same serving lease as a real listener.
+    try:
+        g._ensure_serving_lease()
+        asyncio.run(g._handle(_R(req), w))
+    finally:
+        lease = g._serving_lease
+        if lease is not None:
+            if lease.held:
+                flushed = g._finish_serving_lease()
+                if not flushed:
+                    g._close_serving_lease()  # isolated fixture teardown only
+                assert flushed, "direct guard fixture failed to flush serving state"
+            else:
+                g._close_serving_lease()
     assert w.closed
     return w.buf
 

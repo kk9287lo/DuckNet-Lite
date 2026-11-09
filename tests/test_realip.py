@@ -13,6 +13,8 @@ from dataplane.engine.services.proxy import (_real_client_ip, _header_value,
                                              _forwarded_proto_tls,
                                              _set_forwarded_for, AsyncEdgeGuard)
 import dataplane.engine.lifeform.pipeline as ND
+import dataplane.engine.lifeform.policy as FW
+from guard_support import stop_guard_owned
 
 
 def _req(xff=None):
@@ -203,15 +205,20 @@ def test_backend_receives_resolved_client_ip_end_to_end():
     # 信頼proxy構成: peer=127.0.0.1 を信頼に入れ、client が XFF 偽装(9.9.9.9)+実IP(1.2.3.4)を送る。
     # バックエンドは解決済み実IP(1.2.3.4)を XFF/X-Real-IP で受け取り、偽装値は消える。
     import tempfile
-    osh = ND._SHIELD
+    osh, ofw = ND._SHIELD, FW._FW
     got, bport = _capture_backend()
     with tempfile.TemporaryDirectory() as tmp:
         ND._SHIELD = ND.NetShield(state_dir=tmp)
         ND._SHIELD.cfg["trusted_proxies"] = ["127.0.0.1/32"]
+        # ACL の安全な既定は public deny。XFF から解決した実クライアントだけを
+        # 明示許可し、試験が転送ヘッダまで進めるようにする。
+        FW._FW = FW.AppFirewall(state_dir=tmp)
+        assert FW._FW.add_rule("1.2.3.4/32", "allow")["ok"]
+        assert FW._FW.evaluate("9.9.9.9")["action"] == "deny"
         guard = AsyncEdgeGuard(backend_host="127.0.0.1", backend_port=bport,
                                listen_host="127.0.0.1", listen_port=0)
-        guard.start()
         try:
+            assert guard.start()["ok"]
             c = socket.create_connection(("127.0.0.1", guard.listen_port), timeout=5)
             c.sendall(b"GET / HTTP/1.1\r\nHost: x\r\n"
                       b"X-Forwarded-For: 1.2.3.4, 127.0.0.1\r\n\r\n")
@@ -225,8 +232,8 @@ def test_backend_receives_resolved_client_ip_end_to_end():
             assert b"x-forwarded-for: 1.2.3.4" in low          # 解決済み実クライアント
             assert b"x-real-ip: 1.2.3.4" in low
         finally:
-            guard.stop()
-            ND._SHIELD = osh
+            stop_guard_owned(guard)
+            ND._SHIELD, FW._FW = osh, ofw
 
 
 # ── IPv4-mapped IPv6 正規化(#14): dual-stack 束縛時の BAN すり抜けを防ぐ ──

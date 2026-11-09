@@ -144,13 +144,12 @@ def test_t1_startup_fail_closed_even_if_operator_had_disabled():
 
 
 def test_t1_first_start_keeps_today_behaviour():
-    """初回起動・設定を一度も保存していない再起動・署名導入前の平文 state の移行・別鍵の
-    state を持ち込んだ初回起動は従来どおり(既定=OFF のまま。誤警報を出さない)。"""
+    """欠落状態は防御 ON、署名導入前の平文設定は移行し、別鍵の state は拒否する。"""
     with tempfile.TemporaryDirectory() as d:
         s1 = NetShield(state_dir=d)
-        assert not s1.is_enabled() and _tamper_count(s1) == 0
+        assert s1.is_enabled() and _tamper_count(s1) == 0
         s2 = _restart(d)                     # マーカーはあるが state.json は一度も保存していない
-        assert not s2.is_enabled() and _tamper_count(s2) == 0, s2.metrics()["tamper"]
+        assert s2.is_enabled() and _tamper_count(s2) == 0, s2.metrics()["tamper"]
     with tempfile.TemporaryDirectory() as d:  # 署名導入前の平文 state(マーカー・.hw 無し)
         _write(os.path.join(d, "state.json"),
                json.dumps({"cfg": {"enabled": True, "block_score": 150}}))
@@ -165,7 +164,7 @@ def test_t1_first_start_keeps_today_behaviour():
         sa.enable()
         shutil.copy(os.path.join(a, "state.json"), os.path.join(b, "state.json"))
         sb = _restart(b)                     # 署名実績の無い初回起動=従来どおり(警報+既定)
-        assert not sb.is_enabled() and _tamper_count(sb, "state_tamper") >= 1
+        assert sb.is_enabled() and _tamper_count(sb, "state_tamper") >= 1
 
 
 # ── T2: body_sig_weight_factor ─────────────────────────────────────────────

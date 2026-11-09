@@ -21,6 +21,7 @@ from test_sweep_det2_signatures import _PROSE_BODIES
 from test_sweep_det3_crlf import _CRLF_FIXTURES, _LINE_BREAK_BODIES, _multipart
 from test_sweep_det_normalize import BROWSER_MULTIPART
 from test_sweep_rv_bodynorm import _JA_OTHER, _JA_TITLES, _STACKED_NL
+from test_sweep_proxy_request import _through
 
 _JSON = "application/json"
 _BS = chr(92)                     # バックスラッシュ(エスケープをソースに直書きしない)
@@ -72,7 +73,7 @@ def test_crlf_fixture_with_json_short_escape_is_detected():
     """既存の crlf fixture の改行を JSON の短いエスケープ(\\r\\n・\\n)で書くと crlf として数える
     (Content-Type の有無・整形・配列の中を問わない)。"""
     with tempfile.TemporaryDirectory() as d:
-        sh = _shield(d, block_score=10000)
+        sh = _shield(d, block_score=1000)
         for name, value in _fixture_pairs():
             assert "\n" in value, value
             for b in _json_bodies(name, value):
@@ -85,7 +86,7 @@ def test_crlf_fixture_with_json_short_escape_is_detected():
 def test_json_short_escape_matches_unicode_escape_form():
     """同じ値は JSON での書き方(短いエスケープ \\n・\\u000a)に依らず同じ結果。"""
     with tempfile.TemporaryDirectory() as d:
-        sh = _shield(d, block_score=10000)
+        sh = _shield(d, block_score=1000)
         for name, value in _fixture_pairs():
             short = json.dumps({name: value}).encode("ascii")
             uesc = short.replace((_BS + "r").encode("ascii"), (_BS + "u000d").encode("ascii")) \
@@ -97,7 +98,7 @@ def test_json_short_escape_matches_unicode_escape_form():
 def test_json_short_escape_detected_past_first_window():
     """先頭を無害な詰め物で埋めて後ろの窓へ押し出しても数える(JSON かどうかは本文全体で決める)。"""
     with tempfile.TemporaryDirectory() as d:
-        sh = _shield(d, block_score=10000)
+        sh = _shield(d, block_score=1000)
         for name, value in _fixture_pairs():
             b = json.dumps({"pad": "A" * (P._MAX_SCAN + 100), name: value}).encode("ascii")
             r = sh.inspect_body("192.0.2.82", b)
@@ -108,10 +109,41 @@ def test_json_short_escape_reaches_stacked_rule():
     """複文(sqli-stacked)の照合も同じ見え方を使う(rv_bodynorm の fixture を JSON の値に)。"""
     value = unquote_plus(_STACKED_NL.decode("ascii"))
     with tempfile.TemporaryDirectory() as d:
-        sh = _shield(d, block_score=10000)
+        sh = _shield(d, block_score=1000)
         for b in _json_bodies("q", value):
             r = sh.inspect_body("192.0.2.83", b)
             assert r.get("signature") == "sqli-stacked", (b, r)
+
+
+def test_json_multipart_part_short_escape_is_scanned_without_code_literal_false_positive():
+    """A JSON operations part has JSON escape semantics, unlike a plain code part."""
+    def request(value, *, name=b"operations", part_type=b"application/json"):
+        content = json.dumps({"query": "query($x:String){echo(x:$x)}",
+                              "variables": {"next": value}}).encode("ascii")
+        body = (b'--b\r\nContent-Disposition: form-data; name="' + name + b'"\r\n'
+                + b'Content-Type: ' + part_type + b'\r\n\r\n' + content + b'\r\n--b--\r\n')
+        head = (b'POST /graphql HTTP/1.1\r\nHost: x\r\n'
+                b'Content-Type: multipart/form-data; boundary=b\r\nContent-Length: '
+                + str(len(body)).encode() + b'\r\n\r\n')
+        return head + body
+
+    attack = request("\r\nSet-Cookie: sid=evil")
+    received, _, metrics = _through([attack], body_scan_max_bytes=1024, block_score=20)
+    assert received == b"" and metrics["proxied"] == 0
+
+    for value in ("Great store.\r\nCat food arrived fast",
+                  r"\r\nSet-Cookie: sid=evil"):
+        benign = request(value)
+        received, response, metrics = _through([benign], body_scan_max_bytes=1024,
+                                               block_score=20)
+        assert benign.partition(b"\r\n\r\n")[2] in received
+        assert response.startswith(b"HTTP/1.1 200") and metrics["proxied"] == 1
+
+    # Without JSON semantics, the same source-code literal stays a literal.
+    code = request(r"\r\nSet-Cookie: sid=evil", name=b"code", part_type=b"text/plain")
+    received, response, _ = _through([code], body_scan_max_bytes=1024, block_score=20)
+    assert code.partition(b"\r\n\r\n")[2] in received
+    assert response.startswith(b"HTTP/1.1 200")
 
 
 # ── 本文の走査面(他の検知が見る見え方)は変えない ─────────────────────────────
@@ -155,9 +187,17 @@ def test_existing_false_positive_fixtures_as_json_values_score_zero():
             for b in _json_bodies("note", t):
                 r = sh.inspect_body("192.0.2.85", b)
                 assert r["action"] == "allow", (t, r)
-        for b in (BROWSER_MULTIPART,) + _LINE_BREAK_BODIES + _PROSE_BODIES:
+        for b in _LINE_BREAK_BODIES + _PROSE_BODIES:
             assert sh.inspect_body("192.0.2.85", b)["action"] == "allow", b[:80]
         assert sh._decayed_score(sh._state("192.0.2.85")) == 0
+
+
+def test_binary_multipart_file_is_not_silently_skipped():
+    """A random-looking file may score; its client-controlled label cannot disable scanning."""
+    with tempfile.TemporaryDirectory() as d:
+        sh = _shield(d)
+        result = sh.inspect_body("192.0.2.90", BROWSER_MULTIPART)
+        assert result.get("signature") and result["action"] == "score", result
 
 
 def test_double_escaped_code_snippet_in_json_scores_zero():
@@ -196,7 +236,7 @@ def test_backslash_n_in_non_json_bodies_is_not_a_line_break():
 def test_other_detections_on_json_bodies_unchanged():
     """全角の互換文字による回避(dec_headfold の fixture)は、JSON の値に改行が混じっても従来どおり検知。"""
     with tempfile.TemporaryDirectory() as d:
-        sh = _shield(d, block_score=10000)
+        sh = _shield(d, block_score=1000)
         for s, sig in _FW_EVASION:
             for b in _json_bodies("c", "line one\n" + s):
                 assert sh.inspect_body("192.0.2.88", b).get("signature") == sig, (s, b)

@@ -32,7 +32,7 @@ def test_conn_cap_rejects_over_limit():
     with tempfile.TemporaryDirectory() as tmp:
         g = _guard_with_cap(tmp, 2)
         called = []
-        async def fake(r, w): called.append(1)
+        async def fake(r, w, acl_jobs=None): called.append(1)
         g._handle_conn = fake
         try:
             g._conn_per_ip["9.9.9.9"] = 2                  # 既に上限本数
@@ -50,7 +50,7 @@ def test_conn_under_cap_processes_and_cleans_up():
     with tempfile.TemporaryDirectory() as tmp:
         g = _guard_with_cap(tmp, 2)
         seen = []
-        async def fake(r, w): seen.append(g._conn_per_ip.get("8.8.8.8"))
+        async def fake(r, w, acl_jobs=None): seen.append(g._conn_per_ip.get("8.8.8.8"))
         g._handle_conn = fake
         try:
             asyncio.run(g._handle(None, _W("8.8.8.8")))
@@ -65,7 +65,7 @@ def test_conn_cap_zero_is_unlimited():
     with tempfile.TemporaryDirectory() as tmp:
         g = _guard_with_cap(tmp, 0)                       # 既定OFF
         called = []
-        async def fake(r, w): called.append(1)
+        async def fake(r, w, acl_jobs=None): called.append(1)
         g._handle_conn = fake
         try:
             g._conn_per_ip["7.7.7.7"] = 999               # 上限なし=無視
@@ -79,7 +79,7 @@ def test_conn_counter_decrements_on_exception():
     osh = ND._SHIELD
     with tempfile.TemporaryDirectory() as tmp:
         g = _guard_with_cap(tmp, 5)
-        async def boom(r, w): raise RuntimeError("x")
+        async def boom(r, w, acl_jobs=None): raise RuntimeError("x")
         g._handle_conn = boom
         try:
             try:

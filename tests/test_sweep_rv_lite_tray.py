@@ -45,6 +45,21 @@ def _G():
     return G
 
 
+@contextlib.contextmanager
+def _env(**values):
+    saved = {key: os.environ.get(key) for key in values}
+    try:
+        for key, value in values.items():
+            os.environ[key] = value
+        yield
+    finally:
+        for key, value in saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
 def _u16(s: str) -> int:
     """szTip(WCHAR 配列)で占める UTF-16 単位数。"""
     return len(s.encode("utf-16-le", "surrogatepass")) // 2
@@ -132,115 +147,31 @@ def _dashboard(token="rv-tray-token"):
         shutil.rmtree(tmp, True)
 
 
-# ── #25 別のプログラムの 401 を「トークン不一致」と言わない ─────────────────
-def test_foreign_401_on_admin_port_is_unreachable_not_token_mismatch():
+# ── Proof-only polling against foreign listeners ─────────────────────
+def test_foreign_or_forged_response_never_receives_token():
     G = _G()
-    with _stub(_foreign_401) as (url, _seen):
-        for tok in ("", "configured-token"):
-            assert G._fetch_shield_state(url, tok, timeout=2.0) == "unreachable", tok
-        # 起動時の流れ: _ensure_gateway は「本製品ではない」と判断して空トークンを返す(起動しない)。
-        # その後のポーラの表示は「接続できません」=トークンを直す話ではないと分かる。
-        def _no_spawn(*a, **k):
-            raise AssertionError("must not spawn a gateway on an occupied port")
-        for env_tok in ("", "configured-token"):
-            with _patched(G, _spawn_gateway=_no_spawn), \
-                    contextlib.redirect_stderr(io.StringIO()):
-                tok, child = G._ensure_gateway(url, env_tok)
-            assert (tok, child) == ("", None), (tok, child)
-            tip, _icon = G._status_view(G._fetch_shield_state(url, tok, timeout=2.0),
-                                        "DuckNet-Lite")
-            assert "Gateway unreachable" in tip, tip
-            assert "トークン" not in tip and "token" not in tip, tip
-
-
-def test_ducknet_401_is_still_token_mismatch():
-    """本製品の 401 はこれまでどおり「トークン不一致」(前回の修正の意図: ON/OFF を偽らない)。"""
-    G = _G()
-    with _dashboard("right-token") as (_adm, url, sh):
-        sh.enable()
-        assert G._fetch_shield_state(url, "right-token") == "on"
-        assert G._fetch_shield_state(url, "wrong-token") == "auth"
-        assert G._fetch_shield_state(url, "") == "auth"
-    with _stub(_ducknet_like("right-token")) as (url, _seen):
-        assert G._fetch_shield_state(url, "wrong-token", timeout=2.0) == "auth"
-        assert G._fetch_shield_state(url, "", timeout=2.0) == "auth"
-
-
-# ── #26 本製品と確かめられない相手へトークンを送らない ───────────────────
-def test_token_is_not_sent_to_a_listener_that_is_not_ducknet():
-    G = _G()
-    for answer in (_plain_200, _not_found, _foreign_401):
+    class Child:
+        _ducknet_tray_proof_key = "00" * 32
+        def poll(self):
+            return None
+    for answer in (_foreign_401, _plain_200,
+                   lambda _h: (401, [("X-DuckNet-Tray-Proof", "0" * 64)], ADMIN_401)):
         with _stub(answer) as (url, seen):
-            assert G._fetch_shield_state(url, "secret-tok", timeout=2.0) == "unreachable", \
-                answer.__name__
-        assert seen, answer.__name__                 # 相手には届いている(確認の要求)
-        assert all(t is None for _p, t in seen), (answer.__name__, seen)
+            assert G._fetch_shield_state(url, "secret", owned_child=Child()) == G.STATE_DOWN
+            assert seen and all(token is None for _path, token in seen)
 
 
-def test_identity_probe_does_not_follow_redirects_to_the_real_admin():
-    """相手が本物の管理APIへリダイレクトしても、その先の 401 を『相手は本製品』と取り違えない
-    (指紋を借りた別物へトークンを送らない)。"""
+def test_redirect_never_reaches_target_or_discloses_token():
     G = _G()
-    with _stub(_ducknet_like("secret-tok")) as (real, real_seen):
-        def _redirect(_h):
-            return (302, [("Location", real + "/api/state")], b"")
-        with _stub(_redirect) as (url, seen):
-            assert G._fetch_shield_state(url, "secret-tok", timeout=2.0) == "unreachable"
-            assert G._admin_is_ours("127.0.0.1", int(url.rsplit(":", 1)[1]), 2.0) is False
-    assert all(t is None for _p, t in seen), seen
-    assert real_seen == [], real_seen                # リダイレクト先へは要求すら出していない
-
-
-def test_verified_admin_gets_the_token_without_following_redirects():
-    """相手を確かめた後の本要求も、リダイレクトに従ってトークンを持ち出さない。"""
-    G = _G()
+    class Child:
+        _ducknet_tray_proof_key = "00" * 32
+        def poll(self):
+            return None
     with _stub(_plain_200) as (target, target_seen):
-        def _authed(_h):
-            return (302, [("Location", target + "/steal")], b"")
-        with _stub(_ducknet_like("secret-tok", authed=_authed)) as (url, seen):
-            assert G._fetch_shield_state(url, "secret-tok", timeout=2.0) == "unreachable"
-    assert ("/api/metrics", "secret-tok") in seen, seen
-    assert target_seen == [], target_seen
-
-
-def test_ducknet_is_probed_without_the_token_then_read_with_it():
-    G = _G()
-    with _stub(_ducknet_like("secret-tok")) as (url, seen):
-        assert G._fetch_shield_state(url, "secret-tok", timeout=2.0) == "on"
-    # 1 本目はトークン無しの確認、2 本目でだけトークンを付けて状態を読む
-    assert len(seen) == 2 and seen[0][1] is None, seen
-    assert seen[1] == ("/api/metrics", "secret-tok"), seen
-
-
-def test_token_is_not_handed_to_whoever_takes_the_admin_port_later():
-    """設定済みトークンで本体が稼働 → 本体が止まる → 別のプロセスが同じポートで待ち受ける、の後の
-    ポーリングで、そのプロセスへトークンが渡らない(以前は 5 秒ごとに渡していた)。"""
-    G = _G()
-    token = "configured-in-app-env"
-    with _dashboard(token) as (adm, url, sh):
-        sh.disable()
-        tok, child = G._ensure_gateway(url, token)
-        assert (tok, child) == (token, None)        # 稼働中の本体を確認してトークンを使う
-        assert G._fetch_shield_state(url, tok) == "off"
-        port = int(url.rsplit(":", 1)[1].split("/")[0])
-        adm.stop()
-    cm, err = None, None
-    for _ in range(50):
-        try:
-            cm = _stub(_plain_200, port)
-            ctx = cm.__enter__()
-            break
-        except OSError as e:
-            cm, err = None, e
-            time.sleep(0.05)
-    if cm is None:
-        raise SkipTest("管理APIのポートを別の待受で取り直せない: %r" % (err,))
-    try:
-        _u, seen = ctx
-        assert G._fetch_shield_state(url, tok, timeout=2.0) == "unreachable"
-        assert seen and all(t is None for _p, t in seen), seen
-    finally:
-        cm.__exit__(None, None, None)
+        with _stub(lambda _h: (302, [("Location", target + "/steal")], b"")) as (url, seen):
+            assert G._fetch_shield_state(url, "secret", owned_child=Child()) == G.STATE_DOWN
+            assert seen == [("/api/state", None)]
+    assert target_seen == []
 
 
 # ── #27 監査モード(記録のみ)を「防御 ON」と同じに見せない ──────────────────
@@ -257,21 +188,6 @@ def test_audit_view_is_distinct_and_dimmed():
     long_brand = "長い偽装名😀" * 40                  # 長いブランドでも状態の文言は欠けない
     t2, _ = G._status_view("audit", long_brand)
     assert _u16(t2) <= 127 and t2.endswith(tip[len("DuckNet-Lite"):]), t2
-
-
-def test_audit_gauge_is_read_from_metrics():
-    G = _G()
-    cases = (
-        (b"ducknet_shield_enabled 1\nducknet_shield_audit_mode 1\n", "audit"),
-        (b"ducknet_shield_audit_mode 1\nducknet_shield_enabled 1\n", "audit"),   # 行の順序に依らない
-        (b"ducknet_shield_enabled 1\nducknet_shield_audit_mode 0\n", "on"),
-        (b"ducknet_shield_enabled 1\n", "on"),            # 指標を出さない旧い本体は従来どおり
-        (b"ducknet_shield_enabled 0\nducknet_shield_audit_mode 1\n", "off"),     # 検査自体が止まっている
-        (b"ducknet_shield_audit_mode 1\n", "unreachable"),  # 有効/無効が無い=本製品の応答ではない
-    )
-    for body, want in cases:
-        with _stub(_ducknet_like("tok", metrics=body)) as (url, _seen):
-            assert G._fetch_shield_state(url, "tok", timeout=2.0) == want, (body, want)
 
 
 def test_poller_shows_audit_as_its_own_state():
@@ -291,17 +207,30 @@ def test_poller_shows_audit_as_its_own_state():
 
 
 def test_audit_mode_end_to_end_with_real_dashboard():
-    """実際の本体で mode=audit にすると、トレイは監査モードと読む(/api/metrics の
-    ducknet_shield_audit_mode を本体が出していること込み)。"""
     G = _G()
-    with _dashboard("audit-token") as (_adm, url, sh):
-        sh.enable()
-        assert G._fetch_shield_state(url, "audit-token") == "on"
-        r = sh.set_config(mode="audit")
-        assert r.get("ok") and sh.cfg.get("mode") == "audit", r
-        assert G._fetch_shield_state(url, "audit-token") == "audit"
-        sh.set_config(mode="enforce")
-        assert G._fetch_shield_state(url, "audit-token") == "on"
-        sh.set_config(mode="audit")
-        sh.disable()
-        assert G._fetch_shield_state(url, "audit-token") == "off"   # 無効なら監査より OFF を出す
+    import dataplane.engine.lifeform.policy as FW
+    import dataplane.engine.lifeform.pipeline as ND
+    from dataplane.admin import AdminDashboard
+    import secrets
+    key = secrets.token_hex(32)
+    with tempfile.TemporaryDirectory() as tmp, _env(DUCKNET_TRAY_PROOF_KEY=key):
+        old_fw, old_sh = FW._FW, ND._SHIELD
+        FW._FW = FW.AppFirewall(state_dir=tmp)
+        ND._SHIELD = ND.NetShield(state_dir=tmp)
+        admin = AdminDashboard(host="127.0.0.1", port=0, token="audit-token", state_dir=tmp)
+        info = admin.start()
+        class Child:
+            _ducknet_tray_proof_key = key
+            def poll(self):
+                return None
+        try:
+            url, sh = info["url"], ND._SHIELD
+            assert sh.enable()["ok"]
+            assert G._fetch_shield_state(url, "wrong", owned_child=Child()) == G.STATE_ON
+            assert sh.set_config(mode="audit")["ok"]
+            assert G._fetch_shield_state(url, "", owned_child=Child()) == G.STATE_AUDIT
+            assert sh.disable()["ok"]
+            assert G._fetch_shield_state(url, "secret", owned_child=Child()) == G.STATE_OFF
+        finally:
+            admin.stop()
+            FW._FW, ND._SHIELD = old_fw, old_sh

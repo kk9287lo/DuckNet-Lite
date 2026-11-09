@@ -32,6 +32,7 @@ import dataplane.engine.lifeform.policy as FW
 from dataplane.engine.lifeform.graphql import check, has_introspection, max_depth
 from dataplane.engine.lifeform.pipeline import NetShield, _dangerous_upload_filename
 from dataplane.engine.services.proxy import AsyncEdgeGuard
+from guard_support import stop_guard_owned
 
 # tests/test_graphql.py の深さ 10 問い合わせ(test_only_applies_to_graphql_paths)と
 # イントロスペクション問い合わせ。
@@ -193,7 +194,7 @@ def _through(parts, *, delay=0.05, guard_kw=None, **cfg):
                     c.close()
                 time.sleep(0.2)
             finally:
-                g.stop()
+                stop_guard_owned(g)
         return be.saw(), resp
     finally:
         be.close()
@@ -227,7 +228,9 @@ def test_d4_graphql_body_beyond_scan_prefix_is_parsed_in_full():
         r = sh.inspect_graphql("192.0.2.22", "/graphql", body)
         assert r["action"] == "block" and r["reason"].startswith("depth"), r
         r = sh.inspect_graphql("192.0.2.23", "/graphql", batch)
-        assert r["action"] == "block" and r["reason"].startswith("batch-too-large"), r
+        assert r["action"] == "block", r
+        assert (r["reason"].startswith("batch-too-large")
+                or r["reason"] == "query-readings-too-large"), r
 
 
 def test_d4_graphql_body_over_max_bytes_is_rejected_without_ban():
@@ -252,7 +255,8 @@ def test_d4_proxy_reads_graphql_body_past_scan_cap_and_413s_oversize():
     body = json.dumps({"query": query, "variables": {"note": "x" * 70000}}).encode()
     head = _post(b"/graphql", body)
     _, blocked = _scan(head + body[:4096], "/graphql", [body[4096:]],
-                       graphql_enabled=True, graphql_max_depth=5)
+                       graphql_enabled=True, graphql_max_depth=5,
+                       body_scan_enabled=False)   # GraphQL 独立の全量検査を確認
     assert blocked is True, blocked
     small = b'{"query":"{ me { id } }","variables":{"note":"' + b"x" * 1500 + b'"}}'
     req = _post(b"/graphql", small)
@@ -261,7 +265,7 @@ def test_d4_proxy_reads_graphql_body_past_scan_cap_and_413s_oversize():
     assert b"/graphql" not in saw, saw[:80]
     saw, resp = _through([req + small], graphql_enabled=True)       # 既定上限内は通る
     assert b"/graphql" in saw and resp.endswith(b"ok"), (saw[:80], resp[:80])
-    # multipart(GraphQL のファイルアップロード)は operations 欄だけが上限の対象=大きなファイルは通る
+    # GraphQL 固有の上限は operations 欄だけが対象。本文署名の全体上限は別に適用される。
     up = (b'--b\r\nContent-Disposition: form-data; name="operations"\r\n\r\n'
           b'{"query":"mutation($f: Upload!) { up(file: $f) { id } }","variables":{"f":null}}\r\n'
           b'--b\r\nContent-Disposition: form-data; name="0"; filename="photo.jpg"\r\n\r\n'
@@ -405,11 +409,13 @@ def test_d33_part_headers_beyond_scan_prefix_are_checked():
     後ろに置いた 2 個目のパート(拒否拡張子)はそのまま backend へ流れた。"""
     body = _two_files(b"note.xyz")
     req = _post(b"/upload", body, _MP_CT.encode()) + body
-    saw, _ = _through([req[:30000], req[30000:]], upload_deny_ext=["xyz"])
+    saw, _ = _through([req[:30000], req[30000:]], upload_deny_ext=["xyz"],
+                      body_scan_enabled=False)
     assert b"note.xyz" not in saw, len(saw)
     ok = _two_files(b"notes.txt")                      # 拒否拡張子でなければ全体が届く
     req = _post(b"/upload", ok, _MP_CT.encode()) + ok
-    saw, resp = _through([req[:30000], req[30000:]], upload_deny_ext=["xyz"])
+    saw, resp = _through([req[:30000], req[30000:]], upload_deny_ext=["xyz"],
+                         body_scan_enabled=False)
     assert saw.endswith(b"x\r\n--b--\r\n") and resp.endswith(b"ok"), (len(saw), resp[:60])
 
 
@@ -422,7 +428,8 @@ def test_d33_chunked_upload_beyond_prefix_is_checked():
     head = (b"POST /upload HTTP/1.1\r\nHost: x\r\nUser-Agent: curl/8\r\nContent-Type: "
             + _MP_CT.encode() + b"\r\nTransfer-Encoding: chunked\r\n\r\n")
     req = head + framed
-    saw, _ = _through([req[:30000], req[30000:]], upload_deny_ext=["xyz"])
+    saw, _ = _through([req[:30000], req[30000:]], upload_deny_ext=["xyz"],
+                      body_scan_enabled=False)
     seen = AsyncEdgeGuard._dechunk_bounded(saw.partition(b"\r\n\r\n")[2], 1 << 20)
     assert seen is not None and b"note.xyz" not in seen, len(saw)   # 枠を解いても届いていない
     assert not saw.endswith(b"0\r\n\r\n"), len(saw)                 # 要求は完結させない
@@ -430,7 +437,7 @@ def test_d33_chunked_upload_beyond_prefix_is_checked():
     framed = b"".join(b"%x\r\n" % len(ok[i:i + 7]) + ok[i:i + 7] + b"\r\n"
                       for i in range(0, len(ok), 7)) + b"0\r\n\r\n"
     saw, resp = _through([(head + framed)[:30000], (head + framed)[30000:]],
-                         upload_deny_ext=["xyz"])
+                         upload_deny_ext=["xyz"], body_scan_enabled=False)
     assert saw.endswith(b"0\r\n\r\n") and resp.endswith(b"ok"), (len(saw), resp[:60])
 
 
@@ -463,7 +470,8 @@ def test_d13_scan_phase_timeout_disconnects():
     """#13: 走査フェーズで body_max_sec を超えても blocked=False を返し、部分本文を backend へ
     転送して新しい body_max_sec でもう一度待っていた。"""
     buf = b"POST /x HTTP/1.1\r\nHost: x\r\nContent-Length: 100000\r\n\r\n"
-    with _shield(body_scan_enabled=True, body_timeout_enabled=True, body_max_sec=0.25):
+    with _shield(body_scan_enabled=True, body_scan_max_bytes=262144,
+                 body_timeout_enabled=True, body_max_sec=0.25):
         g = AsyncEdgeGuard(head_timeout=10.0)
 
         async def go():
@@ -489,7 +497,7 @@ def test_d13_body_max_sec_is_total_across_scan_and_stream():
     送り切ってから小出しにすると、本文の受信を body_max_sec のほぼ 2 倍まで保持できた。"""
     be = _Backend(idle=8.0)                                # 本文を待つ間に backend 側が先に切らない
     try:
-        with _shield(body_timeout_enabled=True, body_max_sec=1.5):
+        with _shield(mode="audit", body_timeout_enabled=True, body_max_sec=1.5):
             g = AsyncEdgeGuard(backend_host="127.0.0.1", backend_port=be.port,
                                listen_host="127.0.0.1", listen_port=0, head_timeout=5.0)
             assert g.start().get("ok")
@@ -515,7 +523,7 @@ def test_d13_body_max_sec_is_total_across_scan_and_stream():
                     break
                 c.close()
             finally:
-                g.stop()
+                stop_guard_owned(g)
         assert closed is not None and closed < 2.1, closed   # 総時間 1.5 秒で打ち切られる
     finally:
         be.close()

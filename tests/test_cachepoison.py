@@ -9,6 +9,7 @@ import threading
 import time
 
 from dataplane.engine.services.proxy import _strip_request_headers, AsyncEdgeGuard
+from guard_support import stop_guard_owned
 
 
 def test_strip_removes_named_headers():
@@ -62,7 +63,7 @@ def test_cache_poison_header_stripped_end_to_end():
     # 直結(trusted_proxies 既定=空=非信頼)→ X-Forwarded-Host は backend へ届かない。
     got, bport = _capture_backend()
     g = AsyncEdgeGuard(backend_host="127.0.0.1", backend_port=bport, listen_port=0)
-    g.start()
+    assert g.start().get("ok") is True
     try:
         c = socket.create_connection(("127.0.0.1", g.listen_port), timeout=5)
         c.sendall(b"GET / HTTP/1.1\r\nHost: x\r\nX-Forwarded-Host: evil.attacker\r\n\r\n")
@@ -79,4 +80,4 @@ def test_cache_poison_header_stripped_end_to_end():
         assert b"evil.attacker" not in got[0]                    # 汚染ヘッダ除去済み
         assert b"x-forwarded-host" not in got[0].lower()
     finally:
-        g.stop()
+        stop_guard_owned(g)
